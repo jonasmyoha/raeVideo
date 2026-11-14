@@ -21,6 +21,12 @@ The design is [docs/design.md](docs/design.md); what lives here,
   `addFfmpegBackend(table:)`. A program that uses it ships the files in its
   build's `legal/` folder (`packages/ffmpeg/legal/NOTICE.md`). macOS; never iOS.
 
+## Examples
+
+- `examples/simplePlayer`: one video file in a Rae UI window, a play/pause
+  button and a seek bar (its README has the 4K numbers):
+  `./rae run examples/simplePlayer/Main.rae -- clip.mp4`.
+
 A program takes a package by git at a release tag:
 
 ```

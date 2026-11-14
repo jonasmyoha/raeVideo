@@ -1,0 +1,322 @@
+# What the simple player's controls do, apart from the window and its loop
+# (Main.rae): the play/pause button and the space key, the seek bar (a press,
+# a drag, a release), and the frame on the GPU.
+#
+# The seek bar: a press inside it (or a little above or below it, the bar is
+# thin) takes the playhead there; while the pointer is held the picture
+# follows it with the sound stopped; on release the sound starts again from
+# the new place if the video was playing.
+#
+# The frame is drawn from the player's texture: video/YuvPicture converts the
+# decoded frame into an RGBA texture made in the canvas's own GPU resources, and
+# that texture is the canvas image under `frameImageKey`, which the scene's
+# Picture node shows (a lib/ui Sprite, scaled to fit). Each new frame changes
+# the texture's contents, not the image, so lib/ui needs nothing new for it.
+import Gpu2d
+import Math
+open app3d/UiShell
+open audio/Audio
+open ecs/ComponentTable
+open ecs/Entity
+open gpu/GpuIds
+open gpu/GpuLifetime
+open gpu/GpuResources
+open Gpu2dCanvas
+open Gpu2dCanvasImage
+open media/MediaTime
+open ui/Components
+open ui/Transform
+open ui/Ecs
+open ui/UiSystems
+open video/FrameStream
+open video/VideoDecoder
+open video/VideoPlayer
+open video/YuvPicture
+
+# The canvas image the Picture node's Sprite names
+const frameImageKey: String = "simplePlayer.frame"
+
+# How far above and below the thin seek bar a press still counts (design units)
+const seekBarReach: Float = 18.0
+
+# The refreshes whose work is kept for the debug line
+const workSamples: Int = 120
+
+type PlayerApp {
+  player: VideoPlayer
+  # the frame as a texture, made at the first frame (its size and layout)
+  picture: opt YuvPicture
+  # conversions submitted and not yet finished
+  inFlight: List(SubmissionId)
+  # a press on the seek bar is held, and whether play goes on after it
+  dragging: Bool
+  playAfterDrag: Bool
+  # the work of the last refreshes (ns): refresh, upload and conversion
+  workTimes: List(Int)
+  # the frame size, for the debug line
+  frameWidth: Int
+  frameHeight: Int
+}
+
+func createPlayerApp(player: own VideoPlayer) ret PlayerApp {
+  ret PlayerApp {
+    player: own player
+    picture: none
+    inFlight: {}
+    dragging: false
+    playAfterDrag: false
+    workTimes: {}
+    frameWidth: 0
+    frameHeight: 0
+  }
+}
+
+func togglePlaying(app: mod PlayerApp, audio: mod AudioEngine) {
+  if app.player.playing {
+    app.player.pausePlaying(audio: audio, hostNs: nowNs())
+  } else {
+    app.player.startPlaying(audio: audio, hostNs: nowNs())
+  }
+}
+
+# A node's box on screen (design units): its place from the transform pass,
+# its size from the last layout pass (ComputedRect alone is parent-local)
+func nodeBox(world: view UiWorld, uiSystems: view UiSystems, nodeId: view String) ret ComputedRect {
+  let entityId: EntityId = nodeEntityFor(world: world, nodeId: nodeId)
+  if not isNone(this: entityId) {
+    if componentHas(this: uiSystems.layout.computedRects, entityId: entityId) and componentHas(
+      this: uiSystems.transform2d.worldTransforms
+      entityId: entityId
+    ) {
+      let computed: view ComputedRect = componentView(
+        this: uiSystems.layout.computedRects
+        entityId: entityId
+      )
+      let transform: view WorldTransform2D = componentView(
+        this: uiSystems.transform2d.worldTransforms
+        entityId: entityId
+      )
+      let rect: WorldRect = worldRectOf(wt: transform, cr: computed)
+      ret ComputedRect { position: { x: rect.x, y: rect.y }, size: { x: rect.w, y: rect.h } }
+    }
+  }
+  ret ComputedRect { position: { x: 0.0, y: 0.0 }, size: { x: 0.0, y: 0.0 } }
+}
+
+# Where along the bar a pointer at x is, 0 to 1
+func barFraction(bar: view ComputedRect, x: view Float) ret Float {
+  if bar.size.x <= 0.0 {
+    ret 0.0
+  }
+  ret clamp(val: (x - bar.position.x) / bar.size.x, low: 0.0, high: 1.0)
+}
+
+func seekToFraction(app: mod PlayerApp, audio: mod AudioEngine, fraction: view Float) {
+  let end: Int = app.player.endPosition()
+  let position: Int = ((end as Float) * fraction) as Int
+  app.player.seekTo(
+    audio: audio
+    hostNs: nowNs()
+    time: sampleTime(frames: position, sampleRate: app.player.sampleRate)
+  )
+}
+
+# The seek bar's pointer handling, once per frame after Gpu2d.pollClose
+func handleSeekBar(
+  app: mod PlayerApp
+  audio: mod AudioEngine
+  world: view UiWorld
+  uiSystems: view UiSystems
+) {
+  let bar: ComputedRect = nodeBox(world: world, uiSystems: uiSystems, nodeId: "SeekBar")
+  let x: Float = Gpu2d.pointerX()
+  let y: Float = Gpu2d.pointerY()
+  if Gpu2d.pointerPressed() and not app.dragging {
+    let inside: Bool = x >= bar.position.x and x <= bar.position.x + bar.size.x and y >= bar.position.y - seekBarReach and y <= bar.position.y + bar.size.y + seekBarReach
+    if inside {
+      app.dragging = true
+      app.playAfterDrag = app.player.playing or app.player.ended
+      if app.player.playing {
+        app.player.pausePlaying(audio: audio, hostNs: nowNs())
+      }
+    }
+  }
+  if app.dragging {
+    seekToFraction(app: app, audio: audio, fraction: barFraction(bar: bar, x: x))
+    if Gpu2d.pointerReleased() or not Gpu2d.pointerDown() {
+      app.dragging = false
+      if app.playAfterDrag {
+        app.player.startPlaying(audio: audio, hostNs: nowNs())
+      }
+    }
+  }
+}
+
+# Makes the picture for the first frame, in the canvas's GPU resources, and
+# names its texture as the canvas image the scene shows
+func ensurePicture(app: mod PlayerApp, canvas: mod Gpu2dCanvas) {
+  if app.picture is not none {
+    ret
+  }
+  let frame: view VideoFrame = app.player.current
+  if frame.handle is 0 {
+    ret
+  }
+  ensureBoxResources(canvas: canvas)
+  if let resources: mod GpuResources = canvas.gpuResources {
+    if let picture: YuvPicture = createYuvPicture(
+      resources: resources
+      width: frame.width
+      height: frame.height
+      layout: frame.layout
+    ) {
+      let handle: Int = registerImageTexture(
+        canvas: canvas
+        resources: resources
+        texture: picture.picture
+        width: frame.width
+        height: frame.height
+      )
+      canvasRegisterImageKey(canvas: canvas, key: frameImageKey, handle: handle)
+      app.frameWidth = frame.width
+      app.frameHeight = frame.height
+      app.picture = picture
+    }
+  }
+}
+
+# The player's frame for this refresh, and when it changed its upload and
+# conversion into the picture's texture (submitted, not waited for: the
+# canvas's frame, submitted after it, sees it done). The work is timed.
+func refreshPicture(
+  app: mod PlayerApp
+  audio: mod AudioEngine
+  canvas: mod Gpu2dCanvas
+  hostNs: view Int
+) {
+  let started: Int = nowNs()
+  let changed: Bool = app.player.refresh(audio: audio, hostNs: hostNs)
+  let pictureWasMissing: Bool = app.picture is none
+  ensurePicture(app: app, canvas: canvas)
+  if changed or (pictureWasMissing and app.picture is not none) {
+    if let resources: mod GpuResources = canvas.gpuResources {
+      if let picture: mod YuvPicture = app.picture {
+        if picture.uploadFrame(resources: resources, frame: app.player.current) {
+          if var recording: Recording = beginRecording(resources: resources) {
+            if picture.recordConversion(recording: recording, resources: resources) {
+              if let submission: SubmissionId = submit(resources: resources, recording: recording) {
+                app.inFlight.add(value: submission)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  if let resources: mod GpuResources = canvas.gpuResources {
+    pollSubmissions(inFlight: app.inFlight, resources: resources)
+  }
+  app.workTimes.add(value: nowNs() - started)
+  if app.workTimes.length() > workSamples {
+    app.workTimes.remove(index: 0)
+  }
+}
+
+# Waits for the conversions still running (at the end)
+func finishConversions(app: mod PlayerApp, canvas: mod Gpu2dCanvas) {
+  if let resources: mod GpuResources = canvas.gpuResources {
+    loop let submission: SubmissionId in app.inFlight {
+      let finished: Bool = awaitSubmission(resources: resources, id: submission)
+    }
+  }
+  app.inFlight.clear()
+}
+
+func twoDigits(value: view Int) ret String {
+  if value < 10 {
+    ret "0{value}"
+  }
+  ret "{value}"
+}
+
+# m:ss.t of a position in samples
+func clockText(position: view Int, sampleRate: view Int) ret String {
+  let tenths: Int = position * 10 / max(a: 1, b: sampleRate)
+  let seconds: Int = tenths / 10
+  ret "{seconds / 60}:{twoDigits(value: seconds % 60)}.{tenths % 10}"
+}
+
+# Mean and 95th percentile of the kept work times, in ms with one decimal
+func workText(times: view List(Int)) ret String {
+  let count: Int = times.length()
+  if count is 0 {
+    ret "-"
+  }
+  var sorted: List(Int) = List.create(Int, cap: count)
+  var total: Int = 0
+  loop let time: Int in times {
+    total = total + time
+    var at: Int = sorted.length()
+    loop at > 0 and sorted.copyAtDefault(index: at - 1) > time {
+      at = at - 1
+    }
+    sorted.insert(index: at, value: time)
+  }
+  let mean: Int = total / count / 100000
+  let p95: Int = sorted.copyAtDefault(index: count * 95 / 100) / 100000
+  ret "mean {mean / 10}.{mean % 10} ms, p95 {p95 / 10}.{p95 % 10} ms"
+}
+
+func debugLine(app: view PlayerApp) ret String {
+  ret "{app.frameWidth}x{app.frameHeight} · frame work {workText(times: app.workTimes)} · frames shown {app.player.shownFrames}, dropped {app.player.droppedFrames}"
+}
+
+func setSpriteKey(world: mod UiWorld, nodeId: view String, key: view String) {
+  let entityId: EntityId = nodeEntityFor(world: world, nodeId: nodeId)
+  if isNone(this: entityId) or not componentHas(this: world.sprites, entityId: entityId) {
+    ret
+  }
+  let sprite: mod Sprite = componentMod(this: world.sprites, entityId: entityId)
+  if sprite.textureKey is not key {
+    sprite.textureKey = "{key}"
+  }
+}
+
+# The controls as the player is now: the button's icon, the played part of
+# the bar, the time and the debug line
+func syncControls(
+  app: view PlayerApp
+  audio: view AudioEngine
+  world: mod UiWorld
+  uiSystems: view UiSystems
+  hostNs: view Int
+) {
+  if app.player.playing {
+    setSpriteKey(world: world, nodeId: "PlayIcon", key: "mat:pause")
+  } else {
+    setSpriteKey(world: world, nodeId: "PlayIcon", key: "mat:play_arrow")
+  }
+  let end: Int = max(a: 1, b: app.player.endPosition())
+  let position: Int = app.player.timeAt(audio: audio, hostNs: hostNs).toSamples(
+    sampleRate: app.player.sampleRate
+  )
+  let bar: ComputedRect = nodeBox(world: world, uiSystems: uiSystems, nodeId: "SeekBar")
+  let played: Float = bar.size.x * (position as Float) / (end as Float)
+  setNodeRect(
+    world: world
+    nodeId: "SeekPlayed"
+    x: 0.0
+    y: 0.0
+    w: played
+    h: bar.size.y
+  )
+  setNodeText(
+    world: world
+    nodeId: "TimeText"
+    value: "{clockText(position: position, sampleRate: app.player.sampleRate)} / {clockText(
+      position: end
+      sampleRate: app.player.sampleRate
+    )}"
+  )
+  setNodeText(world: world, nodeId: "DebugText", value: debugLine(app: app))
+}

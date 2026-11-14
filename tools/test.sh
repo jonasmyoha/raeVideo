@@ -1,5 +1,6 @@
 #!/bin/sh
-# Runs every test program (tests/<name>/Main.rae with an expected.txt) from
+# Runs every test program (tests/<name>/Main.rae with an expected.txt, and
+# examples/<name> the same way) from
 # the repository root and compares its output with expected.txt. Each test
 # may have a config.env (KEY=value lines) for its environment. Exit 1 when
 # one fails. RAE_ROOT=<a Rae checkout> builds with that Rae instead of the
@@ -10,14 +11,17 @@ cd "$root" || exit 1
 filter=${1:-}
 passed=0
 failed=0
-for dir in tests/*/; do
+# Test programs: tests/<name>, and an example with an expected.txt (its
+# config.env puts it in its test mode)
+for dir in tests/*/ examples/*/; do
   name=$(basename "$dir")
   [ -f "$dir/Main.rae" ] && [ -f "$dir/expected.txt" ] || continue
   case "$name" in *"$filter"*) ;; *) continue ;; esac
   environment=""
   [ -f "$dir/config.env" ] && environment=$(grep -v '^#' "$dir/config.env" | tr '\n' ' ')
   output=$(env $environment RAE_FORMAT=check perl -e 'alarm shift; exec @ARGV' 600 \
-    ./rae run "$dir/Main.rae" 2>&1 | grep -v '^@@' | grep -v '^note: RAE_ROOT is set')
+    ./rae run "$dir/Main.rae" 2>&1 | grep -v '^@@' | grep -v '^note: RAE_ROOT is set' |
+    grep -v '^\[present\]')
   if [ "$output" = "$(cat "$dir/expected.txt")" ]; then
     echo "PASS: $name"
     passed=$((passed + 1))

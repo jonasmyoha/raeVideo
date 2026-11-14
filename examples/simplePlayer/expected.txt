@@ -1,0 +1,13 @@
+[audio] stream voice 1 tests/media/counter709.mp4 bus music
+pressing play starts the video: true
+playing, 40 refreshes show frames 0..20, each the one the audio clock is at: true
+pressing pause holds frame 20 for 20 refreshes and the sound stops: true
+a click at the middle of the bar shows frame 45 (the middle is 45), still paused: true
+[audio] stream voice 3 tests/media/counter709.mp4 bus music
+a drag along the bar shows frames 18 31 45 58 72 (18 31 45 58 72) with the sound stopped: true
+[audio] stream voice 5 tests/media/counter709.mp4 bus music
+on release it plays on from frame 72: the frames follow the clock, the sound is the tone at that place: true
+at the end it stops on frame 89, the button showing mat:play_arrow: true
+[simplePlayer] frames shown 59, dropped 0
+closed: the sound stopped, the window closed
+done

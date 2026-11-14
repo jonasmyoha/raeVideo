@@ -1,0 +1,34 @@
+pack SimplePlayer {
+  format: "raepack"
+  version: 1
+  defaultTarget: compiled
+  name: "Simple video player"
+  description: "One video file in a window: the picture fitted to the window, a play/pause button and a seek bar. packages/video plays it with Rae's audio engine as the clock; the window is Rae's lib/ui."
+  category: "Video"
+  rae: {
+    version: "0.3.123"
+  }
+  dependencies: {
+    dep video: {
+      path: "../../packages/video"
+    }
+    dep audio: {
+      git: "https://github.com/jonasmyoha/rae.git"
+      subdir: "packages/audio"
+      version: "0.15.1"
+      hash: "git-tree:b4980c53225391e3b553295f3b36bae7889a30a3"
+    }
+  }
+  targets: {
+    target compiled: {
+      label: "Compiled"
+      entry: "Main.rae"
+      sources: {
+        source: {
+          path: "."
+          emit: compiled
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,274 @@
+# A simple video player: one file in a window, its picture fitted to the window
+# (letterboxed, aspect kept), a play/pause button (or the space key) and a seek
+# bar under it. packages/video plays it (video/VideoPlayer), its sound through
+# Rae's audio engine, which is the master clock; the window is Rae's lib/ui
+# (assets/Ui.raescene).
+#
+#     ./rae run examples/simplePlayer/Main.rae -- clip.mp4
+#     ./rae run examples/simplePlayer/Main.rae           # asks for a file
+#
+# Each refresh: the controls take their input (PlayerControls), the player picks
+# the frame the audio clock is at and, when it changed, its planes go to the GPU
+# and are converted into the texture the Picture node shows; the debug line under
+# the bar shows the work per refresh and the frames dropped. Closing the window
+# stops the sound and the audio engine's threads before the program ends.
+#
+# RAE_SIMPLE_PLAYER_TEST=1 runs the headless test instead (PlayerTest,
+# config.env): the same app, the audio engine offline, a script at the pointer.
+# With RAE_AUDIO_DEVICE=offline and no test, the offline engine follows the wall
+# clock, so the player runs in real time without a sound device.
+# RAE_SIMPLE_PLAYER_MEASURE=1 shows the first frame, starts playing, and closes the
+# window at the end, logging the debug line (README.md: the 4K numbers).
+import Gpu2d
+import Sdl3
+import String
+open Sys
+open app3d/UiShell
+open audio/Audio
+open ecs/Schedule
+open Gpu2dCanvas
+open Keys
+open ui/Ecs
+open ui/EventLoop
+open ui/inputSystem/InputSystem
+open ui/Pipeline
+open ui/Registry
+open ui/renderSystem/RenderSystem
+open ui/Scene
+open ui/SceneFile
+open ui/SceneLoader
+open ui/UiSystems
+open video/VideoBackends
+open video/VideoPlayer
+open PlayerControls
+open PlayerTest
+
+const designW: Int = 960
+
+const designH: Int = 620
+
+const assetsFolder: String = "examples/simplePlayer/assets/"
+
+# The file to play: the first argument, or one picked in the OS's panel (the
+# loop keeps the window alive while it is open). "" when the window closed first.
+func chooseFile(
+  world: mod UiWorld
+  uiSystems: mod UiSystems
+  schedule: mod Schedule
+  gpuUi: view Gpu2dUi
+  canvas: mod Gpu2dCanvas
+) ret String {
+  if argCount() > 0 {
+    ret argAt(index: 0)
+  }
+  setNodeText(world: world, nodeId: "DebugText", value: "Choose a video file to play")
+  Sdl3.openFileDialog(filters: ["mp4;mov;m4v"], defaultLocation: "")
+  loop not Gpu2d.pollClose() {
+    let picked: String = Sdl3.pollFileDialogResult()
+    if picked.length() > 0 {
+      ret picked
+    }
+    let resized: Bool = resizeUiToWindow(world: world, uiSystems: uiSystems, res: gpuUi)
+    runScheduledUiSystems(
+      schedule: schedule
+      world: world
+      uiSystems: uiSystems
+      res: gpuUi
+    )
+    renderUi(
+      world: world
+      uiSystems: uiSystems
+      gpuUi: gpuUi
+      canvas: canvas
+    )
+    Gpu2d.waitEvents(timeoutSeconds: 0.1)
+    uiFrameEnd(world: world, uiSystems: uiSystems)
+  }
+  ret ""
+}
+
+func renderUi(
+  world: view UiWorld
+  uiSystems: mod UiSystems
+  gpuUi: view Gpu2dUi
+  canvas: mod Gpu2dCanvas
+) {
+  if Gpu2d.shouldRenderFrame(appNeedsRender: true) {
+    Gpu2d.beginFrame(
+      canvas: canvas
+      r: 0.0
+      g: 0.0
+      b: 0.0
+      a: 1.0
+    )
+    renderSystemGpu2d(
+      world: world
+      uiSystems: uiSystems
+      res: gpuUi
+      canvas: canvas
+    )
+    Gpu2d.endFrame(canvas: canvas)
+  }
+}
+
+func main() ret Int {
+  let testing: Bool = getEnv(name: "RAE_SIMPLE_PLAYER_TEST") is "1"
+  let measuring: Bool = getEnv(name: "RAE_SIMPLE_PLAYER_MEASURE") is "1"
+  Gpu2d.initWindow(width: designW, height: designH, title: "Simple player")
+  var canvas: Gpu2dCanvas = createGpu2dCanvas()
+  let gpuUi: Gpu2dUi = loadUiAssets(
+    dir: assetsFolder
+    textFontName: "Roboto-Regular"
+    iconFontName: "MaterialIconsRound-Regular"
+    themeFile: "Theme.raescene"
+  )
+  var world: UiWorld = create()
+  var uiSystems: UiSystems = createUiSystems()
+  seedWorldTheme(world: world, res: gpuUi)
+  world.layoutW = designW.toFloat()
+  world.layoutH = designH.toFloat()
+  let scene: Scene = loadSceneFile(path: "{assetsFolder}Ui.raescene")
+  if scene.ok is false {
+    log("[simplePlayer] the scene failed to load: {scene.errorMsg}")
+    Gpu2d.closeWindow()
+    ret 1
+  }
+  loadScene(world: world, uiSystems: uiSystems, scene: scene)
+  var schedule: Schedule = createUiPipeline(world: world)
+  runScheduledUiSystems(
+    schedule: schedule
+    world: world
+    uiSystems: uiSystems
+    res: gpuUi
+  )
+
+  var path: String = "tests/media/counter709.mp4"
+  if not testing {
+    path = chooseFile(
+      world: world
+      uiSystems: uiSystems
+      schedule: schedule
+      gpuUi: gpuUi
+      canvas: canvas
+    )
+  }
+  if path.length() is 0 {
+    canvasShutdown(canvas: canvas)
+    Gpu2d.closeWindow()
+    ret 0
+  }
+
+  var settings: AudioSettings = defaultAudioSettings()
+  settings.offline = testing
+  var audio: AudioEngine = audioStart(settings: settings)
+  var app: PlayerApp = createPlayerApp(
+    player: openVideoPlayer(path: path, table: defaultVideoBackends())
+  )
+  if app.player.error.length() > 0 {
+    log("[simplePlayer] {path}: {app.player.error}")
+  }
+  var test: PlayerTest = createPlayerTest()
+  # measuring: like a person, the first frame is shown paused (its textures and
+  # the conversion pipeline are made then), and play starts ten refreshes later
+  var refreshes: Int = 0
+  var input: UiInput = createUiInput()
+  let started: Int = nowNs()
+  loop not Gpu2d.pollClose() and not test.done {
+    let resized: Bool = resizeUiToWindow(world: world, uiSystems: uiSystems, res: gpuUi)
+    updateUiInput(input: input, world: world, uiSystems: uiSystems)
+    if app.player.error.length() is 0 {
+      if uiActionFired(world: world, actionId: "player.toggle") or Sdl3.isKeyPressed(key: keySpace) {
+        togglePlaying(app: app, audio: audio)
+      }
+      handleSeekBar(
+        app: app
+        audio: audio
+        world: world
+        uiSystems: uiSystems
+      )
+    }
+    var sound: List(Float) = {}
+    if testing {
+      sound = renderRefresh(audio: audio)
+    } else if audio.offline {
+      # no sound device: the offline engine keeps up with the wall clock
+      let wanted: Int = (nowNs() - started) / 1000 * audio.sampleRate / 1000000
+      if wanted > audio.renderedFrames {
+        sound = audio.renderOffline(frames: wanted - audio.renderedFrames)
+      }
+    }
+    audio.update()
+    let hostNs: Int = nowNs()
+    if app.player.error.length() is 0 {
+      refreshPicture(
+        app: app
+        audio: audio
+        canvas: canvas
+        hostNs: hostNs
+      )
+      syncControls(
+        app: app
+        audio: audio
+        world: world
+        uiSystems: uiSystems
+        hostNs: hostNs
+      )
+    } else {
+      setNodeText(world: world, nodeId: "DebugText", value: "{path}: {app.player.error}")
+    }
+    runScheduledUiSystems(
+      schedule: schedule
+      world: world
+      uiSystems: uiSystems
+      res: gpuUi
+    )
+    renderUi(
+      world: world
+      uiSystems: uiSystems
+      gpuUi: gpuUi
+      canvas: canvas
+    )
+    if testing {
+      runPlayerTest(
+        test: test
+        app: app
+        audio: audio
+        sound: sound
+        canvas: canvas
+        world: world
+        uiSystems: uiSystems
+      )
+    } else if not app.player.playing and not app.dragging {
+      # nothing moves: wake on input, or a few times a second
+      Gpu2d.waitEvents(timeoutSeconds: 0.05)
+    }
+    uiFrameEnd(world: world, uiSystems: uiSystems)
+    refreshes = refreshes + 1
+    if measuring and refreshes is 10 and app.player.error.length() is 0 {
+      app.player.startPlaying(audio: audio, hostNs: nowNs())
+    }
+    if measuring and app.player.ended {
+      break
+    }
+  }
+
+  if testing {
+    log("[simplePlayer] frames shown {app.player.shownFrames}, dropped {app.player.droppedFrames}")
+  } else {
+    log("[simplePlayer] {debugLine(app: app)}")
+  }
+  finishConversions(app: app, canvas: canvas)
+  app.player.close(audio: audio)
+  let stopped: Int = stopAudio(this: audio)
+  canvasShutdown(canvas: canvas)
+  Gpu2d.closeWindow()
+  if testing {
+    log("closed: the sound stopped, the window closed")
+    if test.failures > 0 {
+      log("FAIL: {test.failures} checks failed")
+      ret 1
+    }
+    log("done")
+  }
+  ret 0
+}

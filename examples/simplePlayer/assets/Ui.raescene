@@ -1,0 +1,226 @@
+{
+ "type": "Scene",
+ "version": 2,
+ "root": "UiRoot",
+ "nodes": {
+  "UiRoot": {
+   "Rect": {
+    "x": 0,
+    "y": 0,
+    "w": 960,
+    "h": 620
+   },
+   "Layout": {
+    "type": "Vertical",
+    "gap": "spaceS",
+    "alignCross": "Stretch"
+   },
+   "Padding": {
+    "l": "spaceM",
+    "t": "spaceM",
+    "r": "spaceM",
+    "b": "spaceS"
+   },
+   "Children": [
+    "Picture",
+    "Controls",
+    "DebugText"
+   ]
+  },
+  "Picture": {
+   "Rect": {
+    "x": 0,
+    "y": 0,
+    "w": 932,
+    "h": 500
+   },
+   "Size": {
+    "w": {
+     "mode": "Fill"
+    },
+    "h": {
+     "mode": "Fill"
+    }
+   },
+   "Sprite": {
+    "textureKey": "simplePlayer.frame"
+   }
+  },
+  "Controls": {
+   "Rect": {
+    "x": 0,
+    "y": 0,
+    "w": 932,
+    "h": 48
+   },
+   "Layout": {
+    "type": "Horizontal",
+    "gap": "spaceM",
+    "alignCross": "Center"
+   },
+   "Size": {
+    "w": {
+     "mode": "Fill"
+    },
+    "h": {
+     "mode": "Fixed"
+    }
+   },
+   "Children": [
+    "PlayButton",
+    "SeekBar",
+    "TimeText"
+   ]
+  },
+  "PlayButton": {
+   "bundles": [
+    "pressable"
+   ],
+   "Rect": {
+    "x": 0,
+    "y": 0,
+    "w": 48,
+    "h": 48
+   },
+   "Size": {
+    "w": {
+     "mode": "Fixed"
+    },
+    "h": {
+     "mode": "Fixed"
+    }
+   },
+   "Shape": {
+    "kind": "RoundedRect",
+    "fill": "surfaceAlt",
+    "radius": "radiusPill"
+   },
+   "OnClick": {
+    "actionId": "player.toggle",
+    "label": "Play or pause"
+   },
+   "Children": [
+    "PlayIcon"
+   ]
+  },
+  "PlayIcon": {
+   "Rect": {
+    "x": 0,
+    "y": 0,
+    "w": 48,
+    "h": 48
+   },
+   "Sprite": {
+    "textureKey": "mat:play_arrow",
+    "tint": "textPrimary"
+   }
+  },
+  "SeekBar": {
+   "Rect": {
+    "x": 0,
+    "y": 0,
+    "w": 700,
+    "h": 10
+   },
+   "Layout": {
+    "type": "Horizontal",
+    "gap": 0,
+    "alignCross": "Stretch"
+   },
+   "Size": {
+    "w": {
+     "mode": "Fill"
+    },
+    "h": {
+     "mode": "Fixed"
+    }
+   },
+   "Children": [
+    "SeekPlayed",
+    "SeekRest"
+   ]
+  },
+  "SeekPlayed": {
+   "Rect": {
+    "x": 0,
+    "y": 0,
+    "w": 0,
+    "h": 10
+   },
+   "Size": {
+    "w": {
+     "mode": "Fixed"
+    },
+    "h": {
+     "mode": "Fill"
+    }
+   },
+   "Shape": {
+    "kind": "RoundedRect",
+    "fill": "accent",
+    "radius": 5
+   }
+  },
+  "SeekRest": {
+   "Rect": {
+    "x": 0,
+    "y": 0,
+    "w": 700,
+    "h": 10
+   },
+   "Size": {
+    "w": {
+     "mode": "Fill"
+    },
+    "h": {
+     "mode": "Fill"
+    }
+   },
+   "Shape": {
+    "kind": "RoundedRect",
+    "fill": "surfaceAlt",
+    "radius": 5
+   }
+  },
+  "TimeText": {
+   "Rect": {
+    "x": 0,
+    "y": 0,
+    "w": 170,
+    "h": 48
+   },
+   "Size": {
+    "w": {
+     "mode": "Fixed"
+    },
+    "h": {
+     "mode": "Fixed"
+    }
+   },
+   "Text": {
+    "text": "0:00.0 / 0:00.0",
+    "styleId": "body"
+   }
+  },
+  "DebugText": {
+   "Rect": {
+    "x": 0,
+    "y": 0,
+    "w": 932,
+    "h": 22
+   },
+   "Size": {
+    "w": {
+     "mode": "Fill"
+    },
+    "h": {
+     "mode": "Fixed"
+    }
+   },
+   "Text": {
+    "text": "",
+    "styleId": "muted"
+   }
+  }
+ }
+}

@@ -1,0 +1,440 @@
+# The simple player's headless test (RAE_SIMPLE_PLAYER_TEST=1, examples/simplePlayer
+# config.env): the app runs as it does for a person, on tests/media/counter709.mp4
+# (90 frames at 29.97 fps, the frame counter burned into each frame, a rising
+# tone), but the audio engine is offline and renders 800 samples per refresh
+# (60 Hz), and a script presses the pointer where a person would
+# (lib/Gpu2dSimulatedInput). After every refresh the texture the window shows is
+# read back and the counter in it compared with the frame the audio clock is at.
+#
+#   1. press play: the frames follow the clock;
+#   2. press pause: the picture holds and the sound stops;
+#   3. a click at the bar's middle: frame 45, still paused;
+#   4. play, then a drag along the bar (to frames 18, 31, 45, 58, 72): the
+#      frames follow the pointer and the sound is silent; on release the sound
+#      starts again from the new place (the tone there) and the frames follow it;
+#   5. play to the end: it stops on frame 89, the button back to "play".
+import Gpu2d
+open Gpu2dSimulatedInput
+import Math
+open app3d/UiShell
+open audio/Audio
+open ecs/ComponentTable
+open ecs/Entity
+open gpu/GpuResources
+open Gpu2dCanvas
+open ui/Components
+open ui/Ecs
+open ui/UiSystems
+open video/VideoPlayer
+open video/YuvPicture
+open PlayerControls
+
+const refreshSamples: Int = 800
+
+# a little more than the 5 ms fade a voice starts or stops with
+const fadeSamples: Int = 300
+
+type PlayerTest {
+  frame: Int
+  step: Int
+  # the refresh the current step started on
+  stepFrame: Int
+  # the counter shown at the last refresh, and the ones a step saw
+  lastCounter: Int
+  firstCounter: Int
+  mismatches: Int
+  followed: String
+  toneError: Float
+  silence: Float
+  # where the sound must restart from after the drag, and when
+  restartSample: Int
+  restartPosition: Int
+  failures: Int
+  done: Bool
+}
+
+func createPlayerTest() ret PlayerTest {
+  ret PlayerTest {
+    frame: 0
+    step: 0
+    stepFrame: 0
+    lastCounter: -1
+    firstCounter: -1
+    mismatches: 0
+    followed: ""
+    toneError: 0.0
+    silence: 0.0
+    restartSample: 0
+    restartPosition: 0
+    failures: 0
+    done: false
+  }
+}
+
+# The file's rising tone at `position` samples (tools/makeTestMedia.swift)
+func toneAt(position: view Int) ret Float {
+  let seconds: Float64 = (position as Float64) / 48000.0
+  let length: Float64 = ((90 * 1001) as Float64) / 30000.0
+  let rising: Float64 = seconds * seconds * 1000.0 / (length * 2.0)
+  let cycles: Float64 = seconds * 500.0 + rising
+  let within: Float64 = cycles - ((cycles as Int) as Float64)
+  ret 0.25 * sin(x: 2.0 * pi * (within as Float))
+}
+
+# The 29.97 fps frame at `position` samples
+func frameAtPosition(position: view Int) ret Int {
+  ret min(a: 89, b: position * 30000 / (48000 * 1001))
+}
+
+# The counter in the texture the window shows (its 16 cells), -1 before one
+func shownCounter(app: view PlayerApp, canvas: mod Gpu2dCanvas) ret Int {
+  if let picture: view YuvPicture = app.picture {
+    if let resources: mod GpuResources = canvas.gpuResources {
+      let pixels: List(UInt8) = picture.readPicture(resources: resources)
+      let row: Int = picture.height * 3 / 4 + picture.height / 16
+      var value: Int = 0
+      loop var bit: Int = 0, bit < 16, ++bit {
+        let x: Int = bit * picture.width / 16 + picture.width / 32
+        value = value * 2
+        if (pixels.copyAtDefault(index: (row * picture.width + x) * 4) as Int) > 128 {
+          value = value + 1
+        }
+      }
+      ret value
+    }
+  }
+  ret -1
+}
+
+# Where frame n's span on the bar has its middle, 0 to 1 along the bar: the
+# pointer lands on whole pixels, so a press aims there, not at a frame's edge
+func frameOnBar(frameIndex: view Int) ret Float {
+  ret ((frameIndex as Float) + 0.5) / 90.0
+}
+
+# A node's center as a fraction of the window, for the simulated pointer
+func pressPoint(
+  world: view UiWorld
+  uiSystems: view UiSystems
+  nodeId: view String
+  along: view Float
+) ret List(Float) {
+  let box: ComputedRect = nodeBox(world: world, uiSystems: uiSystems, nodeId: nodeId)
+  let x: Float = (box.position.x + box.size.x * along) / world.layoutW
+  let y: Float = (box.position.y + box.size.y / 2.0) / world.layoutH
+  ret List(Float) { x, y }
+}
+
+func pointer(kind: view Int, point: view List(Float)) {
+  simulateFingerPointer(
+    kind: kind
+    x: point.copyAtDefault(index: 0)
+    y: point.copyAtDefault(index: 1)
+  )
+}
+
+func nextStep(test: mod PlayerTest) {
+  test.step = test.step + 1
+  test.stepFrame = test.frame
+  test.mismatches = 0
+  test.firstCounter = -1
+  test.followed = ""
+  test.toneError = 0.0
+  test.silence = 0.0
+}
+
+func check(test: mod PlayerTest, name: view String, passed: view Bool) {
+  log("{name}: {passed}")
+  if not passed {
+    test.failures = test.failures + 1
+  }
+}
+
+# The frame the audio clock is at now (the player's anchor and the samples
+# rendered since it)
+func clockFrame(app: view PlayerApp, audio: view AudioEngine) ret Int {
+  if not app.player.playing {
+    ret frameAtPosition(position: app.player.anchorPosition)
+  }
+  ret frameAtPosition(
+    position: app.player.anchorPosition + max(
+      a: 0
+      b: audio.renderedFrames - app.player.anchorSample
+    )
+  )
+}
+
+# One refresh of the test: renders the refresh's sound, before the app's own
+# work. `sound` is what was rendered, checked after the app's refresh.
+func renderRefresh(audio: mod AudioEngine) ret List(Float) {
+  ret audio.renderOffline(frames: refreshSamples)
+}
+
+# Called once per refresh after the app's work: checks what the window shows
+# and moves the script on
+func runPlayerTest(
+  test: mod PlayerTest
+  app: mod PlayerApp
+  audio: view AudioEngine
+  sound: view List(Float)
+  canvas: mod Gpu2dCanvas
+  world: view UiWorld
+  uiSystems: view UiSystems
+) {
+  test.frame = test.frame + 1
+  let since: Int = test.frame - test.stepFrame
+  let counter: Int = shownCounter(app: app, canvas: canvas)
+  if test.firstCounter < 0 {
+    test.firstCounter = counter
+  }
+  test.lastCounter = counter
+  let soundStart: Int = audio.renderedFrames - refreshSamples
+  if test.step is 0 {
+    # the first refreshes lay the scene out; then press play
+    if since is 3 {
+      pointer(
+        kind: simulatedTouchDown
+        point: pressPoint(
+          world: world
+          uiSystems: uiSystems
+          nodeId: "PlayButton"
+          along: 0.5
+        )
+      )
+    } else if since is 4 {
+      pointer(
+        kind: simulatedTouchUp
+        point: pressPoint(
+          world: world
+          uiSystems: uiSystems
+          nodeId: "PlayButton"
+          along: 0.5
+        )
+      )
+    } else if since > 4 and app.player.playing {
+      log("pressing play starts the video: true")
+      nextStep(test: test)
+    } else if since > 20 {
+      check(test: test, name: "pressing play starts the video", passed: false)
+      test.done = true
+    }
+    ret
+  }
+  if test.step is 1 {
+    # playing: every refresh shows the frame of the clock
+    if counter is not clockFrame(app: app, audio: audio) {
+      test.mismatches = test.mismatches + 1
+    }
+    if since is 40 {
+      check(
+        test: test
+        name: "playing, 40 refreshes show frames {test.firstCounter}..{counter}, each the one the audio clock is at"
+        passed: test.mismatches is 0
+      )
+      pointer(
+        kind: simulatedTouchDown
+        point: pressPoint(
+          world: world
+          uiSystems: uiSystems
+          nodeId: "PlayButton"
+          along: 0.5
+        )
+      )
+    } else if since is 41 {
+      pointer(
+        kind: simulatedTouchUp
+        point: pressPoint(
+          world: world
+          uiSystems: uiSystems
+          nodeId: "PlayButton"
+          along: 0.5
+        )
+      )
+      nextStep(test: test)
+    }
+    ret
+  }
+  if test.step is 2 {
+    # paused: the picture holds and the sound is silent
+    if since > 2 {
+      if counter is not test.firstCounter {
+        test.mismatches = test.mismatches + 1
+      }
+      loop var i: Int = 0, i < refreshSamples, ++i {
+        test.silence = max(a: test.silence, b: abs(value: sound.copyAtDefault(index: i * 2)))
+      }
+    }
+    if since is 22 {
+      check(
+        test: test
+        name: "pressing pause holds frame {counter} for 20 refreshes and the sound stops"
+        passed: test.mismatches is 0 and not app.player.playing and test.silence < 0.001
+      )
+      pointer(
+        kind: simulatedTouchDown
+        point: pressPoint(
+          world: world
+          uiSystems: uiSystems
+          nodeId: "SeekBar"
+          along: frameOnBar(frameIndex: 45)
+        )
+      )
+    } else if since is 23 {
+      pointer(
+        kind: simulatedTouchUp
+        point: pressPoint(
+          world: world
+          uiSystems: uiSystems
+          nodeId: "SeekBar"
+          along: frameOnBar(frameIndex: 45)
+        )
+      )
+      nextStep(test: test)
+    }
+    ret
+  }
+  if test.step is 3 {
+    # after the click at the middle of the bar
+    if since is 3 {
+      check(
+        test: test
+        name: "a click at the middle of the bar shows frame {counter} (the middle is 45), still paused"
+        passed: counter is 45 and not app.player.playing
+      )
+      pointer(
+        kind: simulatedTouchDown
+        point: pressPoint(
+          world: world
+          uiSystems: uiSystems
+          nodeId: "PlayButton"
+          along: 0.5
+        )
+      )
+    } else if since is 4 {
+      pointer(
+        kind: simulatedTouchUp
+        point: pressPoint(
+          world: world
+          uiSystems: uiSystems
+          nodeId: "PlayButton"
+          along: 0.5
+        )
+      )
+    } else if since is 10 {
+      # playing again; now a drag along the bar
+      pointer(
+        kind: simulatedTouchDown
+        point: pressPoint(
+          world: world
+          uiSystems: uiSystems
+          nodeId: "SeekBar"
+          along: frameOnBar(frameIndex: 18)
+        )
+      )
+      nextStep(test: test)
+    }
+    ret
+  }
+  if test.step is 4 {
+    # dragging: each pointer place shows its frame, the sound is silent
+    let places: List(Int) = List(Int) {
+      18
+      31
+      45
+      58
+      72
+    }
+    let place: Int = since / 3
+    if since % 3 is 0 and place >= 1 and place <= 5 {
+      # the frame shown for the place set three refreshes ago
+      let expected: Int = places.copyAtDefault(index: place - 1)
+      test.followed = test.followed.concat(other: " {counter}")
+      if counter is not expected {
+        test.mismatches = test.mismatches + 1
+      }
+      if place < 5 {
+        pointer(
+          kind: simulatedTouchMotion
+          point: pressPoint(
+            world: world
+            uiSystems: uiSystems
+            nodeId: "SeekBar"
+            along: frameOnBar(frameIndex: places.copyAtDefault(index: place))
+          )
+        )
+      }
+    }
+    if since > 2 {
+      loop var i: Int = 0, i < refreshSamples, ++i {
+        test.silence = max(a: test.silence, b: abs(value: sound.copyAtDefault(index: i * 2)))
+      }
+    }
+    if since is 15 {
+      check(
+        test: test
+        name: "a drag along the bar shows frames{test.followed} (18 31 45 58 72) with the sound stopped"
+        passed: test.mismatches is 0 and test.silence < 0.001
+      )
+      pointer(
+        kind: simulatedTouchUp
+        point: pressPoint(
+          world: world
+          uiSystems: uiSystems
+          nodeId: "SeekBar"
+          along: frameOnBar(frameIndex: 72)
+        )
+      )
+      nextStep(test: test)
+    }
+    ret
+  }
+  if test.step is 5 {
+    # released: playing again from the new place
+    if since is 1 {
+      test.restartSample = app.player.anchorSample
+      test.restartPosition = app.player.anchorPosition
+    }
+    if since > 1 {
+      if counter is not clockFrame(app: app, audio: audio) {
+        test.mismatches = test.mismatches + 1
+      }
+      loop var i: Int = 0, i < refreshSamples, ++i {
+        let sample: Int = soundStart + i
+        if sample >= test.restartSample + fadeSamples {
+          let position: Int = test.restartPosition + sample - test.restartSample
+          if position < 89 * 1601 {
+            let error: Float = abs(
+              value: sound.copyAtDefault(index: i * 2) - toneAt(position: position)
+            )
+            test.toneError = max(a: test.toneError, b: error)
+          }
+        }
+      }
+    }
+    if since is 21 {
+      check(
+        test: test
+        name: "on release it plays on from frame {test.firstCounter}: the frames follow the clock, the sound is the tone at that place"
+        passed: app.player.playing and test.mismatches is 0 and test.toneError < 0.02
+      )
+      nextStep(test: test)
+    }
+    ret
+  }
+  if test.step is 6 {
+    if app.player.ended or since > 200 {
+      var icon: String = ""
+      let entityId: EntityId = nodeEntityFor(world: world, nodeId: "PlayIcon")
+      if componentHas(this: world.sprites, entityId: entityId) {
+        let sprite: view Sprite = componentView(this: world.sprites, entityId: entityId)
+        icon = "{sprite.textureKey}"
+      }
+      check(
+        test: test
+        name: "at the end it stops on frame {counter}, the button showing {icon}"
+        passed: app.player.ended and not app.player.playing and counter is 89 and icon is "mat:play_arrow"
+      )
+      test.done = true
+    }
+  }
+}
