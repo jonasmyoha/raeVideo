@@ -566,8 +566,12 @@ Depends on the audio steps for its clock (audio 1/6 to 4/6).
    `packages/video/Mp4Writer.rae` until they move to `lib/media`; the round trip
    in `tests/writer`, ffprobe / ffmpeg / AVFoundation in
    `tools/checkWrittenFiles.sh`; the FFmpeg package's DNxHR and FFV1 encoders
-   as backends of the same API (video 0.7.0, ffmpeg 0.2.0). Not yet: an AAC
-   encoder, input without the readback (QUEUE.md); the offline loop with audio and the round-trip tests
+   as backends of the same API (video 0.7.0, ffmpeg 0.2.0); AAC through
+   AudioToolbox (`AacEncoder`, video 0.8.0: here rather than in Rae's audio
+   package, beside the writer an export uses), its priming the track's edit
+   start, the frames fed its length, AAC's pre-roll written as a roll sample
+   group as Apple does (without it AVFoundation takes the priming out twice).
+   Not yet: input without the readback (QUEUE.md); the offline loop with audio and the round-trip tests
    where the timeline is, in `mediaeditor`.
 5. **The FFmpeg package** (`packages/ffmpeg`, `ffmpeg/v0.1.0`, **landed
    2026-11-14**, §4), dav1d, libvpx, the WebM reader.

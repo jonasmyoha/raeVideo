@@ -433,6 +433,187 @@ int64_t rae_video_vte_copy_config(int64_t handle, uint8_t* into, int64_t capacit
 void rae_video_vte_close(int64_t handle) { (void)handle; }
 #endif
 
+/* ---- AAC through AudioToolbox -------------------------------------------------
+ * One AudioConverter from float PCM to AAC-LC. The PCM waits in a buffer the
+ * converter's input callback reads from; a pull asks for one packet. Platform
+ * reason: AAC is the platform's to encode (no permissive encoder; docs/design.md
+ * §3.1). Loaded at run time, as the audio package loads it for decoding. */
+#if defined(__APPLE__)
+#include <AudioToolbox/AudioConverter.h>
+
+typedef OSStatus (*RaeAacNew)(const AudioStreamBasicDescription*, const AudioStreamBasicDescription*,
+                              AudioConverterRef*);
+typedef OSStatus (*RaeAacSet)(AudioConverterRef, AudioConverterPropertyID, UInt32, const void*);
+typedef OSStatus (*RaeAacGet)(AudioConverterRef, AudioConverterPropertyID, UInt32*, void*);
+typedef OSStatus (*RaeAacFill)(AudioConverterRef, AudioConverterComplexInputDataProc, void*, UInt32*,
+                               AudioBufferList*, AudioStreamPacketDescription*);
+typedef OSStatus (*RaeAacDispose)(AudioConverterRef);
+
+static struct {
+  RaeAacNew create;
+  RaeAacSet set;
+  RaeAacGet get;
+  RaeAacFill fill;
+  RaeAacDispose dispose;
+} g_rae_aac;
+static pthread_once_t g_rae_aac_once = PTHREAD_ONCE_INIT;
+
+static void rae_aac_load(void) {
+  void* toolbox = rae_encoder_framework("AudioToolbox");
+  if (!toolbox) return;
+  g_rae_aac.create = (RaeAacNew)dlsym(toolbox, "AudioConverterNew");
+  g_rae_aac.set = (RaeAacSet)dlsym(toolbox, "AudioConverterSetProperty");
+  g_rae_aac.get = (RaeAacGet)dlsym(toolbox, "AudioConverterGetProperty");
+  g_rae_aac.fill = (RaeAacFill)dlsym(toolbox, "AudioConverterFillComplexBuffer");
+  g_rae_aac.dispose = (RaeAacDispose)dlsym(toolbox, "AudioConverterDispose");
+}
+
+/* The callback's answer when the PCM runs out before a flush: the converter
+ * stops and keeps what it has */
+#define RAE_AAC_NEEDS_MORE ((OSStatus)'more')
+
+typedef struct {
+  AudioConverterRef converter;
+  int64_t channels;
+  float* pcm;
+  int64_t frames;
+  int64_t capacity;
+  /* frames handed to the converter by the last callback (dropped from the
+   * buffer at the next one: the converter reads them until then) */
+  int64_t lent;
+  int flushing;
+} RaeAacEncoder;
+
+static OSStatus rae_aac_input(AudioConverterRef converter, UInt32* packets, AudioBufferList* data,
+                              AudioStreamPacketDescription** descriptions, void* user) {
+  (void)converter; (void)descriptions;
+  RaeAacEncoder* encoder = (RaeAacEncoder*)user;
+  if (encoder->lent > 0) {
+    memmove(encoder->pcm, encoder->pcm + encoder->lent * encoder->channels,
+            (size_t)((encoder->frames - encoder->lent) * encoder->channels) * sizeof(float));
+    encoder->frames -= encoder->lent;
+    encoder->lent = 0;
+  }
+  if (encoder->frames == 0) {
+    *packets = 0;
+    data->mBuffers[0].mDataByteSize = 0;
+    data->mBuffers[0].mData = NULL;
+    return encoder->flushing ? noErr : RAE_AAC_NEEDS_MORE;
+  }
+  int64_t give = encoder->frames;
+  if (give > (int64_t)*packets) give = (int64_t)*packets;
+  data->mNumberBuffers = 1;
+  data->mBuffers[0].mNumberChannels = (UInt32)encoder->channels;
+  data->mBuffers[0].mData = encoder->pcm;
+  data->mBuffers[0].mDataByteSize = (UInt32)(give * encoder->channels * (int64_t)sizeof(float));
+  *packets = (UInt32)give;
+  encoder->lent = give;
+  return noErr;
+}
+
+int64_t rae_video_aac_open(int64_t sample_rate, int64_t channels, int64_t bit_rate) {
+  pthread_once(&g_rae_aac_once, rae_aac_load);
+  if (!g_rae_aac.create || !g_rae_aac.fill) return 0;
+  AudioStreamBasicDescription input;
+  memset(&input, 0, sizeof(input));
+  input.mSampleRate = (Float64)sample_rate;
+  input.mFormatID = kAudioFormatLinearPCM;
+  input.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+  input.mBytesPerPacket = (UInt32)(4 * channels);
+  input.mFramesPerPacket = 1;
+  input.mBytesPerFrame = (UInt32)(4 * channels);
+  input.mChannelsPerFrame = (UInt32)channels;
+  input.mBitsPerChannel = 32;
+  AudioStreamBasicDescription output;
+  memset(&output, 0, sizeof(output));
+  output.mSampleRate = (Float64)sample_rate;
+  output.mFormatID = kAudioFormatMPEG4AAC;
+  output.mFormatFlags = kMPEG4Object_AAC_LC;
+  output.mFramesPerPacket = 1024;
+  output.mChannelsPerFrame = (UInt32)channels;
+  RaeAacEncoder* encoder = (RaeAacEncoder*)calloc(1, sizeof(RaeAacEncoder));
+  if (!encoder) return 0;
+  encoder->channels = channels;
+  if (g_rae_aac.create(&input, &output, &encoder->converter) != noErr) {
+    free(encoder);
+    return 0;
+  }
+  if (bit_rate > 0) {
+    UInt32 rate = (UInt32)bit_rate;
+    g_rae_aac.set(encoder->converter, kAudioConverterEncodeBitRate, sizeof(rate), &rate);
+  }
+  return (int64_t)(intptr_t)encoder;
+}
+
+int64_t rae_video_aac_priming(int64_t handle) {
+  RaeAacEncoder* encoder = (RaeAacEncoder*)(intptr_t)handle;
+  if (!encoder) return -1;
+  AudioConverterPrimeInfo prime;
+  UInt32 size = sizeof(prime);
+  if (g_rae_aac.get(encoder->converter, kAudioConverterPrimeInfo, &size, &prime) != noErr) return -1;
+  return (int64_t)prime.leadingFrames;
+}
+
+int64_t rae_video_aac_feed(int64_t handle, float* samples, int64_t frames) {
+  RaeAacEncoder* encoder = (RaeAacEncoder*)(intptr_t)handle;
+  if (!encoder || !samples || frames < 0) return -1;
+  if (encoder->frames + frames > encoder->capacity) {
+    int64_t capacity = (encoder->frames + frames) * 2;
+    float* grown = (float*)realloc(encoder->pcm, (size_t)(capacity * encoder->channels) * sizeof(float));
+    if (!grown) return -1;
+    encoder->pcm = grown;
+    encoder->capacity = capacity;
+  }
+  memcpy(encoder->pcm + encoder->frames * encoder->channels, samples,
+         (size_t)(frames * encoder->channels) * sizeof(float));
+  encoder->frames += frames;
+  return 0;
+}
+
+int64_t rae_video_aac_pull(int64_t handle, uint8_t* into, int64_t capacity, int64_t flush) {
+  RaeAacEncoder* encoder = (RaeAacEncoder*)(intptr_t)handle;
+  if (!encoder || !into) return -1;
+  if (!flush && encoder->frames - encoder->lent < 1024) return 0;
+  encoder->flushing = flush ? 1 : 0;
+  AudioBufferList list;
+  list.mNumberBuffers = 1;
+  list.mBuffers[0].mNumberChannels = (UInt32)encoder->channels;
+  list.mBuffers[0].mDataByteSize = (UInt32)capacity;
+  list.mBuffers[0].mData = into;
+  UInt32 packets = 1;
+  AudioStreamPacketDescription description;
+  memset(&description, 0, sizeof(description));
+  OSStatus status = g_rae_aac.fill(encoder->converter, rae_aac_input, encoder, &packets, &list, &description);
+  if (status != noErr && status != RAE_AAC_NEEDS_MORE) return (int64_t)(status < 0 ? status : -status);
+  if (packets == 0) return 0;
+  return (int64_t)list.mBuffers[0].mDataByteSize;
+}
+
+void rae_video_aac_close(int64_t handle) {
+  RaeAacEncoder* encoder = (RaeAacEncoder*)(intptr_t)handle;
+  if (!encoder) return;
+  if (encoder->converter) g_rae_aac.dispose(encoder->converter);
+  free(encoder->pcm);
+  free(encoder);
+}
+
+#else
+int64_t rae_video_aac_open(int64_t sample_rate, int64_t channels, int64_t bit_rate) {
+  (void)sample_rate; (void)channels; (void)bit_rate;
+  return 0;
+}
+int64_t rae_video_aac_priming(int64_t encoder) { (void)encoder; return -1; }
+int64_t rae_video_aac_feed(int64_t encoder, float* samples, int64_t frames) {
+  (void)encoder; (void)samples; (void)frames;
+  return -1;
+}
+int64_t rae_video_aac_pull(int64_t encoder, uint8_t* into, int64_t capacity, int64_t flush) {
+  (void)encoder; (void)into; (void)capacity; (void)flush;
+  return -1;
+}
+void rae_video_aac_close(int64_t encoder) { (void)encoder; }
+#endif
+
 /* ---- registered encoders ----------------------------------------------------
  * Written once per backend at start-up on the main thread, then only read. */
 #define RAE_ENCODER_BACKEND_MAX 8

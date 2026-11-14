@@ -36,5 +36,15 @@ if ! perl -e 'alarm shift; exec @ARGV' 300 swift tools/checkAvFoundation.swift $
   grep -v 'warning' build/writer/avfoundation.log | grep 'FAILED\|cannot' | head -5
   echo "FAIL: AVFoundation could not decode every file"; failed=1
 fi
+# the AAC round trip (tests/aac): its edit makes the sound exactly the 100,000
+# frames encoded, for ffprobe and for AVFoundation
+if [ -f build/writer/aacTone.mp4 ]; then
+  duration=$(ffprobe -v error -show_entries stream=duration -of csv=p=0 build/writer/aacTone.mp4)
+  [ "$duration" = "2.083333" ] || { echo "FAIL: ffprobe says the AAC lasts $duration s, not 100,000 frames"; failed=1; }
+  grep -q 'aacTone.mp4: decoded: soun 100000$' build/writer/avfoundation.log || {
+    echo "FAIL: AVFoundation does not decode the AAC's 100,000 frames: $(grep aacTone build/writer/avfoundation.log)"
+    failed=1
+  }
+fi
 [ "$failed" -eq 0 ] && echo "ffprobe, ffmpeg and AVFoundation read every written file; the PCM is exact"
 exit "$failed"

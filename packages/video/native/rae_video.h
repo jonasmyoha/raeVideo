@@ -140,6 +140,21 @@ int64_t rae_video_registered_encoder_copy_config(int64_t backend, int64_t encode
                                                  int64_t capacity);
 void rae_video_registered_encoder_close(int64_t backend, int64_t encoder);
 
+/* ---- AAC encoding (AudioToolbox, native/rae_video_encoder.c) --------------
+ * An AAC-LC encoder for interleaved 32-bit float PCM at sample_rate and
+ * channels, bit_rate bits per second (0: its own). A handle, or 0. */
+int64_t rae_video_aac_open(int64_t sample_rate, int64_t channels, int64_t bit_rate);
+/* The frames the encoder puts before the sound (its priming, 2112 for
+ * AudioToolbox's AAC-LC): the track's edit starts there */
+int64_t rae_video_aac_priming(int64_t encoder);
+/* Hands it `frames` frames of PCM (kept until they are encoded) */
+int64_t rae_video_aac_feed(int64_t encoder, float* samples, int64_t frames);
+/* One AAC packet (1024 frames) into `into`: its size, 0 when there is not a
+ * packet's worth of PCM yet (with `flush`: when everything, padded, is out),
+ * or a negative error */
+int64_t rae_video_aac_pull(int64_t encoder, uint8_t* into, int64_t capacity, int64_t flush);
+void rae_video_aac_close(int64_t encoder);
+
 /* ---- files for writing ------------------------------------------------------ */
 /* Creates (or empties) a file for writing: its descriptor, or a negative errno */
 int64_t rae_video_file_create(uint8_t* path_z);

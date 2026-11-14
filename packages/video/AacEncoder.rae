@@ -1,0 +1,182 @@
+# video/AacEncoder — PCM in, AAC out (docs/design.md §6.4): AAC-LC through
+# AudioToolbox's AudioConverter, for the sound of an export
+# (video/MediaWriter's AAC tracks).
+#
+#     var aac: AacEncoder = openAacEncoder(sampleRate: 48000, channels: 2, bitRate: 192000)
+#     let sound: Int = writer.addAacTrack(channels: 2, sampleRate: 48000,
+#     audioSpecificConfig: aac.audioSpecificConfig())
+#     writer.setEditStart(trackIndex: sound, start: aac.priming)
+#     aac.feed(samples: block, frames: 1024)          # interleaved floats, any amount
+#     loop let packet: AacPacket in aac.takePackets(flush: false) { writer.writePacket(...) }
+#     ... at the end: aac.takePackets(flush: true), and
+#     writer.setEditLength(trackIndex: sound, length: aac.framesFed)
+#
+# Where it lives: here, beside the writer an export uses, rather than in Rae's
+# audio package (which decodes AAC through the same AudioConverter): an encoder
+# there needs a Rae release, and the editor's export takes it from packages/video
+# either way. Each packet is 1024 frames, decoded at packetIndex x 1024 in the
+# track's units (its sample rate). AudioToolbox puts `priming` frames (2112)
+# before the sound: the track's edit starts there, and lasts `framesFed`, so a
+# reader's sound starts at the first frame fed and ends at the last.
+import Math
+open video/VideoGlue
+
+# The frames in one AAC packet
+const aacPacketFrames: Int = 1024
+
+type AacPacket {
+  bytes: List(UInt8)
+  # the packet's decode time, in the track's units (frames)
+  decodeTime: Int
+}
+
+type AacEncoder {
+  handle: Int
+  sampleRate: Int
+  channels: Int
+  priming: Int
+  framesFed: Int
+  packetsOut: Int
+  error: String
+}
+
+func openAacEncoder(sampleRate: view Int, channels: view Int, bitRate: view Int) ret AacEncoder {
+  var encoder: AacEncoder = {
+    handle: 0
+    sampleRate: sampleRate
+    channels: channels
+    priming: 0
+    framesFed: 0
+    packetsOut: 0
+    error: ""
+  }
+  unsafe {
+    encoder.handle = rae_video_aac_open(
+      sampleRate: sampleRate
+      channels: channels
+      bitRate: bitRate
+    )
+    if encoder.handle is not 0 {
+      encoder.priming = rae_video_aac_priming(encoder: encoder.handle)
+    }
+  }
+  if encoder.handle is 0 {
+    encoder.error = "AudioToolbox has no AAC encoder for {channels} channels at {sampleRate} Hz"
+  } else if encoder.priming < 0 {
+    encoder.error = "AudioToolbox did not say its AAC priming"
+  }
+  ret encoder
+}
+
+# MPEG-4's sampling frequency index of a rate, 15 (an explicit rate) for another
+func samplingFrequencyIndex(sampleRate: view Int) ret Int {
+  let rates: List(Int) = List(Int) {
+    96000
+    88200
+    64000
+    48000
+    44100
+    32000
+    24000
+    22050
+    16000
+    12000
+    11025
+    8000
+    7350
+  }
+  loop var i: Int = 0, i < rates.length(), ++i {
+    if rates.copyAtDefault(index: i) is sampleRate {
+      ret i
+    }
+  }
+  ret 15
+}
+
+# The AudioSpecificConfig of AAC-LC at this rate and channel count (ISO/IEC
+# 14496-3: object type 2 in 5 bits, the frequency index in 4, the channel
+# configuration in 4, three zero bits): the esds's decoder-specific info
+func audioSpecificConfig(this: view AacEncoder) ret List(UInt8) {
+  let index: Int = samplingFrequencyIndex(sampleRate: this.sampleRate)
+  var bytes: List(UInt8) = {}
+  if index is 15 {
+    # an explicit rate: 5 + 4 + 24 + 4 + 3 bits
+    let bits: Int = (2 shl 35) bitor (15 shl 31) bitor (this.sampleRate shl 7) bitor (this.channels shl 3)
+    loop var i: Int = 0, i < 5, ++i {
+      bytes.add(value: ((bits shr (32 - 8 * i)) bitand 255) as UInt8)
+    }
+    ret bytes
+  }
+  let bits: Int = (2 shl 11) bitor (index shl 7) bitor (this.channels shl 3)
+  bytes.add(value: ((bits shr 8) bitand 255) as UInt8)
+  bytes.add(value: (bits bitand 255) as UInt8)
+  ret bytes
+}
+
+# Hands it `frames` frames of interleaved float PCM
+func feed(this: mod AacEncoder, samples: view List(Float), frames: view Int) ret Bool {
+  if this.handle is 0 or samples.length() < frames * this.channels {
+    ret false
+  }
+  var result: Int = -1
+  unsafe {
+    result = rae_video_aac_feed(encoder: this.handle, samples: samples.data, frames: frames)
+  }
+  if result is not 0 {
+    this.error = "feeding {frames} frames failed"
+    ret false
+  }
+  this.framesFed = this.framesFed + frames
+  ret true
+}
+
+# The packets the PCM fed so far makes; with `flush` (at the end), all of
+# them, the last padded
+func takePackets(this: mod AacEncoder, flush: view Bool) ret List(AacPacket) {
+  var packets: List(AacPacket) = {}
+  if this.handle is 0 {
+    ret packets
+  }
+  var flushing: Int = 0
+  if flush {
+    flushing = 1
+  }
+  loop true {
+    var bytes: List(UInt8) = List.create(UInt8, cap: 8192)
+    bytes.addDefaults(count: 8192)
+    var size: Int = 0
+    unsafe {
+      size = rae_video_aac_pull(
+        encoder: this.handle
+        into: bytes.data
+        capacity: 8192
+        flush: flushing
+      )
+    }
+    if size < 0 {
+      this.error = "AudioToolbox failed ({size})"
+      ret packets
+    }
+    if size is 0 {
+      ret packets
+    }
+    var packet: List(UInt8) = List.create(UInt8, cap: size)
+    loop var i: Int = 0, i < size, ++i {
+      packet.add(value: bytes.copyAtDefault(index: i))
+    }
+    packets.add(
+      value: AacPacket { bytes: own packet, decodeTime: this.packetsOut * aacPacketFrames }
+    )
+    this.packetsOut = this.packetsOut + 1
+  }
+  ret packets
+}
+
+func close(this: mod AacEncoder) {
+  if this.handle is not 0 {
+    unsafe {
+      rae_video_aac_close(encoder: this.handle)
+    }
+    this.handle = 0
+  }
+}

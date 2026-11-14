@@ -1,0 +1,7 @@
+AudioToolbox's AAC-LC: 2112 frames of priming; AudioSpecificConfig 2 bytes
+100000 frames fed, 100 packets written: true
+decoded back: 100000 frames, 2 channels at 48000 Hz: as long as fed true
+it matches the tone best at lag 0: starts at the first frame fed true
+channel 0: within RMS 0.002 and largest 0.05 of the tone: true
+channel 1: within RMS 0.002 and largest 0.05 of the tone: true
+done

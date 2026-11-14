@@ -8,7 +8,8 @@
 # edit (edts/elst) when the track has one, mdia (mdhd, hdlr, minf with
 # vmhd/smhd, dinf, and stbl: stsd, stts, stss, ctts, stsc, stsz, co64). Sample
 # entries: H.264 (avc1 + avcC), HEVC (hvc1 + hvcC), ProRes (apco ... ap4h),
-# each with a colr box (BT.709); AAC (mp4a + esds); 16-bit PCM (MOV's sowt).
+# each with a colr box (BT.709); AAC (mp4a + esds, and its pre-roll as a roll
+# sample group); 16-bit PCM (MOV's sowt).
 import Math
 
 enum ContainerKind { mov, mp4 }
@@ -382,7 +383,43 @@ func co64Box(table: view SampleTable) ret List(UInt8) {
   )
 }
 
-func stblBox(sampleEntry: view List(UInt8), table: view SampleTable) ret List(UInt8) {
+# AAC's pre-roll as a sample group (sgpd + sbgp, group type roll): every
+# sample needs the one before it to decode right (roll distance -1), as
+# Apple writes it; AVFoundation reads an AAC track's edit right only with it
+func rollGroupBoxes(table: view SampleTable) ret List(UInt8) {
+  var description: List(UInt8) = {}
+  putText(bytes: description, text: "roll")
+  putU32(bytes: description, value: 2)
+  putU32(bytes: description, value: 1)
+  putU16(bytes: description, value: 65535)
+  var mapping: List(UInt8) = {}
+  putText(bytes: mapping, text: "roll")
+  putU32(bytes: mapping, value: 1)
+  putU32(bytes: mapping, value: table.sampleCount)
+  putU32(bytes: mapping, value: 1)
+  var bytes: List(UInt8) = fullBox(
+    kind: "sgpd"
+    version: 1
+    flags: 0
+    body: description
+  )
+  putBytes(
+    bytes: bytes
+    more: fullBox(
+      kind: "sbgp"
+      version: 0
+      flags: 0
+      body: mapping
+    )
+  )
+  ret bytes
+}
+
+func stblBox(
+  sampleEntry: view List(UInt8)
+  table: view SampleTable
+  preRoll: view Bool
+) ret List(UInt8) {
   var stsdBody: List(UInt8) = {}
   putU32(bytes: stsdBody, value: 1)
   putBytes(bytes: stsdBody, more: sampleEntry)
@@ -404,6 +441,9 @@ func stblBox(sampleEntry: view List(UInt8), table: view SampleTable) ret List(UI
   putBytes(bytes: body, more: stscBox(table: table))
   putBytes(bytes: body, more: stszBox(table: table))
   putBytes(bytes: body, more: co64Box(table: table))
+  if preRoll {
+    putBytes(bytes: body, more: rollGroupBoxes(table: table))
+  }
   ret box(kind: "stbl", body: body)
 }
 
@@ -420,6 +460,8 @@ type TrackHeader {
   # the edit: the part of the media shown, from `editStart` (track units), -1
   # for none
   editStart: Int
+  # AAC: each sample needs the one before (the roll group)
+  preRoll: Bool
 }
 
 func trakBox(
@@ -547,7 +589,10 @@ func trakBox(
       )
     )
   )
-  putBytes(bytes: minf, more: stblBox(sampleEntry: sampleEntry, table: table))
+  putBytes(
+    bytes: minf
+    more: stblBox(sampleEntry: sampleEntry, table: table, preRoll: header.preRoll)
+  )
   var mdia: List(UInt8) = {}
   putBytes(
     bytes: mdia

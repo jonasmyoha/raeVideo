@@ -23,8 +23,9 @@ import Math
 open video/Mp4Writer
 open video/VideoGlue
 
-# The movie's own time unit (mvhd, tkhd durations, edits): milliseconds
-const movieTimescale: Int = 1000
+# The movie's own time unit (mvhd, tkhd durations, edits) when it has no
+# tracks: milliseconds
+const defaultMovieTimescale: Int = 1000
 
 type WaitingPacket {
   bytes: List(UInt8)
@@ -51,8 +52,10 @@ type WriterTrack {
   configKind: String
   table: SampleTable
   waiting: List(WaitingPacket)
-  # the edit: the media shown from `editStart`, -1 for none
+  # the edit: the media shown from `editStart` (-1 for none), for
+  # `editLength` (track units; -1: to the end)
   editStart: Int
+  editLength: Int
 }
 
 type MediaWriter {
@@ -129,6 +132,7 @@ func newTrack(sound: view Bool, codec: view String, timescale: view Int) ret Wri
     table: createSampleTable()
     waiting: {}
     editStart: -1
+    editLength: -1
   }
 }
 
@@ -194,11 +198,35 @@ func setTrackConfig(this: mod MediaWriter, trackIndex: view Int, config: view Li
 }
 
 # The track shows its media from `start` (track units): an AAC track's
-# priming frames left out
+# priming frames left out. setEditLength says how much of it.
 func setEditStart(this: mod MediaWriter, trackIndex: view Int, start: view Int) {
   if let track: mod WriterTrack = this.tracks.modAt(index: trackIndex) {
     track.editStart = start
   }
+}
+
+# The track shows `length` units of its media from its edit's start (an AAC
+# track: the frames that were encoded, not the encoder's padding at the end)
+func setEditLength(this: mod MediaWriter, trackIndex: view Int, length: view Int) {
+  if let track: mod WriterTrack = this.tracks.modAt(index: trackIndex) {
+    track.editLength = length
+    if track.editStart < 0 {
+      track.editStart = 0
+    }
+  }
+}
+
+# The part of a track shown (track units): its edit's length, or what follows
+# the edit's start
+func shownLength(track: view WriterTrack) ret Int {
+  let duration: Int = trackDuration(track: track)
+  if track.editLength >= 0 {
+    ret min(a: track.editLength, b: max(a: 0, b: duration - max(a: 0, b: track.editStart)))
+  }
+  if track.editStart > 0 {
+    ret max(a: 0, b: duration - track.editStart)
+  }
+  ret duration
 }
 
 # Writes a waiting packet's bytes as one chunk and enters it in its table
@@ -331,6 +359,21 @@ func writePcm(
   ret this.flushWaiting(everything: false)
 }
 
+# The movie's time unit: the first sound track's (its sample rate), so a sound
+# edit's length is exact in it (an AAC track shows exactly the frames encoded),
+# else the first track's
+func movieTimescaleOf(this: view MediaWriter) ret Int {
+  loop let track: view WriterTrack in this.tracks {
+    if track.sound {
+      ret track.timescale
+    }
+  }
+  if let first: view WriterTrack = this.tracks.viewAt(index: 0) {
+    ret first.timescale
+  }
+  ret defaultMovieTimescale
+}
+
 # A track's length in its own units
 func trackDuration(track: view WriterTrack) ret Int {
   var total: Int = 0
@@ -347,16 +390,13 @@ func finish(this: mod MediaWriter) ret Bool {
     ret false
   }
   var ok: Bool = this.error.length() is 0 and this.flushWaiting(everything: true)
+  let movieTimescale: Int = this.movieTimescaleOf()
   let mdatSize: Int = this.offset - this.mdatStart
   var moov: List(UInt8) = {}
   var movieDuration: Int = 0
   loop var i: Int = 0, i < this.tracks.length(), ++i {
     if let track: view WriterTrack = this.tracks.viewAt(index: i) {
-      let duration: Int = trackDuration(track: track)
-      var shown: Int = duration
-      if track.editStart > 0 {
-        shown = max(a: 0, b: duration - track.editStart)
-      }
+      let shown: Int = shownLength(track: track)
       let inMovie: Int = (shown * movieTimescale + track.timescale - 1) / max(
         a: 1
         b: track.timescale
@@ -367,10 +407,7 @@ func finish(this: mod MediaWriter) ret Bool {
   loop var i: Int = 0, i < this.tracks.length(), ++i {
     if let track: view WriterTrack = this.tracks.viewAt(index: i) {
       let duration: Int = trackDuration(track: track)
-      var shown: Int = duration
-      if track.editStart > 0 {
-        shown = max(a: 0, b: duration - track.editStart)
-      }
+      let shown: Int = shownLength(track: track)
       var entry: List(UInt8) = {}
       if track.sound {
         entry = soundSampleEntry(
@@ -405,6 +442,7 @@ func finish(this: mod MediaWriter) ret Bool {
               b: track.timescale
             )
             editStart: track.editStart
+            preRoll: track.codec is "mp4a"
           }
           sampleEntry: entry
           table: track.table

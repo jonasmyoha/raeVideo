@@ -274,6 +274,29 @@ func rae_video_registered_encoder_close(
   encoder: Int
 ) unsafe extern("rae_video_registered_encoder_close")
 
+func rae_video_aac_open(
+  sampleRate: Int
+  channels: Int
+  bitRate: Int
+) unsafe extern("rae_video_aac_open") ret Int
+
+func rae_video_aac_priming(encoder: Int) unsafe extern("rae_video_aac_priming") ret Int
+
+func rae_video_aac_feed(
+  encoder: Int
+  samples: Buffer(Float)
+  frames: Int
+) unsafe extern("rae_video_aac_feed") ret Int
+
+func rae_video_aac_pull(
+  encoder: Int
+  into: Buffer(UInt8)
+  capacity: Int
+  flush: Int
+) unsafe extern("rae_video_aac_pull") ret Int
+
+func rae_video_aac_close(encoder: Int) unsafe extern("rae_video_aac_close")
+
 func rae_video_file_create(pathZ: Buffer(UInt8)) unsafe extern("rae_video_file_create") ret Int
 
 func rae_video_file_write_at(

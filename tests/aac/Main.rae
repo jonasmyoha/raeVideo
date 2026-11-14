@@ -1,0 +1,142 @@
+# video/AacEncoder: a round trip of a test tone through AAC (docs/design.md
+# §6.4). 100,000 frames of stereo at 48 kHz (a 1 kHz sine on the left, 750 Hz
+# on the right, both at -12 dBFS; not a whole number of 1024-frame packets)
+# are encoded by AudioToolbox, written with video/MediaWriter into an MP4 (its
+# esds from audioSpecificConfig, its edit from the priming and the frames fed),
+# and decoded back by Rae's audio package, which follows the edit:
+#
+# - the sound decoded is exactly as long as the sound fed;
+# - it starts at the first frame fed: compared with the tone at lags -32..32,
+#   it matches best at 0 (the edit took the priming out);
+# - it is the tone within the stated error (AAC is lossy): RMS under 0.002
+#   (-54 dBFS) and largest difference under 0.05, each channel (the largest
+#   are where the tone stops dead at the end, a cut AAC smears a little).
+#
+# The file stays in build/writer for tools/checkWrittenFiles.sh (ffprobe,
+# ffmpeg, AVFoundation).
+import Math
+open Sys
+open audio/Decoder
+open audio/Sound
+open video/AacEncoder
+open video/MediaWriter
+open video/Mp4Writer
+
+const frames: Int = 100000
+
+const sampleRate: Int = 48000
+
+const path: String = "build/writer/aacTone.mp4"
+
+func toneAt(frame: view Int, channel: view Int) ret Float {
+  var hertz: Int = 1000
+  if channel is 1 {
+    hertz = 750
+  }
+  let cycles: Int = frame * hertz % sampleRate
+  ret 0.25 * sin(x: 2.0 * pi * (cycles as Float) / (sampleRate as Float))
+}
+
+func main() ret Int {
+  let made: Bool = makeDir(path: "build")
+  let madeWriter: Bool = makeDir(path: "build/writer")
+  var aac: AacEncoder = openAacEncoder(sampleRate: sampleRate, channels: 2, bitRate: 192000)
+  if aac.error.length() > 0 {
+    log("FAIL: {aac.error}")
+    ret 1
+  }
+  log(
+    "AudioToolbox's AAC-LC: {aac.priming} frames of priming; AudioSpecificConfig {aac.audioSpecificConfig().length()} bytes"
+  )
+  var writer: MediaWriter = openMediaWriter(path: path, container: ContainerKind.mp4)
+  let track: Int = writer.addAacTrack(
+    channels: 2
+    sampleRate: sampleRate
+    audioSpecificConfig: aac.audioSpecificConfig()
+  )
+  writer.setEditStart(trackIndex: track, start: aac.priming)
+  var fed: Int = 0
+  var packets: Int = 0
+  loop fed < frames or true {
+    let count: Int = min(a: 1600, b: frames - fed)
+    var block: List(Float) = List.create(Float, cap: count * 2)
+    loop var i: Int = 0, i < count, ++i {
+      block.add(value: toneAt(frame: fed + i, channel: 0))
+      block.add(value: toneAt(frame: fed + i, channel: 1))
+    }
+    if count > 0 {
+      let given: Bool = aac.feed(samples: block, frames: count)
+      fed = fed + count
+    }
+    let finished: Bool = fed >= frames
+    loop let packet: view AacPacket in aac.takePackets(flush: finished) {
+      let wrote: Bool = writer.writePacket(
+        trackIndex: track
+        bytes: packet.bytes
+        time: packet.decodeTime
+        decodeTime: packet.decodeTime
+        duration: 1024
+        keyframe: true
+      )
+      packets = packets + 1
+    }
+    if finished {
+      break
+    }
+  }
+  writer.setEditLength(trackIndex: track, length: aac.framesFed)
+  let written: Bool = writer.finish()
+  aac.close()
+  log("{fed} frames fed, {packets} packets written: {written and aac.error.length() is 0}")
+
+  let sound: SoundData = readAnySoundFile(path: path)
+  if sound.error.length() > 0 {
+    log("FAIL: reading it back: {sound.error}")
+    ret 1
+  }
+  log(
+    "decoded back: {sound.frameCount} frames, {sound.channels} channels at {sound.sampleRate} Hz: as long as fed {sound.frameCount is frames}"
+  )
+  # the lag at which the decoded sound matches the tone best
+  var bestLag: Int = 0
+  var bestError: Float = 1000000.0
+  loop var lag: Int = -32, lag <= 32, ++lag {
+    var error: Float = 0.0
+    loop var frame: Int = 24000, frame < 72000, ++frame {
+      let difference: Float = sampleAt(samples: sound.samples, index: (frame + lag) * 2) - toneAt(
+        frame: frame
+        channel: 0
+      )
+      error = error + difference * difference
+    }
+    if error < bestError {
+      bestError = error
+      bestLag = lag
+    }
+  }
+  log("it matches the tone best at lag {bestLag}: starts at the first frame fed {bestLag is 0}")
+  var ok: Bool = written and sound.frameCount is frames and bestLag is 0
+  loop var channel: Int = 0, channel < 2, ++channel {
+    var squares: Float64 = 0.0
+    var largest: Float = 0.0
+    loop var frame: Int = 0, frame < min(a: frames, b: sound.frameCount), ++frame {
+      let difference: Float = sampleAt(samples: sound.samples, index: frame * 2 + channel) - toneAt(
+        frame: frame
+        channel: channel
+      )
+      squares = squares + ((difference * difference) as Float64)
+      largest = max(a: largest, b: abs(value: difference))
+    }
+    let rms: Float64 = sqrt(x: (squares / (frames as Float64)) as Float) as Float64
+    log(
+      "channel {channel}: within RMS 0.002 and largest 0.05 of the tone: {rms < 0.002 and largest < 0.05}"
+    )
+    ok = ok and rms < 0.002 and largest < 0.05
+  }
+  if not ok {
+    log("FAIL")
+    ret 1
+  }
+  log("done")
+  ret 0
+}
