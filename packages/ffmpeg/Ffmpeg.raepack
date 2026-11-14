@@ -2,7 +2,7 @@ pack Ffmpeg {
   format: "raepack"
   version: 1
   meta: {
-    version: "0.1.0"
+    version: "0.2.0"
   }
   rae: {
     version: "0.3.123"
@@ -11,8 +11,8 @@ pack Ffmpeg {
     dep video: {
       git: "https://github.com/jonasmyoha/raeVideo.git"
       subdir: "packages/video"
-      version: "0.2.0"
-      hash: "git-tree:1402b15d972caed9bc00d4a239659a4f1e809e9f"
+      version: "0.7.0"
+      hash: "git-tree:b9478290dd1f6ce129d02a38140b00cb832eda61"
     }
   }
   native: {

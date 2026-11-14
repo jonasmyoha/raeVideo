@@ -10,7 +10,7 @@ The design is [docs/design.md](docs/design.md); what lives here,
 
 ## Packages
 
-- `packages/video` (0.6.0): MP4 and MOV reading (`MediaReader`), decoding
+- `packages/video` (0.7.0): MP4 and MOV reading (`MediaReader`), decoding
   through VideoToolbox on Apple (H.264, HEVC, ProRes: `VideoDecoder`,
   `FrameStream`) or a registered backend, a frame on the GPU as RGBA
   (`YuvPicture`), 10-bit frames as linear light in rgba16float
@@ -20,10 +20,11 @@ The design is [docs/design.md](docs/design.md); what lives here,
   VideoToolbox (`VideoEncoder`: H.264, HEVC, ProRes) and MOV / MP4 writing
   (`MediaWriter`), and a simple player on Rae's audio clock (`VideoPlayer`). It
   depends on Rae's `audio` package 0.15.1.
-- `packages/ffmpeg` (0.1.0): FFmpeg 9.0.2, built LGPL-only from its pinned
+- `packages/ffmpeg` (0.2.0): FFmpeg 9.0.2, built LGPL-only from its pinned
   tarball the first time a program uses the package, loaded at run time, as
   one more decoder of the video package (DNxHD/DNxHR, VP8, VP9, FFV1, ProRes):
-  `addFfmpegBackend(table:)`. A program that uses it ships the files in its
+  `addFfmpegBackend(table:)`, and encoder (DNxHR LB and HQ, FFV1):
+  `addFfmpegEncoders(table:)`. A program that uses it ships the files in its
   build's `legal/` folder (`packages/ffmpeg/legal/NOTICE.md`). macOS; never iOS.
 
 ## Examples
@@ -39,14 +40,14 @@ A program takes a package by git at a release tag:
 dep video: {
   git: "https://github.com/jonasmyoha/raeVideo.git"
   subdir: "packages/video"
-  version: "0.2.0"
-  hash: "git-tree:1402b15d972caed9bc00d4a239659a4f1e809e9f"
+  version: "0.7.0"
+  hash: "git-tree:b9478290dd1f6ce129d02a38140b00cb832eda61"
 }
 dep ffmpeg: {
   git: "https://github.com/jonasmyoha/raeVideo.git"
   subdir: "packages/ffmpeg"
-  version: "0.1.0"
-  hash: "git-tree:fa511e78cde5aecc56ba2eb3f2e568796cc4b716"
+  version: "0.2.0"
+  hash: "git-tree:6e884a024fe0a5de6de8a64ef5dca5694ba8ed42"
 }
 ```
 

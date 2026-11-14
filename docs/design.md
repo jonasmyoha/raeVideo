@@ -215,6 +215,14 @@ WebM / MXF through its demuxers is not wired yet. Frames come as three planes,
 which `YuvPicture` converts with `yuvPlanarToRgb.wgsl` (8-bit; 10-bit DNxHR
 HQX and VP9 profile 2 are not shown yet).
 
+**Then, 2026-11-15: `packages/ffmpeg` 0.2.0** adds its encoders: DNxHR LB and HQ
+(the dnxhd encoder, 4:2:2) and FFV1 (lossless, given 4:2:0), plugged into
+`VideoEncoder` the way its decoders plug into `VideoDecoder`: a second struct
+of calls (`RaeVideoEncoderCalls`), a Rae table of which backend encodes which
+codec (`EncoderBackend`), the frame converted to planar Y'CbCr on the GPU
+(`rgbaToPlanar.wgsl`) and read back. FFV1's extradata goes in MOV's `glbl` box,
+which `MediaReader` reads back.
+
 Platform notes:
 
 - **iOS:** an LGPL dynamic library inside an App Store app is legally debated
@@ -557,8 +565,9 @@ Depends on the audio steps for its clock (audio 1/6 to 4/6).
    MP4: AAC packets, 16-bit PCM in MOV, interleaved by time), the boxes in
    `packages/video/Mp4Writer.rae` until they move to `lib/media`; the round trip
    in `tests/writer`, ffprobe / ffmpeg / AVFoundation in
-   `tools/checkWrittenFiles.sh`. Not yet: an AAC encoder, the FFmpeg package's
-   encoders, input without the readback (QUEUE.md); the offline loop with audio and the round-trip tests
+   `tools/checkWrittenFiles.sh`; the FFmpeg package's DNxHR and FFV1 encoders
+   as backends of the same API (video 0.7.0, ffmpeg 0.2.0). Not yet: an AAC
+   encoder, input without the readback (QUEUE.md); the offline loop with audio and the round-trip tests
    where the timeline is, in `mediaeditor`.
 5. **The FFmpeg package** (`packages/ffmpeg`, `ffmpeg/v0.1.0`, **landed
    2026-11-14**, §4), dav1d, libvpx, the WebM reader.
