@@ -1,17 +1,20 @@
 # video/VideoDecoder — packets in, frames out (docs/design.md §5 V2), through
 # the first backend of video/VideoBackends that opens for the track's codec.
 #
-#     var decoder: VideoDecoder = openVideoDecoder(track: track, table: defaultVideoBackends())
+#     var decoder: VideoDecoder = openVideoDecoder(track: track, tags: tags, table:
+#     defaultVideoBackends())
 #     var frame: VideoFrame = decoder.decodePacket(packet: packet)
 #     if frame.handle is not 0 { ... frame.copyPlane(plane: 0) ...; releaseFrame(frame: frame) }
 #     decoder.close()
 #
-# Frames come out in decode order, one per packet (VideoToolbox decodes each
-# packet synchronously, without reordering); video/FrameStream puts them in
-# the order they are shown. A frame is 8-bit 4:2:0 in two planes (NV12: Y,
-# then Cb and Cr interleaved at half width and height) and carries the
-# stream's color tags; video/YuvPicture turns it into RGB on the GPU. Its
-# holder releases it (releaseFrame).
+# Frames come out in decode order, one per packet (both backends decode each
+# packet synchronously, without reordering or holding frames back);
+# video/FrameStream puts them in the order they are shown. A frame is 8-bit
+# Y'CbCr: VideoToolbox gives NV12 (Y, then Cb and Cr interleaved at half width
+# and height), a registered backend may give three planes (FrameLayout). It
+# carries the stream's color tags, or the container's where the stream has
+# none. video/YuvPicture turns it into RGB on the GPU. Its holder releases it
+# (releaseFrame).
 import Math
 open media/MediaTime
 open media/Mp4
@@ -45,14 +48,31 @@ enum TransferFunction {
   linear
 }
 
+# How a frame's 8-bit Y'CbCr is laid out in planes
+enum FrameLayout {
+  # one the video package cannot show yet (10-bit, RGB, ...)
+  unsupported
+  # Y, then CbCr interleaved at half width and height
+  nv12
+  # Y, Cb, Cr; chroma at half width and height, half width, full size
+  planar420
+  planar422
+  planar444
+}
+
 type VideoFrame {
-  # the platform's frame (a CVPixelBuffer on Apple); 0 for none
+  # the backend's frame (a CVPixelBuffer from VideoToolbox); 0 for none
   handle: Int
+  backend: VideoBackend
+  # a registered backend's number
+  backendNumber: Int
   sampleIndex: Int
   presentationTime: MediaTime
   width: Int
   height: Int
-  # the pixel format's four characters as an integer ("420v", "420f")
+  layout: FrameLayout
+  # VideoToolbox's pixel format as its four characters ("420v", "420f"); 0
+  # for a registered backend's frame
   pixelFormat: Int
   # full range (0-255) rather than limited (16-235 luma, 16-240 chroma)
   fullRange: Bool
@@ -63,11 +83,14 @@ type VideoFrame {
 
 type VideoDecoder {
   backend: VideoBackend
+  backendNumber: Int
   # the backend's decoder; 0 when none opened
   handle: Int
   codec: String
   width: Int
   height: Int
+  # the container's color tags, for frames whose stream has none
+  tags: ColorTags
   # "" when a backend opened
   error: String
 }
@@ -75,10 +98,13 @@ type VideoDecoder {
 func noVideoFrame() ret VideoFrame {
   ret VideoFrame {
     handle: 0
+    backend: VideoBackend.none
+    backendNumber: 0
     sampleIndex: -1
     presentationTime: mediaTime(value: 0, numerator: 1, denominator: 1)
     width: 0
     height: 0
+    layout: FrameLayout.unsupported
     pixelFormat: 0
     fullRange: false
     matrix: YuvMatrix.unknown
@@ -99,8 +125,8 @@ func configKindOf(codec: view String) ret String {
   ret ""
 }
 
-func openVideoToolbox(track: view Mp4Track, tags: view ColorTags) ret Int {
-  let kind: String = configKindOf(codec: track.codec)
+# The track's codec configuration, never empty (C gets a valid pointer)
+func configBytes(track: view Mp4Track) ret List(UInt8) {
   var config: List(UInt8) = List.create(UInt8, cap: max(a: 1, b: track.codecConfig.length()))
   loop let byte: UInt8 in track.codecConfig {
     config.add(value: byte)
@@ -108,6 +134,12 @@ func openVideoToolbox(track: view Mp4Track, tags: view ColorTags) ret Int {
   if config.length() is 0 {
     config.add(value: 0 as UInt8)
   }
+  ret config
+}
+
+func openVideoToolbox(track: view Mp4Track, tags: view ColorTags) ret Int {
+  let kind: String = configKindOf(codec: track.codec)
+  let config: List(UInt8) = configBytes(track: track)
   var kindCode: Int = 0
   if kind.length() > 0 {
     kindCode = fourCharacterCode(text: kind)
@@ -136,9 +168,25 @@ func openVideoToolbox(track: view Mp4Track, tags: view ColorTags) ret Int {
   }
 }
 
+func openRegistered(track: view Mp4Track, backend: view VideoBackendRef) ret Int {
+  let config: List(UInt8) = configBytes(track: track)
+  let codecZ: List(UInt8) = textBytesZ(text: backend.codecName)
+  unsafe {
+    ret rae_video_backend_open(
+      backend: backend.number
+      codecZ: codecZ.data
+      width: track.width
+      height: track.height
+      config: config.data
+      configSize: track.codecConfig.length()
+    )
+  }
+}
+
 # A decoder for the track: the first backend of `table` for its codec that
-# opens. `tags` are the container's color tags (MediaReader.colorTagsOfTrack),
-# which its frames then carry. `error` says why when none opens.
+# opens. `tags` are the container's color tags (MediaReader.colorTagsOfTrack):
+# VideoToolbox is given them, and a frame whose stream has none takes them.
+# `error` says why when none opens.
 func openVideoDecoder(
   track: view Mp4Track
   tags: view ColorTags
@@ -146,27 +194,88 @@ func openVideoDecoder(
 ) ret VideoDecoder {
   var decoder: VideoDecoder = {
     backend: VideoBackend.none
+    backendNumber: 0
     handle: 0
     codec: "{track.codec}"
     width: track.width
     height: track.height
-    error: "no backend decodes {track.codec} on this platform"
+    tags: tags
+    error: "no backend decodes {track.codec} here"
   }
-  loop let backend: VideoBackend in backendsFor(table: table, codec: track.codec) {
-    if decoder.handle is 0 and backend is VideoBackend.videoToolbox {
-      let handle: Int = openVideoToolbox(track: track, tags: tags)
+  loop let backend: VideoBackendRef in backendsFor(table: table, codec: track.codec) {
+    if decoder.handle is 0 {
+      var handle: Int = 0
+      if backend.kind is VideoBackend.videoToolbox {
+        handle = openVideoToolbox(track: track, tags: tags)
+      } else if backend.kind is VideoBackend.registered {
+        handle = openRegistered(track: track, backend: backend)
+      }
       if handle is not 0 {
-        decoder.backend = backend
+        decoder.backend = backend.kind
+        decoder.backendNumber = backend.number
         decoder.handle = handle
         decoder.error = ""
       } else {
-        decoder.error = "VideoToolbox refused the {track.codec} stream"
+        decoder.error = "{backendName(backend: backend)} refused the {track.codec} stream"
       }
     }
   }
   ret decoder
 }
 
+# ITU-T H.273 code points (what containers and FFmpeg use) to the enums
+func matrixOfH273(code: view Int) ret YuvMatrix {
+  if code is 1 {
+    ret YuvMatrix.bt709
+  }
+  if code is 5 or code is 6 {
+    ret YuvMatrix.bt601
+  }
+  if code is 9 or code is 10 {
+    ret YuvMatrix.bt2020
+  }
+  if code is 7 {
+    ret YuvMatrix.smpte240
+  }
+  ret YuvMatrix.unknown
+}
+
+func primariesOfH273(code: view Int) ret ColorPrimaries {
+  if code is 1 {
+    ret ColorPrimaries.bt709
+  }
+  if code is 9 {
+    ret ColorPrimaries.bt2020
+  }
+  if code is 11 or code is 12 {
+    ret ColorPrimaries.displayP3
+  }
+  if code is 5 or code is 6 {
+    ret ColorPrimaries.bt601
+  }
+  ret ColorPrimaries.unknown
+}
+
+func transferOfH273(code: view Int) ret TransferFunction {
+  if code is 1 or code is 6 or code is 14 or code is 15 {
+    ret TransferFunction.bt709
+  }
+  if code is 16 {
+    ret TransferFunction.pq
+  }
+  if code is 18 {
+    ret TransferFunction.hlg
+  }
+  if code is 13 {
+    ret TransferFunction.srgb
+  }
+  if code is 8 {
+    ret TransferFunction.linear
+  }
+  ret TransferFunction.unknown
+}
+
+# VideoToolbox's own tag codes (native/rae_video.h) to the enums
 func matrixOfCode(code: view Int) ret YuvMatrix {
   if code is 1 {
     ret YuvMatrix.bt709
@@ -218,12 +327,30 @@ func transferOfCode(code: view Int) ret TransferFunction {
   ret TransferFunction.unknown
 }
 
-# The frame for a platform handle, its size, format and tags read
-func frameOfHandle(handle: view Int, packet: view MediaPacket) ret VideoFrame {
+func layoutOfCode(code: view Int) ret FrameLayout {
+  if code is 1 {
+    ret FrameLayout.nv12
+  }
+  if code is 2 {
+    ret FrameLayout.planar420
+  }
+  if code is 3 {
+    ret FrameLayout.planar422
+  }
+  if code is 4 {
+    ret FrameLayout.planar444
+  }
+  ret FrameLayout.unsupported
+}
+
+# A frame of VideoToolbox's: its size, format and tags read
+func frameOfVideoToolbox(handle: view Int, packet: view MediaPacket) ret VideoFrame {
   var frame: VideoFrame = noVideoFrame()
   frame.handle = handle
+  frame.backend = VideoBackend.videoToolbox
   frame.sampleIndex = packet.sampleIndex
   frame.presentationTime = packet.presentationTime
+  frame.layout = FrameLayout.nv12
   unsafe {
     frame.width = rae_video_frame_width(frame: handle)
     frame.height = rae_video_frame_height(frame: handle)
@@ -236,6 +363,46 @@ func frameOfHandle(handle: view Int, packet: view MediaPacket) ret VideoFrame {
   ret frame
 }
 
+# A registered backend's frame: its layout, size and tags read; a tag the
+# stream does not give is the container's
+func frameOfRegistered(
+  this: view VideoDecoder
+  handle: view Int
+  packet: view MediaPacket
+) ret VideoFrame {
+  var frame: VideoFrame = noVideoFrame()
+  frame.handle = handle
+  frame.backend = VideoBackend.registered
+  frame.backendNumber = this.backendNumber
+  frame.sampleIndex = packet.sampleIndex
+  frame.presentationTime = packet.presentationTime
+  var tags: Int = 0
+  unsafe {
+    frame.layout = layoutOfCode(
+      code: rae_video_backend_frame_layout(backend: this.backendNumber, frame: handle)
+    )
+    frame.width = rae_video_backend_frame_width(backend: this.backendNumber, frame: handle)
+    frame.height = rae_video_backend_frame_height(backend: this.backendNumber, frame: handle)
+    tags = rae_video_backend_frame_tags(backend: this.backendNumber, frame: handle)
+  }
+  frame.matrix = matrixOfH273(code: tags bitand 255)
+  frame.primaries = primariesOfH273(code: (tags shr 8) bitand 255)
+  frame.transfer = transferOfH273(code: (tags shr 16) bitand 255)
+  frame.fullRange = ((tags shr 24) bitand 1) is 1
+  if this.tags.present {
+    if frame.matrix is YuvMatrix.unknown {
+      frame.matrix = matrixOfH273(code: this.tags.matrix)
+    }
+    if frame.primaries is ColorPrimaries.unknown {
+      frame.primaries = primariesOfH273(code: this.tags.primaries)
+    }
+    if frame.transfer is TransferFunction.unknown {
+      frame.transfer = transferOfH273(code: this.tags.transfer)
+    }
+  }
+  ret frame
+}
+
 # The frame this packet gave (handle 0 when it gave none, or failed: `error`
 # says so)
 func decodePacket(this: mod VideoDecoder, packet: view MediaPacket) ret VideoFrame {
@@ -244,13 +411,24 @@ func decodePacket(this: mod VideoDecoder, packet: view MediaPacket) ret VideoFra
   }
   var result: Int = 0
   unsafe {
-    result = rae_video_vt_decode(
-      decoder: this.handle
-      packet: packet.bytes.data
-      size: packet.bytes.length()
-      time: packet.presentationTime.value
-      timescale: packet.presentationTime.timebase.denominator
-    )
+    if this.backend is VideoBackend.videoToolbox {
+      result = rae_video_vt_decode(
+        decoder: this.handle
+        packet: packet.bytes.data
+        size: packet.bytes.length()
+        time: packet.presentationTime.value
+        timescale: packet.presentationTime.timebase.denominator
+      )
+    } else {
+      result = rae_video_backend_decode(
+        backend: this.backendNumber
+        decoder: this.handle
+        packet: packet.bytes.data
+        size: packet.bytes.length()
+        time: packet.presentationTime.value
+        timescale: packet.presentationTime.timebase.denominator
+      )
+    }
   }
   if result < 0 {
     this.error = "decoding sample {packet.sampleIndex} failed ({result})"
@@ -259,13 +437,20 @@ func decodePacket(this: mod VideoDecoder, packet: view MediaPacket) ret VideoFra
   if result is 0 {
     ret noVideoFrame()
   }
-  ret frameOfHandle(handle: result, packet: packet)
+  if this.backend is VideoBackend.videoToolbox {
+    ret frameOfVideoToolbox(handle: result, packet: packet)
+  }
+  ret this.frameOfRegistered(handle: result, packet: packet)
 }
 
 func close(this: mod VideoDecoder) {
   if this.handle is not 0 {
     unsafe {
-      rae_video_vt_close(decoder: this.handle)
+      if this.backend is VideoBackend.videoToolbox {
+        rae_video_vt_close(decoder: this.handle)
+      } else {
+        rae_video_backend_close(backend: this.backendNumber, decoder: this.handle)
+      }
     }
     this.handle = 0
   }
@@ -274,52 +459,156 @@ func close(this: mod VideoDecoder) {
 func releaseFrame(frame: mod VideoFrame) {
   if frame.handle is not 0 {
     unsafe {
-      rae_video_frame_release(frame: frame.handle)
+      if frame.backend is VideoBackend.videoToolbox {
+        rae_video_frame_release(frame: frame.handle)
+      } else {
+        rae_video_backend_frame_release(backend: frame.backendNumber, frame: frame.handle)
+      }
     }
     frame.handle = 0
   }
 }
 
-# The bytes per pixel of an NV12 plane: 1 for Y, 2 for the interleaved CbCr
-func planePixelBytes(plane: view Int) ret Int {
-  if plane is 0 {
+# How many planes a layout has
+func planeCountOf(layout: view FrameLayout) ret Int {
+  if layout is FrameLayout.nv12 {
+    ret 2
+  }
+  if layout is FrameLayout.unsupported {
+    ret 0
+  }
+  ret 3
+}
+
+# How much smaller than the picture a layout's chroma planes are: 2 or 1
+func chromaWidthDivisorOf(layout: view FrameLayout) ret Int {
+  if layout is FrameLayout.planar444 {
     ret 1
   }
   ret 2
 }
 
-func planeWidth(this: view VideoFrame, plane: view Int) ret Int {
-  unsafe {
-    ret rae_video_frame_plane_width(frame: this.handle, plane: plane)
+func chromaHeightDivisorOf(layout: view FrameLayout) ret Int {
+  if layout is FrameLayout.nv12 or layout is FrameLayout.planar420 {
+    ret 2
   }
+  ret 1
+}
+
+func planeCount(this: view VideoFrame) ret Int {
+  ret planeCountOf(layout: this.layout)
+}
+
+func chromaWidthDivisor(this: view VideoFrame) ret Int {
+  ret chromaWidthDivisorOf(layout: this.layout)
+}
+
+func chromaHeightDivisor(this: view VideoFrame) ret Int {
+  ret chromaHeightDivisorOf(layout: this.layout)
+}
+
+# The bytes per pixel of a plane: 2 for NV12's interleaved CbCr, else 1
+func planePixelBytes(this: view VideoFrame, plane: view Int) ret Int {
+  if this.layout is FrameLayout.nv12 and plane is 1 {
+    ret 2
+  }
+  ret 1
+}
+
+func planeWidth(this: view VideoFrame, plane: view Int) ret Int {
+  if plane is 0 {
+    ret this.width
+  }
+  let divisor: Int = this.chromaWidthDivisor()
+  ret (this.width + divisor - 1) / divisor
 }
 
 func planeHeight(this: view VideoFrame, plane: view Int) ret Int {
-  unsafe {
-    ret rae_video_frame_plane_height(frame: this.handle, plane: plane)
+  if plane is 0 {
+    ret this.height
   }
+  let divisor: Int = this.chromaHeightDivisor()
+  ret (this.height + divisor - 1) / divisor
 }
 
 # A plane's bytes, its rows packed (width x bytes per pixel each): for the CPU
 # (tests, a thumbnail); drawing goes to the GPU without this copy
 func copyPlane(this: view VideoFrame, plane: view Int) ret List(UInt8) {
-  let rowBytes: Int = this.planeWidth(plane: plane) * planePixelBytes(plane: plane)
+  let rowBytes: Int = this.planeWidth(plane: plane) * this.planePixelBytes(plane: plane)
   let rows: Int = this.planeHeight(plane: plane)
   var bytes: List(UInt8) = List.create(UInt8, cap: max(a: 1, b: rowBytes * rows))
-  if this.handle is 0 or rowBytes <= 0 or rows <= 0 {
+  if this.handle is 0 or rowBytes <= 0 or rows <= 0 or plane >= this.planeCount() {
     ret bytes
   }
   bytes.addDefaults(count: rowBytes * rows)
   unsafe {
-    let copied: Int = rae_video_frame_copy_plane(
-      frame: this.handle
-      plane: plane
-      into: bytes.data
-      rowBytes: rowBytes
-    )
+    var copied: Int = -1
+    if this.backend is VideoBackend.videoToolbox {
+      copied = rae_video_frame_copy_plane(
+        frame: this.handle
+        plane: plane
+        into: bytes.data
+        rowBytes: rowBytes
+      )
+    } else {
+      copied = rae_video_backend_frame_copy_plane(
+        backend: this.backendNumber
+        frame: this.handle
+        plane: plane
+        into: bytes.data
+        rowBytes: rowBytes
+        rows: rows
+      )
+    }
     if copied is not rowBytes * rows {
       bytes.clear()
     }
   }
   ret bytes
+}
+
+# Makes the planes' memory readable until unlockPlanes (VideoToolbox's frames
+# need it; a registered backend's are plain memory). False when it cannot.
+func lockPlanes(this: view VideoFrame) ret Bool {
+  if this.backend is not VideoBackend.videoToolbox {
+    ret this.handle is not 0
+  }
+  unsafe {
+    ret rae_video_frame_lock(frame: this.handle) is 0
+  }
+}
+
+func unlockPlanes(this: view VideoFrame) {
+  if this.backend is VideoBackend.videoToolbox {
+    unsafe {
+      rae_video_frame_unlock(frame: this.handle)
+    }
+  }
+}
+
+# A locked plane's first byte and its row length in bytes
+func planeAddress(this: view VideoFrame, plane: view Int) unsafe ret Ptr {
+  unsafe {
+    if this.backend is VideoBackend.videoToolbox {
+      ret rae_video_frame_plane_address(frame: this.handle, plane: plane)
+    }
+    ret rae_video_backend_frame_plane_address(
+      backend: this.backendNumber
+      frame: this.handle
+      plane: plane
+    )
+  }
+}
+
+func planeBytesPerRow(this: view VideoFrame, plane: view Int) ret Int {
+  unsafe {
+    if this.backend is VideoBackend.videoToolbox {
+      ret rae_video_frame_plane_bytes_per_row(frame: this.handle, plane: plane)
+    }
+    ret rae_video_backend_frame_plane_bytes_per_row(
+      backend: this.backendNumber
+      frame: this.handle
+      plane: plane
+    )
+  }
 }

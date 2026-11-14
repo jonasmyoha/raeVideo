@@ -70,4 +70,55 @@ int64_t rae_video_frame_primaries(int64_t frame);
 int64_t rae_video_frame_transfer(int64_t frame);
 void rae_video_frame_release(int64_t frame);
 
+/* ---- registered backends (another package's decoder) ----------------------
+ * A package with its own decoder (packages/ffmpeg) hands its calls over as a
+ * pointer to this struct, from Rae (video/VideoBackends.registerBackend), so
+ * neither package's C names the other's symbols. `version` must be
+ * RAE_VIDEO_BACKEND_CALLS_VERSION. A frame of such a backend is 8-bit
+ * Y'CbCr in the layout `frame_layout` says:
+ *   1 two planes, CbCr interleaved, 4:2:0 (NV12)
+ *   2 three planes, 4:2:0     3 three planes, 4:2:2     4 three planes, 4:4:4
+ *   0 a layout the video package cannot show yet (10-bit, RGB, ...)
+ * and `frame_tags` gives its color tags as ITU-T H.273 code points: matrix in
+ * bits 0-7, primaries 8-15, transfer 16-23, and bit 24 for full range
+ * (2, unspecified, when the stream does not say). */
+#define RAE_VIDEO_BACKEND_CALLS_VERSION 1
+typedef struct RaeVideoBackendCalls {
+  int64_t version;
+  /* a decoder for the codec the backend knows as `codec_z` ("dnxhd", "vp9") */
+  int64_t (*open)(uint8_t* codec_z, int64_t width, int64_t height, uint8_t* config,
+                  int64_t config_size);
+  /* like rae_video_vt_decode: a frame, 0 for none yet, or a negative error */
+  int64_t (*decode)(int64_t decoder, uint8_t* packet, int64_t size, int64_t time,
+                    int64_t timescale);
+  void (*close)(int64_t decoder);
+  int64_t (*frame_layout)(int64_t frame);
+  int64_t (*frame_width)(int64_t frame);
+  int64_t (*frame_height)(int64_t frame);
+  int64_t (*frame_plane_bytes_per_row)(int64_t frame, int64_t plane);
+  uint8_t* (*frame_plane_address)(int64_t frame, int64_t plane);
+  int64_t (*frame_tags)(int64_t frame);
+  void (*frame_release)(int64_t frame);
+} RaeVideoBackendCalls;
+
+/* Registers a backend's calls; its number (1 and up), or 0 when the struct is
+ * of another version or the table is full */
+int64_t rae_video_backend_register(void* calls);
+int64_t rae_video_backend_open(int64_t backend, uint8_t* codec_z, int64_t width, int64_t height,
+                               uint8_t* config, int64_t config_size);
+int64_t rae_video_backend_decode(int64_t backend, int64_t decoder, uint8_t* packet, int64_t size,
+                                 int64_t time, int64_t timescale);
+void rae_video_backend_close(int64_t backend, int64_t decoder);
+int64_t rae_video_backend_frame_layout(int64_t backend, int64_t frame);
+int64_t rae_video_backend_frame_width(int64_t backend, int64_t frame);
+int64_t rae_video_backend_frame_height(int64_t backend, int64_t frame);
+int64_t rae_video_backend_frame_plane_bytes_per_row(int64_t backend, int64_t frame,
+                                                    int64_t plane);
+uint8_t* rae_video_backend_frame_plane_address(int64_t backend, int64_t frame, int64_t plane);
+int64_t rae_video_backend_frame_tags(int64_t backend, int64_t frame);
+void rae_video_backend_frame_release(int64_t backend, int64_t frame);
+/* Copies `rows` rows of `row_bytes` bytes of a plane, packed, into `into` */
+int64_t rae_video_backend_frame_copy_plane(int64_t backend, int64_t frame, int64_t plane,
+                                           uint8_t* into, int64_t row_bytes, int64_t rows);
+
 #endif

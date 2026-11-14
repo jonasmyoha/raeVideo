@@ -1,24 +1,54 @@
 # video/VideoBackends — which backend decodes which codec (docs/design.md §5
 # V2): a Rae table, not C. Each codec (the sample entry's four characters)
 # lists its backends in the order they are tried; a program may reorder the
-# table or add to it (the FFmpeg package adds itself as one more backend,
-# docs/design.md §4).
+# table or add to it.
 #
 # Apple: VideoToolbox for H.264, HEVC and ProRes. Other platforms have no
-# backend yet (docs/design.md §11 step 6), so their table is empty and a
-# decoder there reports that it has none.
-enum VideoBackend { none, videoToolbox }
+# backend of their own yet (docs/design.md §11 step 6).
+#
+# Another package adds a decoder of its own (packages/ffmpeg, docs/design.md
+# §4) in two steps: registerBackend hands its C calls to this package's C and
+# gives it a number, and addBackend puts it into the table for each codec it
+# decodes, under the name it knows the codec by ("dnxhd", "vp9"). This package
+# never names that package; a program that does not add it never links it.
+import Math
+open video/VideoGlue
 
-type VideoBackendChoice {
-  # "avc1", "hvc1", "apcn", ...
-  codec: String
-  backends: List(VideoBackend)
+enum VideoBackend { none, videoToolbox, registered }
+
+type VideoBackendRef {
+  kind: VideoBackend
+  # for a registered backend, its number (registerBackend)
+  number: Int
+  # what the backend calls the codec ("" for VideoToolbox, which takes the
+  # four characters)
+  codecName: String
 }
 
-func choice(codec: view String, backend: view VideoBackend) ret VideoBackendChoice {
-  var backends: List(VideoBackend) = {}
-  backends.add(value: backend)
-  ret VideoBackendChoice { codec: "{codec}", backends: backends }
+type VideoBackendChoice {
+  # "avc1", "hvc1", "apcn", "AVdh", ...
+  codec: String
+  backends: List(VideoBackendRef)
+}
+
+func videoToolboxRef() ret VideoBackendRef {
+  ret VideoBackendRef { kind: VideoBackend.videoToolbox, number: 0, codecName: "" }
+}
+
+# A registered backend, `number` from registerBackend, for a codec it calls
+# `codecName`
+func registeredRef(number: view Int, codecName: view String) ret VideoBackendRef {
+  ret VideoBackendRef { kind: VideoBackend.registered, number: number, codecName: "{codecName}" }
+}
+
+func backendName(backend: view VideoBackendRef) ret String {
+  if backend.kind is VideoBackend.videoToolbox {
+    ret "VideoToolbox"
+  }
+  if backend.kind is VideoBackend.registered {
+    ret "registered backend {backend.number} ({backend.codecName})"
+  }
+  ret "none"
 }
 
 # The codecs VideoToolbox decodes: H.264 (avc1, avc3), HEVC (hvc1, hev1) and
@@ -42,22 +72,53 @@ func defaultVideoBackends() ret List(VideoBackendChoice) {
   var table: List(VideoBackendChoice) = {}
   if Target.isApple {
     loop let codec: String in videoToolboxCodecs() {
-      table.add(value: choice(codec: codec, backend: VideoBackend.videoToolbox))
+      table.addBackend(codec: codec, backend: videoToolboxRef())
     }
   }
   ret table
 }
 
+# Puts `backend` last in `codec`'s list (making the entry if there is none)
+func addBackend(
+  this: mod List(VideoBackendChoice)
+  codec: view String
+  backend: view VideoBackendRef
+) {
+  loop var i: Int = 0, i < this.length(), ++i {
+    if var entry: VideoBackendChoice = this.copyAt(index: i) {
+      if entry.codec is codec {
+        entry.backends.add(value: backend)
+        this.set(index: i, value: entry)
+        ret
+      }
+    }
+  }
+  var backends: List(VideoBackendRef) = {}
+  backends.add(value: backend)
+  this.add(value: { codec: "{codec}", backends: backends })
+}
+
+# Gives a backend's C calls (a RaeVideoBackendCalls, native/rae_video.h) to
+# this package's C: its number, or 0 when they do not fit
+func registerBackend(calls: view Ptr) ret Int {
+  unsafe {
+    ret rae_video_backend_register(calls: calls)
+  }
+}
+
 # The backends for `codec`, in order; empty when none decodes it
-func backendsFor(table: view List(VideoBackendChoice), codec: view String) ret List(VideoBackend) {
+func backendsFor(
+  table: view List(VideoBackendChoice)
+  codec: view String
+) ret List(VideoBackendRef) {
   loop let entry: view VideoBackendChoice in table {
     if entry.codec is codec {
-      var backends: List(VideoBackend) = {}
-      loop let backend: VideoBackend in entry.backends {
+      var backends: List(VideoBackendRef) = {}
+      loop let backend: VideoBackendRef in entry.backends {
         backends.add(value: backend)
       }
       ret backends
     }
   }
-  ret List(VideoBackend) {}
+  ret List(VideoBackendRef) {}
 }

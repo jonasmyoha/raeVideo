@@ -79,6 +79,7 @@ func checkFile(resources: mod GpuResources, name: view String, wrongMatrix: view
     resources: resources
     width: frame.width
     height: frame.height
+    layout: frame.layout
   ) {
     if wrongMatrix {
       frame.matrix = YuvMatrix.bt601

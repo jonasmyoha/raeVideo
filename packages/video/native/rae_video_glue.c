@@ -43,6 +43,96 @@ void rae_video_file_close(int64_t file) {
   if (file >= 0) close((int)file);
 }
 
+/* ---- registered backends ---------------------------------------------------
+ * The table is written once per backend at start-up, on the main thread,
+ * before any decoder of it opens; after that it is only read. */
+#define RAE_VIDEO_BACKEND_MAX 8
+static const RaeVideoBackendCalls* g_rae_video_backends[RAE_VIDEO_BACKEND_MAX];
+
+int64_t rae_video_backend_register(void* pointer) {
+  const RaeVideoBackendCalls* calls = (const RaeVideoBackendCalls*)pointer;
+  if (!calls || calls->version != RAE_VIDEO_BACKEND_CALLS_VERSION) return 0;
+  for (int i = 0; i < RAE_VIDEO_BACKEND_MAX; i++) {
+    if (g_rae_video_backends[i] == calls) return i + 1;
+    if (!g_rae_video_backends[i]) {
+      g_rae_video_backends[i] = calls;
+      return i + 1;
+    }
+  }
+  return 0;
+}
+
+static const RaeVideoBackendCalls* rae_video_backend(int64_t backend) {
+  if (backend < 1 || backend > RAE_VIDEO_BACKEND_MAX) return NULL;
+  return g_rae_video_backends[backend - 1];
+}
+
+int64_t rae_video_backend_open(int64_t backend, uint8_t* codec_z, int64_t width, int64_t height,
+                               uint8_t* config, int64_t config_size) {
+  const RaeVideoBackendCalls* calls = rae_video_backend(backend);
+  return calls ? calls->open(codec_z, width, height, config, config_size) : 0;
+}
+
+int64_t rae_video_backend_decode(int64_t backend, int64_t decoder, uint8_t* packet, int64_t size,
+                                 int64_t time, int64_t timescale) {
+  const RaeVideoBackendCalls* calls = rae_video_backend(backend);
+  return calls ? calls->decode(decoder, packet, size, time, timescale) : -1;
+}
+
+void rae_video_backend_close(int64_t backend, int64_t decoder) {
+  const RaeVideoBackendCalls* calls = rae_video_backend(backend);
+  if (calls) calls->close(decoder);
+}
+
+int64_t rae_video_backend_frame_layout(int64_t backend, int64_t frame) {
+  const RaeVideoBackendCalls* calls = rae_video_backend(backend);
+  return calls && frame ? calls->frame_layout(frame) : 0;
+}
+
+int64_t rae_video_backend_frame_width(int64_t backend, int64_t frame) {
+  const RaeVideoBackendCalls* calls = rae_video_backend(backend);
+  return calls && frame ? calls->frame_width(frame) : 0;
+}
+
+int64_t rae_video_backend_frame_height(int64_t backend, int64_t frame) {
+  const RaeVideoBackendCalls* calls = rae_video_backend(backend);
+  return calls && frame ? calls->frame_height(frame) : 0;
+}
+
+int64_t rae_video_backend_frame_plane_bytes_per_row(int64_t backend, int64_t frame,
+                                                    int64_t plane) {
+  const RaeVideoBackendCalls* calls = rae_video_backend(backend);
+  return calls && frame ? calls->frame_plane_bytes_per_row(frame, plane) : 0;
+}
+
+uint8_t* rae_video_backend_frame_plane_address(int64_t backend, int64_t frame, int64_t plane) {
+  const RaeVideoBackendCalls* calls = rae_video_backend(backend);
+  return calls && frame ? calls->frame_plane_address(frame, plane) : NULL;
+}
+
+int64_t rae_video_backend_frame_tags(int64_t backend, int64_t frame) {
+  const RaeVideoBackendCalls* calls = rae_video_backend(backend);
+  return calls && frame ? calls->frame_tags(frame) : 0;
+}
+
+void rae_video_backend_frame_release(int64_t backend, int64_t frame) {
+  const RaeVideoBackendCalls* calls = rae_video_backend(backend);
+  if (calls && frame) calls->frame_release(frame);
+}
+
+int64_t rae_video_backend_frame_copy_plane(int64_t backend, int64_t frame, int64_t plane,
+                                           uint8_t* into, int64_t row_bytes, int64_t rows) {
+  const RaeVideoBackendCalls* calls = rae_video_backend(backend);
+  if (!calls || !frame || !into || row_bytes <= 0 || rows <= 0) return -1;
+  const uint8_t* base = calls->frame_plane_address(frame, plane);
+  int64_t stride = calls->frame_plane_bytes_per_row(frame, plane);
+  if (!base || stride < row_bytes) return -1;
+  for (int64_t row = 0; row < rows; row++) {
+    memcpy(into + row * row_bytes, base + row * stride, (size_t)row_bytes);
+  }
+  return rows * row_bytes;
+}
+
 #if defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>

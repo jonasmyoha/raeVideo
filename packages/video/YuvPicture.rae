@@ -1,19 +1,20 @@
 # video/YuvPicture — a decoded frame on the GPU as an RGBA texture (docs/design.md
-# §7, the copy path): the frame's two planes are copied from the decoder's
-# memory into two textures (r8unorm Y, rg8unorm CbCr) by the queue, and a
-# compute pass (yuvToRgb.wgsl) converts them into `picture` (rgba8unorm) with
-# the matrix and range the frame is tagged with. The CPU does not touch the
-# pixels: the one copy is the queue's upload from the locked frame.
+# §7, the copy path): the frame's planes are copied from the decoder's memory
+# into textures by the queue (NV12: r8unorm Y and rg8unorm CbCr; three planes:
+# r8unorm each), and a compute pass (yuvToRgb.wgsl, or yuvPlanarToRgb.wgsl)
+# converts them into `picture` (rgba8unorm) with the matrix and range the
+# frame is tagged with. The CPU does not touch the pixels: the one copy is the
+# queue's upload from the frame's memory.
 #
 #     if var picture: YuvPicture = createYuvPicture(resources: resources, width: 1920, height:
-#     1080) {
+#     1080, layout: FrameLayout.nv12) {
 #       if picture.uploadFrame(resources: resources, frame: frame) {
 #         ... picture.recordConversion(recording: recording, resources: resources) ...
 #         ... draw picture.pictureView ...
 #       }
 #     }
 #
-# A frame of another size needs a picture of that size (createYuvPicture again).
+# A frame of another size or layout needs another picture (createYuvPicture).
 import Math
 open gpu/GpuCompute
 open gpu/GpuIds
@@ -36,12 +37,12 @@ const conversionWorkgroupSize: Int = 256
 type YuvPicture {
   width: Int
   height: Int
-  luma: TextureId
-  chroma: TextureId
+  layout: FrameLayout
+  # one texture per plane of the layout, and their views
+  planes: List(TextureId)
+  planeViews: List(TextureViewId)
   # the converted frame: rgba8unorm, R'G'B' in the stream's transfer
   picture: TextureId
-  lumaView: TextureViewId
-  chromaView: TextureViewId
   pictureView: TextureViewId
   parameters: BufferId
   bounds: ComputeBounds
@@ -104,13 +105,14 @@ func addFloat(bytes: mod List(UInt8), value: view Float) {
   addWord(bytes: bytes, word: floatBits(value: value))
 }
 
-# The YuvParameters uniform of yuvToRgb.wgsl for a frame converted with
-# `matrix` (48 bytes)
+# The YuvParameters uniform of yuvToRgb.wgsl / yuvPlanarToRgb.wgsl for a frame
+# converted with `matrix` (48 bytes)
 func parameterBytes(
   matrix: view YuvMatrix
   fullRange: view Bool
   width: view Int
   height: view Int
+  layout: view FrameLayout
 ) ret List(UInt8) {
   var bytes: List(UInt8) = List.create(UInt8, cap: 48)
   if fullRange {
@@ -131,8 +133,8 @@ func parameterBytes(
   addFloat(bytes: bytes, value: coefficients.cbToBlue)
   addWord(bytes: bytes, word: width)
   addWord(bytes: bytes, word: height)
-  addWord(bytes: bytes, word: 0)
-  addWord(bytes: bytes, word: 0)
+  addWord(bytes: bytes, word: chromaWidthDivisorOf(layout: layout))
+  addWord(bytes: bytes, word: chromaHeightDivisorOf(layout: layout))
   ret bytes
 }
 
@@ -151,92 +153,115 @@ func createPlaneTexture(
   )
 }
 
+# The conversion shader for a layout
+func conversionShader(layout: view FrameLayout) ret Shader {
+  if layout is FrameLayout.nv12 {
+    ret shader(files: ["lib/gpu/computeBounds.wgsl", "yuvToRgb.wgsl"])
+  }
+  ret shader(files: ["lib/gpu/computeBounds.wgsl", "yuvPlanarToRgb.wgsl"])
+}
+
 # The textures, the parameters and the conversion pipeline for frames of
-# width x height; none when the GPU refuses one of them
+# width x height in `layout`; none when the layout cannot be shown or the GPU
+# refuses one of them
 func createYuvPicture(
   resources: mod GpuResources
   width: view Int
   height: view Int
+  layout: view FrameLayout
 ) ret opt YuvPicture {
-  let conversion: Shader = shader(files: ["lib/gpu/computeBounds.wgsl", "yuvToRgb.wgsl"])
-  let chromaWidth: Int = (width + 1) / 2
-  let chromaHeight: Int = (height + 1) / 2
-  if let luma: TextureId = createPlaneTexture(
+  let count: Int = planeCountOf(layout: layout)
+  if count is 0 {
+    ret none
+  }
+  let chromaWidth: Int = (width + chromaWidthDivisorOf(layout: layout) - 1) / chromaWidthDivisorOf(
+    layout: layout
+  )
+  let chromaHeight: Int = (height + chromaHeightDivisorOf(layout: layout) - 1) / chromaHeightDivisorOf(
+    layout: layout
+  )
+  var planes: List(TextureId) = {}
+  var views: List(TextureViewId) = {}
+  loop var plane: Int = 0, plane < count, ++plane {
+    var planeWidth: Int = width
+    var planeHeight: Int = height
+    var format: Int32 = WGPUTextureFormat_R8Unorm
+    if plane > 0 {
+      planeWidth = chromaWidth
+      planeHeight = chromaHeight
+      if layout is FrameLayout.nv12 {
+        format = WGPUTextureFormat_RG8Unorm
+      }
+    }
+    if let texture: TextureId = createPlaneTexture(
+      resources: resources
+      width: planeWidth
+      height: planeHeight
+      format: format
+    ) {
+      planes.add(value: texture)
+      if let planeView: TextureViewId = createTextureView(resources: resources, texture: texture) {
+        views.add(value: planeView)
+      } else {
+        ret none
+      }
+    } else {
+      ret none
+    }
+  }
+  if let picture: TextureId = createTexture(
     resources: resources
     width: width
     height: height
-    format: WGPUTextureFormat_R8Unorm
+    format: WGPUTextureFormat_RGBA8Unorm
+    usage: WGPUTextureUsage_StorageBinding + WGPUTextureUsage_TextureBinding + WGPUTextureUsage_CopySrc
   ) {
-    if let chroma: TextureId = createPlaneTexture(
-      resources: resources
-      width: chromaWidth
-      height: chromaHeight
-      format: WGPUTextureFormat_RG8Unorm
-    ) {
-      if let picture: TextureId = createTexture(
+    if let pictureView: TextureViewId = createTextureView(resources: resources, texture: picture) {
+      if let parameters: BufferId = createBuffer(
         resources: resources
-        width: width
-        height: height
-        format: WGPUTextureFormat_RGBA8Unorm
-        usage: WGPUTextureUsage_StorageBinding + WGPUTextureUsage_TextureBinding + WGPUTextureUsage_CopySrc
+        size: 48
+        usage: WGPUBufferUsage_Uniform + WGPUBufferUsage_CopyDst
       ) {
-        if let lumaView: TextureViewId = createTextureView(resources: resources, texture: luma) {
-          if let chromaView: TextureViewId = createTextureView(
+        if let bounds: ComputeBounds = createComputeBounds(
+          resources: resources
+          workgroupSize: conversionWorkgroupSize
+        ) {
+          let conversion: Shader = conversionShader(layout: layout)
+          if let pipeline: PipelineId = createBoundedComputePipeline(
             resources: resources
-            texture: chroma
+            wgsl: conversion.text
+            entryPoint: "main"
+            bounds: bounds
           ) {
-            if let pictureView: TextureViewId = createTextureView(
+            var buffers: List(BufferId) = {}
+            buffers.add(value: parameters)
+            var bound: List(TextureViewId) = {}
+            loop let planeView: TextureViewId in views {
+              bound.add(value: planeView)
+            }
+            bound.add(value: pictureView)
+            let noSamplers: List(SamplerId) = {}
+            if let bindGroup: BindGroupId = createBoundedBindGroup(
               resources: resources
-              texture: picture
+              pipeline: pipeline
+              bounds: bounds
+              buffers: buffers
+              textureViews: bound
+              samplers: noSamplers
             ) {
-              if let parameters: BufferId = createBuffer(
-                resources: resources
-                size: 48
-                usage: WGPUBufferUsage_Uniform + WGPUBufferUsage_CopyDst
-              ) {
-                if let bounds: ComputeBounds = createComputeBounds(
-                  resources: resources
-                  workgroupSize: conversionWorkgroupSize
-                ) {
-                  if let pipeline: PipelineId = createBoundedComputePipeline(
-                    resources: resources
-                    wgsl: conversion.text
-                    entryPoint: "main"
-                    bounds: bounds
-                  ) {
-                    var buffers: List(BufferId) = {}
-                    buffers.add(value: parameters)
-                    var views: List(TextureViewId) = {}
-                    views.add(value: lumaView)
-                    views.add(value: chromaView)
-                    views.add(value: pictureView)
-                    let noSamplers: List(SamplerId) = {}
-                    if let bindGroup: BindGroupId = createBoundedBindGroup(
-                      resources: resources
-                      pipeline: pipeline
-                      bounds: bounds
-                      buffers: buffers
-                      textureViews: views
-                      samplers: noSamplers
-                    ) {
-                      ret YuvPicture {
-                        width: width
-                        height: height
-                        luma: luma
-                        chroma: chroma
-                        picture: picture
-                        lumaView: lumaView
-                        chromaView: chromaView
-                        pictureView: pictureView
-                        parameters: parameters
-                        bounds: bounds
-                        pipeline: pipeline
-                        bindGroup: bindGroup
-                        uploadedSample: -1
-                      }
-                    }
-                  }
-                }
+              ret YuvPicture {
+                width: width
+                height: height
+                layout: layout
+                planes: planes
+                planeViews: views
+                picture: picture
+                pictureView: pictureView
+                parameters: parameters
+                bounds: bounds
+                pipeline: pipeline
+                bindGroup: bindGroup
+                uploadedSample: -1
               }
             }
           }
@@ -247,21 +272,25 @@ func createYuvPicture(
   ret none
 }
 
-# Copies one plane from the locked frame into its texture through the queue
+# Copies one plane from the frame's memory (locked) into its texture through
+# the queue
 func writePlane(
   resources: view GpuResources
   texture: view TextureId
   frame: view VideoFrame
   plane: view Int
 ) ret Bool {
+  let rowBytes: Int = frame.planeBytesPerRow(plane: plane)
+  let rows: Int = frame.planeHeight(plane: plane)
+  let columns: Int = frame.planeWidth(plane: plane)
+  if rowBytes < columns * frame.planePixelBytes(plane: plane) {
+    ret false
+  }
   unsafe {
-    let address: Ptr = rae_video_frame_plane_address(frame: frame.handle, plane: plane)
+    let address: Ptr = frame.planeAddress(plane: plane)
     if address is webgpuNull() {
       ret false
     }
-    let rowBytes: Int = rae_video_frame_plane_bytes_per_row(frame: frame.handle, plane: plane)
-    let rows: Int = rae_video_frame_plane_height(frame: frame.handle, plane: plane)
-    let columns: Int = rae_video_frame_plane_width(frame: frame.handle, plane: plane)
     let destination: WGPUTexelCopyTextureInfo = {
       texture: textureHandle(resources: resources, id: texture)
       aspect: WGPUTextureAspect_All
@@ -288,7 +317,7 @@ func writePlane(
 }
 
 # Uploads the frame's planes and the parameters its tags give. False when the
-# frame is not an NV12 frame of this picture's size.
+# frame is not of this picture's size and layout.
 func uploadFrame(
   this: mod YuvPicture
   resources: mod GpuResources
@@ -297,34 +326,24 @@ func uploadFrame(
   if frame.handle is 0 or frame.width is not this.width or frame.height is not this.height {
     ret false
   }
-  var planes: Int = 0
-  unsafe {
-    planes = rae_video_frame_plane_count(frame: frame.handle)
-  }
-  if planes is not 2 {
+  if frame.layout is not this.layout {
     ret false
   }
-  var locked: Int = -1
-  unsafe {
-    locked = rae_video_frame_lock(frame: frame.handle)
-  }
-  if locked is not 0 {
+  if not frame.lockPlanes() {
     ret false
   }
-  let written: Bool = writePlane(
-    resources: resources
-    texture: this.luma
-    frame: frame
-    plane: 0
-  ) and writePlane(
-    resources: resources
-    texture: this.chroma
-    frame: frame
-    plane: 1
-  )
-  unsafe {
-    rae_video_frame_unlock(frame: frame.handle)
+  var written: Bool = true
+  loop var plane: Int = 0, plane < this.planes.length(), ++plane {
+    if let texture: TextureId = this.planes.copyAt(index: plane) {
+      written = written and writePlane(
+        resources: resources
+        texture: texture
+        frame: frame
+        plane: plane
+      )
+    }
   }
+  frame.unlockPlanes()
   if not written {
     ret false
   }
@@ -337,6 +356,7 @@ func uploadFrame(
       fullRange: frame.fullRange
       width: this.width
       height: this.height
+      layout: this.layout
     )
   ) {
     ret false

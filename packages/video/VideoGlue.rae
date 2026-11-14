@@ -91,6 +91,74 @@ func rae_video_frame_transfer(frame: Int) unsafe extern("rae_video_frame_transfe
 
 func rae_video_frame_release(frame: Int) unsafe extern("rae_video_frame_release")
 
+func rae_video_backend_register(calls: Ptr) unsafe extern("rae_video_backend_register") ret Int
+
+func rae_video_backend_open(
+  backend: Int
+  codecZ: Buffer(UInt8)
+  width: Int
+  height: Int
+  config: Buffer(UInt8)
+  configSize: Int
+) unsafe extern("rae_video_backend_open") ret Int
+
+func rae_video_backend_decode(
+  backend: Int
+  decoder: Int
+  packet: Buffer(UInt8)
+  size: Int
+  time: Int
+  timescale: Int
+) unsafe extern("rae_video_backend_decode") ret Int
+
+func rae_video_backend_close(backend: Int, decoder: Int) unsafe extern("rae_video_backend_close")
+
+func rae_video_backend_frame_layout(
+  backend: Int
+  frame: Int
+) unsafe extern("rae_video_backend_frame_layout") ret Int
+
+func rae_video_backend_frame_width(
+  backend: Int
+  frame: Int
+) unsafe extern("rae_video_backend_frame_width") ret Int
+
+func rae_video_backend_frame_height(
+  backend: Int
+  frame: Int
+) unsafe extern("rae_video_backend_frame_height") ret Int
+
+func rae_video_backend_frame_plane_bytes_per_row(
+  backend: Int
+  frame: Int
+  plane: Int
+) unsafe extern("rae_video_backend_frame_plane_bytes_per_row") ret Int
+
+func rae_video_backend_frame_plane_address(
+  backend: Int
+  frame: Int
+  plane: Int
+) unsafe extern("rae_video_backend_frame_plane_address") ret Ptr
+
+func rae_video_backend_frame_tags(
+  backend: Int
+  frame: Int
+) unsafe extern("rae_video_backend_frame_tags") ret Int
+
+func rae_video_backend_frame_release(
+  backend: Int
+  frame: Int
+) unsafe extern("rae_video_backend_frame_release")
+
+func rae_video_backend_frame_copy_plane(
+  backend: Int
+  frame: Int
+  plane: Int
+  into: Buffer(UInt8)
+  rowBytes: Int
+  rows: Int
+) unsafe extern("rae_video_backend_frame_copy_plane") ret Int
+
 # A text's bytes with a zero after them, for a C path
 func textBytesZ(text: view String) ret List(UInt8) {
   var bytes: List(UInt8) = List.create(UInt8, cap: text.length() + 1)
