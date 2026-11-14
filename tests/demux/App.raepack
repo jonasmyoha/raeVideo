@@ -1,0 +1,25 @@
+pack App {
+  format: "raepack"
+  version: 1
+  defaultTarget: compiled
+  rae: {
+    version: "0.3.123"
+  }
+  dependencies: {
+    dep video: {
+      path: "../../packages/video"
+    }
+  }
+  targets: {
+    target compiled: {
+      label: "Compiled"
+      entry: "Main.rae"
+      sources: {
+        source: {
+          path: "."
+          emit: compiled
+        }
+      }
+    }
+  }
+}

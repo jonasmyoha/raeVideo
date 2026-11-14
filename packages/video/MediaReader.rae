@@ -1,0 +1,388 @@
+# video/MediaReader — a media file's tracks and packets (docs/design.md §5 V2,
+# §3.4): MP4 and MOV through Rae's media/Mp4. The file is opened once; only the
+# movie box is read whole, and each packet is read from the file when asked.
+#
+#     var reader: MediaReader = openMediaReader(path: "clips/holiday.mov")
+#     let videoTrack: Int = reader.videoTrackIndex()
+#     let packet: MediaPacket = reader.readPacket(trackIndex: videoTrack, sampleIndex: 0)
+#     reader.close()
+#
+# Times are rational (media/MediaTime), in the track's own timebase
+# (1 / its timescale): a packet is decoded at `decodeTime` and shown at
+# `presentationTime`. The edit list's start is taken off both, so the first
+# frame shown is at 0 (as ffprobe and players count).
+import Math
+open media/MediaTime
+open media/Mp4
+open video/VideoGlue
+
+type MediaReader {
+  # the file's descriptor, -1 when it is not open
+  file: Int
+  fileSize: Int
+  movie: Mp4Movie
+  # per track, how much earlier its decode times are put so that no frame is
+  # shown before it is decoded (signed composition offsets; as FFmpeg does)
+  decodeShifts: List(Int)
+  # "" when the file was read
+  error: String
+}
+
+type MediaPacket {
+  trackIndex: Int
+  sampleIndex: Int
+  # empty when it could not be read
+  bytes: List(UInt8)
+  decodeTime: MediaTime
+  presentationTime: MediaTime
+  duration: MediaTime
+  keyframe: Bool
+}
+
+# `count` bytes of the file at `offset`; empty when they cannot all be read
+func readFileRange(file: view Int, offset: view Int, count: view Int) ret List(UInt8) {
+  var bytes: List(UInt8) = List.create(UInt8, cap: max(a: 1, b: count))
+  if count <= 0 or file < 0 {
+    ret bytes
+  }
+  bytes.addDefaults(count: count)
+  unsafe {
+    let got: Int = rae_video_file_read_at(
+      file: file
+      into: bytes.data
+      count: count
+      offset: offset
+    )
+    if got is not count {
+      bytes.clear()
+    }
+  }
+  ret bytes
+}
+
+func failedReader(error: view String) ret MediaReader {
+  ret MediaReader {
+    file: -1
+    fileSize: 0
+    movie: failedMp4Movie(error: error)
+    decodeShifts: {}
+    error: "{error}"
+  }
+}
+
+# The file's movie: its top-level boxes walked, the moov read whole
+func openMediaReader(path: view String) ret MediaReader {
+  let pathZ: List(UInt8) = textBytesZ(text: path)
+  var file: Int = -1
+  var fileSize: Int = 0
+  unsafe {
+    file = rae_video_file_open(pathZ: pathZ.data)
+    if file >= 0 {
+      fileSize = rae_video_file_size(file: file)
+    }
+  }
+  if file < 0 {
+    ret failedReader(error: "cannot open {path}")
+  }
+  var offset: Int = 0
+  loop offset < fileSize {
+    let header: List(UInt8) = readFileRange(
+      file: file
+      offset: offset
+      count: min(a: 16, b: fileSize - offset)
+    )
+    let box: Mp4Box = mp4BoxAt(bytes: header, at: 0, end: fileSize - offset)
+    if box.kind is "" or box.size <= 0 {
+      unsafe {
+        rae_video_file_close(file: file)
+      }
+      ret failedReader(error: "{path} is not an MP4 or MOV file")
+    }
+    if box.kind is "moov" {
+      let movie: Mp4Movie = parseMp4Movie(
+        moov: readFileRange(file: file, offset: offset, count: box.size)
+      )
+      ret MediaReader {
+        file: file
+        fileSize: fileSize
+        movie: movie
+        decodeShifts: decodeShiftsOf(movie: movie)
+        error: "{movie.error}"
+      }
+    }
+    offset = offset + box.size
+  }
+  unsafe {
+    rae_video_file_close(file: file)
+  }
+  ret failedReader(error: "{path} has no moov box")
+}
+
+func close(this: mod MediaReader) {
+  if this.file >= 0 {
+    unsafe {
+      rae_video_file_close(file: this.file)
+    }
+    this.file = -1
+  }
+}
+
+func trackCount(this: view MediaReader) ret Int {
+  ret this.movie.tracks.length()
+}
+
+# The first track with this handler ("vide", "soun"), or -1
+func trackIndexOf(this: view MediaReader, handler: view String) ret Int {
+  loop var i: Int = 0, i < this.movie.tracks.length(), ++i {
+    if let track: view Mp4Track = this.movie.tracks.viewAt(index: i) {
+      if track.handler is handler and track.sampleSizes.length() > 0 {
+        ret i
+      }
+    }
+  }
+  ret -1
+}
+
+func videoTrackIndex(this: view MediaReader) ret Int {
+  ret this.trackIndexOf(handler: "vide")
+}
+
+func audioTrackIndex(this: view MediaReader) ret Int {
+  ret this.trackIndexOf(handler: "soun")
+}
+
+# The track, or an empty one when there is none at `trackIndex`
+func track(this: view MediaReader, trackIndex: view Int) ret Mp4Track {
+  if let track: Mp4Track = this.movie.tracks.copyAt(index: trackIndex) {
+    ret track
+  }
+  ret emptyMp4Track()
+}
+
+func sampleCount(this: view MediaReader, trackIndex: view Int) ret Int {
+  if let track: view Mp4Track = this.movie.tracks.viewAt(index: trackIndex) {
+    ret track.sampleSizes.length()
+  }
+  ret 0
+}
+
+# 1 / the track's timescale
+func trackTimebase(this: view MediaReader, trackIndex: view Int) ret Rational {
+  if let track: view Mp4Track = this.movie.tracks.viewAt(index: trackIndex) {
+    ret rational(numerator: 1, denominator: max(a: 1, b: track.timescale))
+  }
+  ret rational(numerator: 1, denominator: 1)
+}
+
+func trackSampleIsKeyframe(track: view Mp4Track, sampleIndex: view Int) ret Bool {
+  if track.syncSamples.length() is 0 {
+    ret true
+  }
+  # syncSamples is sorted: a binary search
+  var low: Int = 0
+  var high: Int = track.syncSamples.length() - 1
+  loop low <= high {
+    let middle: Int = (low + high) / 2
+    let value: Int = track.syncSamples.copyAtDefault(index: middle)
+    if value is sampleIndex {
+      ret true
+    }
+    if value < sampleIndex {
+      low = middle + 1
+    } else {
+      high = middle - 1
+    }
+  }
+  ret false
+}
+
+# When the sample is shown, in the track's units, the edit's start taken off
+func trackPresentationValue(track: view Mp4Track, sampleIndex: view Int) ret Int {
+  var value: Int = track.sampleTimes.copyAtDefault(index: sampleIndex)
+  if track.compositionOffsets.length() > sampleIndex {
+    value = value + track.compositionOffsets.copyAtDefault(index: sampleIndex)
+  }
+  ret value - track.presentationStart
+}
+
+func trackDecodeValue(track: view Mp4Track, sampleIndex: view Int, shift: view Int) ret Int {
+  ret track.sampleTimes.copyAtDefault(index: sampleIndex) - track.presentationStart - shift
+}
+
+# Per track, the most a sample's decode time comes after its presentation time
+# (0 when none does)
+func decodeShiftsOf(movie: view Mp4Movie) ret List(Int) {
+  var shifts: List(Int) = List.create(Int, cap: max(a: 1, b: movie.tracks.length()))
+  loop let track: view Mp4Track in movie.tracks {
+    var shift: Int = 0
+    loop var i: Int = 0, i < track.sampleTimes.length(), ++i {
+      let late: Int = trackDecodeValue(track: track, sampleIndex: i, shift: 0) - trackPresentationValue(
+        track: track
+        sampleIndex: i
+      )
+      shift = max(a: shift, b: late)
+    }
+    shifts.add(value: shift)
+  }
+  ret shifts
+}
+
+# How long the sample lasts: to the next decode time; the last one to the
+# track's end, or to the end of the edit when that comes first
+func trackDurationValue(track: view Mp4Track, sampleIndex: view Int) ret Int {
+  let count: Int = track.sampleTimes.length()
+  let start: Int = track.sampleTimes.copyAtDefault(index: sampleIndex)
+  if sampleIndex + 1 < count {
+    ret track.sampleTimes.copyAtDefault(index: sampleIndex + 1) - start
+  }
+  var end: Int = track.duration
+  if track.presentationLength > 0 {
+    end = min(a: end, b: track.presentationStart + track.presentationLength)
+  }
+  ret max(a: 0, b: end - start)
+}
+
+func isKeyframe(this: view MediaReader, trackIndex: view Int, sampleIndex: view Int) ret Bool {
+  if let track: view Mp4Track = this.movie.tracks.viewAt(index: trackIndex) {
+    ret trackSampleIsKeyframe(track: track, sampleIndex: sampleIndex)
+  }
+  ret false
+}
+
+func presentationTimeOf(
+  this: view MediaReader
+  trackIndex: view Int
+  sampleIndex: view Int
+) ret MediaTime {
+  let timebase: Rational = this.trackTimebase(trackIndex: trackIndex)
+  if let track: view Mp4Track = this.movie.tracks.viewAt(index: trackIndex) {
+    ret MediaTime {
+      value: trackPresentationValue(track: track, sampleIndex: sampleIndex)
+      timebase: timebase
+    }
+  }
+  ret MediaTime { value: 0, timebase: timebase }
+}
+
+# The packet: its bytes read from the file, its times and whether it is a
+# keyframe
+func readPacket(
+  this: view MediaReader
+  trackIndex: view Int
+  sampleIndex: view Int
+) ret MediaPacket {
+  let timebase: Rational = this.trackTimebase(trackIndex: trackIndex)
+  if let track: view Mp4Track = this.movie.tracks.viewAt(index: trackIndex) {
+    if sampleIndex >= 0 and sampleIndex < track.sampleSizes.length() {
+      ret MediaPacket {
+        trackIndex: trackIndex
+        sampleIndex: sampleIndex
+        bytes: readFileRange(
+          file: this.file
+          offset: track.sampleOffsets.copyAtDefault(index: sampleIndex)
+          count: track.sampleSizes.copyAtDefault(index: sampleIndex)
+        )
+        decodeTime: {
+          value: trackDecodeValue(
+            track: track
+            sampleIndex: sampleIndex
+            shift: this.decodeShifts.copyAtDefault(index: trackIndex)
+          )
+          timebase: timebase
+        }
+        presentationTime: {
+          value: trackPresentationValue(track: track, sampleIndex: sampleIndex)
+          timebase: timebase
+        }
+        duration: {
+          value: trackDurationValue(track: track, sampleIndex: sampleIndex)
+          timebase: timebase
+        }
+        keyframe: trackSampleIsKeyframe(track: track, sampleIndex: sampleIndex)
+      }
+    }
+  }
+  ret MediaPacket {
+    trackIndex: trackIndex
+    sampleIndex: sampleIndex
+    bytes: List.create(UInt8, cap: 0)
+    decodeTime: { value: 0, timebase: timebase }
+    presentationTime: { value: 0, timebase: timebase }
+    duration: { value: 0, timebase: timebase }
+    keyframe: false
+  }
+}
+
+# The track's sample indices in the order they are shown (by presentation
+# time; decode order when two are equal). A merge sort: a file's samples are
+# nearly in order already, but a long one has hundreds of thousands.
+func presentationOrder(this: view MediaReader, trackIndex: view Int) ret List(Int) {
+  let count: Int = this.sampleCount(trackIndex: trackIndex)
+  var times: List(Int) = List.create(Int, cap: max(a: 1, b: count))
+  var order: List(Int) = List.create(Int, cap: max(a: 1, b: count))
+  if let track: view Mp4Track = this.movie.tracks.viewAt(index: trackIndex) {
+    loop var i: Int = 0, i < count, ++i {
+      times.add(value: trackPresentationValue(track: track, sampleIndex: i))
+      order.add(value: i)
+    }
+  }
+  var scratch: List(Int) = List.create(Int, cap: max(a: 1, b: count))
+  scratch.addDefaults(count: count)
+  var width: Int = 1
+  loop width < count {
+    var start: Int = 0
+    loop start < count {
+      let middle: Int = min(a: start + width, b: count)
+      let end: Int = min(a: start + 2 * width, b: count)
+      var left: Int = start
+      var right: Int = middle
+      var at: Int = start
+      loop at < end {
+        var takeLeft: Bool = right >= end
+        if left < middle and right < end {
+          let leftSample: Int = order.copyAtDefault(index: left)
+          let rightSample: Int = order.copyAtDefault(index: right)
+          takeLeft = times.copyAtDefault(index: leftSample) <= times.copyAtDefault(
+            index: rightSample
+          )
+        }
+        if takeLeft and left < middle {
+          scratch.set(index: at, value: order.copyAtDefault(index: left))
+          left = left + 1
+        } else {
+          scratch.set(index: at, value: order.copyAtDefault(index: right))
+          right = right + 1
+        }
+        at = at + 1
+      }
+      start = end
+    }
+    loop var i: Int = 0, i < count, ++i {
+      order.set(index: i, value: scratch.copyAtDefault(index: i))
+    }
+    width = width * 2
+  }
+  ret order
+}
+
+# The last keyframe at or before the sample (in decode order): where a decode
+# that must reach this sample starts
+func keyframeAtOrBefore(
+  this: view MediaReader
+  trackIndex: view Int
+  sampleIndex: view Int
+) ret Int {
+  if let track: view Mp4Track = this.movie.tracks.viewAt(index: trackIndex) {
+    if track.syncSamples.length() is 0 {
+      ret sampleIndex
+    }
+    var found: Int = 0
+    loop let sync: Int in track.syncSamples {
+      if sync <= sampleIndex {
+        found = sync
+      }
+    }
+    ret found
+  }
+  ret 0
+}

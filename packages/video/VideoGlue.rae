@@ -1,0 +1,108 @@
+cheader "rae_video.h"
+
+# The bindings to native/rae_video_glue.c (docs/design.md §5 V1): files, and
+# VideoToolbox decoding on Apple, one platform call each. Handles are Int (0:
+# none). A program that imports this links the package's C (native/build.sh).
+func rae_video_file_open(pathZ: Buffer(UInt8)) unsafe extern("rae_video_file_open") ret Int
+
+func rae_video_file_size(file: Int) unsafe extern("rae_video_file_size") ret Int
+
+func rae_video_file_read_at(
+  file: Int
+  into: Buffer(UInt8)
+  count: Int
+  offset: Int
+) unsafe extern("rae_video_file_read_at") ret Int
+
+func rae_video_file_close(file: Int) unsafe extern("rae_video_file_close")
+
+func rae_video_vt_available() unsafe extern("rae_video_vt_available") ret Int
+
+func rae_video_vt_open(
+  codec: Int
+  width: Int
+  height: Int
+  config: Buffer(UInt8)
+  configSize: Int
+  configKind: Int
+) unsafe extern("rae_video_vt_open") ret Int
+
+func rae_video_vt_decode(
+  decoder: Int
+  packet: Buffer(UInt8)
+  size: Int
+  time: Int
+  timescale: Int
+) unsafe extern("rae_video_vt_decode") ret Int
+
+func rae_video_vt_close(decoder: Int) unsafe extern("rae_video_vt_close")
+
+func rae_video_frame_width(frame: Int) unsafe extern("rae_video_frame_width") ret Int
+
+func rae_video_frame_height(frame: Int) unsafe extern("rae_video_frame_height") ret Int
+
+func rae_video_frame_pixel_format(frame: Int) unsafe extern("rae_video_frame_pixel_format") ret Int
+
+func rae_video_frame_plane_count(frame: Int) unsafe extern("rae_video_frame_plane_count") ret Int
+
+func rae_video_frame_plane_width(
+  frame: Int
+  plane: Int
+) unsafe extern("rae_video_frame_plane_width") ret Int
+
+func rae_video_frame_plane_height(
+  frame: Int
+  plane: Int
+) unsafe extern("rae_video_frame_plane_height") ret Int
+
+func rae_video_frame_plane_bytes_per_row(
+  frame: Int
+  plane: Int
+) unsafe extern("rae_video_frame_plane_bytes_per_row") ret Int
+
+func rae_video_frame_lock(frame: Int) unsafe extern("rae_video_frame_lock") ret Int
+
+func rae_video_frame_plane_address(
+  frame: Int
+  plane: Int
+) unsafe extern("rae_video_frame_plane_address") ret Ptr
+
+func rae_video_frame_unlock(frame: Int) unsafe extern("rae_video_frame_unlock")
+
+func rae_video_frame_copy_plane(
+  frame: Int
+  plane: Int
+  into: Buffer(UInt8)
+  rowBytes: Int
+) unsafe extern("rae_video_frame_copy_plane") ret Int
+
+func rae_video_frame_matrix(frame: Int) unsafe extern("rae_video_frame_matrix") ret Int
+
+func rae_video_frame_primaries(frame: Int) unsafe extern("rae_video_frame_primaries") ret Int
+
+func rae_video_frame_transfer(frame: Int) unsafe extern("rae_video_frame_transfer") ret Int
+
+func rae_video_frame_release(frame: Int) unsafe extern("rae_video_frame_release")
+
+# A text's bytes with a zero after them, for a C path
+func textBytesZ(text: view String) ret List(UInt8) {
+  var bytes: List(UInt8) = List.create(UInt8, cap: text.length() + 1)
+  loop var i: Int = 0, i < text.length(), ++i {
+    bytes.add(value: text.byteAt(index: i) as UInt8)
+  }
+  bytes.add(value: 0 as UInt8)
+  ret bytes
+}
+
+# Four characters ("avc1") as the big-endian integer C's four-character codes are
+func fourCharacterCode(text: view String) ret Int {
+  var code: Int = 0
+  loop var i: Int = 0, i < 4, ++i {
+    var byte: Int = 32
+    if i < text.length() {
+      byte = text.byteAt(index: i)
+    }
+    code = code * 256 + byte
+  }
+  ret code
+}

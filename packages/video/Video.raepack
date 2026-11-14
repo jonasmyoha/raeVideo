@@ -1,0 +1,24 @@
+pack Video {
+  format: "raepack"
+  version: 1
+  meta: {
+    version: "0.1.0"
+  }
+  rae: {
+    version: "0.3.123"
+  }
+  dependencies: {
+    dep audio: {
+      git: "https://github.com/jonasmyoha/rae.git"
+      subdir: "packages/audio"
+      version: "0.15.1"
+      hash: "git-tree:b4980c53225391e3b553295f3b36bae7889a30a3"
+    }
+  }
+  native: {
+    build: "native/build.sh"
+    header: "rae_video.h"
+    include: "include"
+    link: "lib/libraevideo.a"
+  }
+}

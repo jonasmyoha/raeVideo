@@ -1,0 +1,55 @@
+# video/MediaReader against ffprobe (docs/design.md §10 "Demuxers"): every
+# packet of every track of the four test files (tests/media/make.sh), with its
+# presentation and decode times, duration, size and keyframe flag, read from
+# the file. expected.txt is ffprobe's list (makeExpected.sh), so a line that
+# differs is a sample whose time or size we read wrongly. Each packet's bytes
+# are read too, and their count must be its size.
+open media/MediaTime
+open video/MediaReader
+
+func listFile(name: view String) ret Bool {
+  var reader: MediaReader = openMediaReader(path: "tests/media/{name}")
+  if reader.error.length() > 0 {
+    log("{name}: {reader.error}")
+    ret false
+  }
+  var ok: Bool = true
+  loop var trackIndex: Int = 0, trackIndex < reader.trackCount(), ++trackIndex {
+    loop var sampleIndex: Int = 0, sampleIndex < reader.sampleCount(trackIndex: trackIndex), ++sampleIndex {
+      let packet: MediaPacket = reader.readPacket(trackIndex: trackIndex, sampleIndex: sampleIndex)
+      var key: Int = 0
+      if packet.keyframe {
+        key = 1
+      }
+      log(
+        "{name} track {trackIndex} sample {sampleIndex}: pts {packet.presentationTime.value} dts {packet.decodeTime.value} duration {packet.duration.value} size {packet.bytes.length()} key {key}"
+      )
+      if packet.bytes.length() is 0 {
+        ok = false
+      }
+    }
+  }
+  reader.close()
+  ret ok
+}
+
+func main() ret Int {
+  let files: List(String) = {
+    "counter709.mp4"
+    "counter601full.mp4"
+    "counterHevc.mp4"
+    "counterProres.mov"
+  }
+  var ok: Bool = true
+  loop let name: String in files {
+    if not listFile(name: name) {
+      ok = false
+    }
+  }
+  if not ok {
+    log("FAIL: a packet could not be read")
+    ret 1
+  }
+  log("done")
+  ret 0
+}
