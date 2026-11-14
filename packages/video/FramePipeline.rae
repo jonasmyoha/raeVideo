@@ -1,0 +1,484 @@
+# video/FramePipeline — the frame pipeline (docs/design.md §5 V3, §6.2): decode
+# ahead on worker threads, for several files at once, into a frame cache on the
+# GPU with a memory budget, and show a cached frame by recording its
+# conversion into the caller's recording.
+#
+#     var pipeline: FramePipeline = createFramePipeline(budgetBytes: 512 * 1024 * 1024)
+#     let clip: Int = pipeline.addSource(path: "a.mov", table: defaultVideoBackends())
+#     let next: Int = pipeline.addSource(path: "b.mov", table: defaultVideoBackends())
+#     var output: FrameOutput = ...createFrameOutput(resources:, width:, height:)...
+#     # each refresh, on the main thread:
+#     pipeline.update(resources: resources, maxUploads: 4)        # what the workers decoded
+#     pipeline.prefetch(sourceNumber: clip, first: frame, last: frame + 12)
+#     pipeline.prefetch(sourceNumber: next, first: 0, last: 3)     # the next cut, ahead
+#     if pipeline.recordShow(resources:, recording:, output:, sourceNumber: clip, frameIndex:
+#     frame) {
+#       ... draw output.pictureView ...
+#     }
+#     pipeline.close(resources: resources)
+#
+# What runs where: each file's worker (video/DecodeWorker) decodes the frames it
+# is asked for and sends them; the main thread, in `update`, puts them on the
+# GPU (video/FrameCache: the copy from the decoder's memory, a few per refresh)
+# and releases them. Asking for a frame that is cached or already asked for
+# does nothing, so a caller can name every frame it will want each refresh.
+#
+# Stepping and reverse: `prefetchBack` asks for the GOP before a frame, so a
+# step back, or reverse play, finds each GOP decoded forward and serves it
+# backwards from the cache. Scrubbing: `scrub` answers the nearest frame of the
+# file that can be shown now (the exact one when it is cached), and asks for
+# the keyframe and then the exact frame, dropping what was asked before.
+import Math
+open Atomic
+open Channel
+open gpu/GpuCompute
+open gpu/GpuIds
+open gpu/GpuLifetime
+open gpu/GpuResources
+open video/DecodeWorker
+open video/FrameCache
+open video/FrameStream
+open video/VideoBackends
+open video/VideoDecoder
+open video/YuvPicture
+open webgpu/WebgpuEnums
+
+type PipelineSource {
+  number: Int
+  path: String
+  # the file's index (frame times, keyframes), read on the main thread; its
+  # decoder is not used: the worker has its own
+  index: FrameStream
+  requests: Channel(DecodeRequest)
+  running: Atomic(Bool)
+  generation: Atomic(Int)
+  worker: Task(Int)
+  # per frame: asked for and not arrived yet
+  asked: List(Bool)
+  closed: Bool
+}
+
+# An RGBA texture a cached frame is shown in, and the conversion passes for it
+type FrameOutput {
+  width: Int
+  height: Int
+  picture: TextureId
+  pictureView: TextureViewId
+  bounds: ComputeBounds
+  nv12Pipeline: PipelineId
+  planarPipeline: PipelineId
+}
+
+type FramePipeline {
+  sources: List(PipelineSource)
+  results: Channel(DecodedFrame)
+  cache: FrameCache
+  # the frame shown last (it is never given up for another)
+  shownSource: Int
+  shownFrame: Int
+  # statistics: shows of a cached frame, and of a frame that was not
+  hits: Int
+  misses: Int
+}
+
+func createFramePipeline(budgetBytes: view Int) ret FramePipeline {
+  ret FramePipeline {
+    sources: {}
+    results: createChannel(DecodedFrame)
+    cache: createFrameCache(budgetBytes: budgetBytes)
+    shownSource: 0
+    shownFrame: -1
+    hits: 0
+    misses: 0
+  }
+}
+
+# Opens a file and starts its worker: the source's number (1 and up), or 0
+# when the file cannot give frames (`sourceError` says why)
+func addSource(
+  this: mod FramePipeline
+  path: view String
+  table: view List(VideoBackendChoice)
+) ret Int {
+  let number: Int = this.sources.length() + 1
+  let index: FrameStream = openFrameStream(path: path, table: table)
+  let requests: Channel(DecodeRequest) = createChannel(DecodeRequest)
+  let running: Atomic(Bool) = createAtomic(Bool, value: true)
+  let generation: Atomic(Int) = createAtomic(Int, value: 0)
+  var asked: List(Bool) = List.create(Bool, cap: max(a: 1, b: index.frameCount()))
+  loop var i: Int = 0, i < index.frameCount(), ++i {
+    asked.add(value: false)
+  }
+  var tableCopy: List(VideoBackendChoice) = {}
+  loop let entry: VideoBackendChoice in table {
+    tableCopy.add(value: entry)
+  }
+  let ok: Bool = index.error.length() is 0
+  var worker: Task(Int) = spawn thread decodeWorker(
+    path: "{path}"
+    table: own tableCopy
+    sourceNumber: number
+    requests: requests
+    results: this.results
+    running: running
+    generation: generation
+  )
+  this.sources.add(value: own PipelineSource {
+    number: number
+    path: "{path}"
+    index: own index
+    requests: requests
+    running: running
+    generation: generation
+    worker: own worker
+    asked: own asked
+    closed: false
+  })
+  if not ok {
+    ret 0
+  }
+  ret number
+}
+
+func sourceError(this: view FramePipeline, sourceNumber: view Int) ret String {
+  if let source: view PipelineSource = this.sources.viewAt(index: sourceNumber - 1) {
+    ret "{source.index.error}"
+  }
+  ret "no source {sourceNumber}"
+}
+
+func frameCountOf(this: view FramePipeline, sourceNumber: view Int) ret Int {
+  if let source: view PipelineSource = this.sources.viewAt(index: sourceNumber - 1) {
+    ret source.index.frameCount()
+  }
+  ret 0
+}
+
+func isCached(this: view FramePipeline, sourceNumber: view Int, frameIndex: view Int) ret Bool {
+  ret this.cache.contains(sourceNumber: sourceNumber, frameIndex: frameIndex)
+}
+
+# Asks the source's worker for frames first..last, leaving out the ones cached
+# or already asked for (each run of the rest is one request)
+func prefetch(
+  this: mod FramePipeline
+  sourceNumber: view Int
+  first: view Int
+  last: view Int
+) {
+  if let source: mod PipelineSource = this.sources.modAt(index: sourceNumber - 1) {
+    if source.closed {
+      ret
+    }
+    let from: Int = max(a: 0, b: first)
+    let to: Int = min(a: last, b: source.index.frameCount() - 1)
+    var runStart: Int = -1
+    loop var frameIndex: Int = from, frameIndex <= to + 1, ++frameIndex {
+      var needed: Bool = false
+      if frameIndex <= to {
+        needed = not source.asked.copyAtDefault(index: frameIndex) and not this.cache.contains(
+          sourceNumber: sourceNumber
+          frameIndex: frameIndex
+        )
+      }
+      if needed and runStart < 0 {
+        runStart = frameIndex
+      }
+      if not needed and runStart >= 0 {
+        source.requests.channelSend(
+          value: DecodeRequest {
+            kind: DecodeRequestKind.range
+            first: runStart
+            last: frameIndex - 1
+            generation: source.generation.load()
+          }
+        )
+        loop var asked: Int = runStart, asked < frameIndex, ++asked {
+          source.asked.set(index: asked, value: true)
+        }
+        runStart = -1
+      }
+    }
+  }
+}
+
+func want(this: mod FramePipeline, sourceNumber: view Int, frameIndex: view Int) {
+  this.prefetch(sourceNumber: sourceNumber, first: frameIndex, last: frameIndex)
+}
+
+# For stepping back and reverse play: the frames from the keyframe of the
+# frame `count` before `frameIndex` up to it, decoded forward, served backwards
+func prefetchBack(
+  this: mod FramePipeline
+  sourceNumber: view Int
+  frameIndex: view Int
+  count: view Int
+) {
+  var first: Int = max(a: 0, b: frameIndex - count)
+  if let source: view PipelineSource = this.sources.viewAt(index: sourceNumber - 1) {
+    first = min(a: first, b: source.index.keyframeIndexOf(frameIndex: first))
+  }
+  this.prefetch(sourceNumber: sourceNumber, first: first, last: frameIndex)
+}
+
+# Forgets what was asked of a source and not done yet: its worker skips those
+# requests (and stops a range it is in)
+func cancel(this: mod FramePipeline, sourceNumber: view Int) {
+  if let source: mod PipelineSource = this.sources.modAt(index: sourceNumber - 1) {
+    let next: Int = source.generation.fetchAdd(amount: 1) + 1
+    loop var i: Int = 0, i < source.asked.length(), ++i {
+      source.asked.set(index: i, value: false)
+    }
+  }
+}
+
+# A scrub to frame `frameIndex`: the frame to show now (the exact one when it
+# is cached, else the cached frame of the file nearest to it, -1 when none),
+# and the exact frame asked for, after its keyframe, with what was asked
+# before dropped
+func scrub(this: mod FramePipeline, sourceNumber: view Int, frameIndex: view Int) ret Int {
+  if this.cache.contains(sourceNumber: sourceNumber, frameIndex: frameIndex) {
+    ret frameIndex
+  }
+  this.cancel(sourceNumber: sourceNumber)
+  if let source: mod PipelineSource = this.sources.modAt(index: sourceNumber - 1) {
+    if not source.closed and frameIndex >= 0 and frameIndex < source.index.frameCount() {
+      var keyframe: Int = source.index.keyframeIndexOf(frameIndex: frameIndex)
+      if keyframe >= frameIndex or this.cache.contains(
+        sourceNumber: sourceNumber
+        frameIndex: keyframe
+      ) {
+        keyframe = -1
+      }
+      source.requests.channelSend(
+        value: DecodeRequest {
+          kind: DecodeRequestKind.scrub
+          first: keyframe
+          last: frameIndex
+          generation: source.generation.load()
+        }
+      )
+      if keyframe >= 0 {
+        source.asked.set(index: keyframe, value: true)
+      }
+      source.asked.set(index: frameIndex, value: true)
+    }
+  }
+  ret this.nearestCached(sourceNumber: sourceNumber, frameIndex: frameIndex)
+}
+
+# The cached frame of the source nearest to `frameIndex`, -1 when none
+func nearestCached(this: view FramePipeline, sourceNumber: view Int, frameIndex: view Int) ret Int {
+  var found: Int = -1
+  var distance: Int = 0
+  loop let entry: view CachedFrame in this.cache.frames {
+    if entry.sourceNumber is sourceNumber {
+      var gap: Int = entry.frameIndex - frameIndex
+      if gap < 0 {
+        gap = -gap
+      }
+      if found < 0 or gap < distance {
+        found = entry.frameIndex
+        distance = gap
+      }
+    }
+  }
+  ret found
+}
+
+# Once per refresh, on the main thread: up to `maxUploads` decoded frames put
+# on the GPU (the rest wait for the next refresh), each released. True when
+# any arrived.
+func update(this: mod FramePipeline, resources: mod GpuResources, maxUploads: view Int) ret Bool {
+  var arrived: Int = 0
+  loop arrived < maxUploads and this.results.pending() > 0 {
+    var decoded: DecodedFrame = this.results.receive()
+    arrived = arrived + 1
+    if let source: mod PipelineSource = this.sources.modAt(index: decoded.sourceNumber - 1) {
+      if decoded.frameIndex >= 0 and decoded.frameIndex < source.asked.length() {
+        source.asked.set(index: decoded.frameIndex, value: false)
+      }
+      if not source.closed {
+        let stored: Bool = this.cache.store(
+          resources: resources
+          sourceNumber: decoded.sourceNumber
+          frameIndex: decoded.frameIndex
+          frame: decoded.frame
+          pinnedSource: this.shownSource
+          pinnedFrame: this.shownFrame
+        )
+      }
+    }
+    releaseFrame(frame: decoded.frame)
+  }
+  ret arrived > 0
+}
+
+# The RGBA texture cached frames of width x height are shown in, with its
+# conversion passes; none when the GPU refuses
+func createFrameOutput(
+  resources: mod GpuResources
+  width: view Int
+  height: view Int
+) ret opt FrameOutput {
+  let nv12: Shader = shader(files: ["lib/gpu/computeBounds.wgsl", "yuvToRgb.wgsl"])
+  let planar: Shader = shader(files: ["lib/gpu/computeBounds.wgsl", "yuvPlanarToRgb.wgsl"])
+  if let picture: TextureId = createTexture(
+    resources: resources
+    width: width
+    height: height
+    format: WGPUTextureFormat_RGBA8Unorm
+    usage: WGPUTextureUsage_StorageBinding + WGPUTextureUsage_TextureBinding + WGPUTextureUsage_CopySrc
+  ) {
+    if let pictureView: TextureViewId = createTextureView(resources: resources, texture: picture) {
+      if let bounds: ComputeBounds = createComputeBounds(
+        resources: resources
+        workgroupSize: conversionWorkgroupSize
+      ) {
+        if let nv12Pipeline: PipelineId = createBoundedComputePipeline(
+          resources: resources
+          wgsl: nv12.text
+          entryPoint: "main"
+          bounds: bounds
+        ) {
+          if let planarPipeline: PipelineId = createBoundedComputePipeline(
+            resources: resources
+            wgsl: planar.text
+            entryPoint: "main"
+            bounds: bounds
+          ) {
+            ret FrameOutput {
+              width: width
+              height: height
+              picture: picture
+              pictureView: pictureView
+              bounds: bounds
+              nv12Pipeline: nv12Pipeline
+              planarPipeline: planarPipeline
+            }
+          }
+        }
+      }
+    }
+  }
+  ret none
+}
+
+func outputPipeline(output: view FrameOutput, layout: view FrameLayout) ret PipelineId {
+  if layout is FrameLayout.nv12 {
+    ret output.nv12Pipeline
+  }
+  ret output.planarPipeline
+}
+
+# Records the conversion of the cached frame into `output`'s texture, into the
+# caller's recording (submitted with the caller's frame, never waited for
+# here). False when the frame is not cached (a miss: show the last one) or is
+# not of the output's size.
+func recordShow(
+  this: mod FramePipeline
+  resources: mod GpuResources
+  recording: mod Recording
+  output: view FrameOutput
+  sourceNumber: view Int
+  frameIndex: view Int
+) ret Bool {
+  let index: Int = this.cache.indexOf(sourceNumber: sourceNumber, frameIndex: frameIndex)
+  if index < 0 {
+    this.misses = this.misses + 1
+    ret false
+  }
+  this.cache.touch(index: index)
+  this.shownSource = sourceNumber
+  this.shownFrame = frameIndex
+  var layout: FrameLayout = FrameLayout.unsupported
+  var bindGroup: BindGroupId = noBindGroupId()
+  if let entry: mod CachedFrame = this.cache.frames.modAt(index: index) {
+    if entry.width is not output.width or entry.height is not output.height {
+      ret false
+    }
+    layout = entry.layout
+    if entry.boundOutput is not output.picture.slot {
+      if entry.boundOutput >= 0 {
+        let gone: Bool = retireBindGroup(resources: resources, id: entry.bindGroup)
+      }
+      var buffers: List(BufferId) = {}
+      buffers.add(value: entry.parameters)
+      var views: List(TextureViewId) = {}
+      loop let planeView: TextureViewId in entry.planeViews {
+        views.add(value: planeView)
+      }
+      views.add(value: output.pictureView)
+      let noSamplers: List(SamplerId) = {}
+      if let made: BindGroupId = createBoundedBindGroup(
+        resources: resources
+        pipeline: outputPipeline(output: output, layout: entry.layout)
+        bounds: output.bounds
+        buffers: buffers
+        textureViews: views
+        samplers: noSamplers
+      ) {
+        entry.bindGroup = made
+        entry.boundOutput = output.picture.slot
+      } else {
+        entry.boundOutput = -1
+        ret false
+      }
+    }
+    bindGroup = entry.bindGroup
+  }
+  this.hits = this.hits + 1
+  ret recordBoundedCompute(
+    recording: recording
+    resources: resources
+    pipeline: outputPipeline(output: output, layout: layout)
+    bindGroup: bindGroup
+    bounds: output.bounds
+    elementCount: output.width * output.height
+  )
+}
+
+# Stops a source's worker (it finishes the frame it is on) and forgets its
+# frames
+func closeSource(this: mod FramePipeline, sourceNumber: view Int) {
+  if let source: mod PipelineSource = this.sources.modAt(index: sourceNumber - 1) {
+    if source.closed {
+      ret
+    }
+    source.running.store(value: false)
+    let decoded: Int = source.worker.get()
+    source.closed = true
+    source.index.close()
+  }
+  this.cache.forgetSource(sourceNumber: sourceNumber)
+}
+
+# Stops every worker, releases the frames still on their way and the cache
+func close(this: mod FramePipeline, resources: mod GpuResources) {
+  loop var number: Int = 1, number <= this.sources.length(), ++number {
+    this.closeSource(sourceNumber: number)
+  }
+  loop this.results.pending() > 0 {
+    var decoded: DecodedFrame = this.results.receive()
+    releaseFrame(frame: decoded.frame)
+  }
+  loop var i: Int = 0, i < this.sources.length(), ++i {
+    if let source: view PipelineSource = this.sources.viewAt(index: i) {
+      source.requests.freeChannel()
+      source.running.freeAtomic()
+      source.generation.freeAtomic()
+    }
+  }
+  this.results.freeChannel()
+  releaseFrameCache(this: this.cache, resources: resources)
+}
+
+# The output's RGBA bytes, read back from the GPU (waited for): for tests
+func readOutput(output: view FrameOutput, resources: mod GpuResources) ret List(UInt8) {
+  ret readTexture(
+    resources: resources
+    texture: output.picture
+    width: output.width
+    height: output.height
+  )
+}

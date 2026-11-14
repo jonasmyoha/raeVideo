@@ -184,10 +184,7 @@ func takeFrame(this: mod FrameStream, frameIndex: view Int) ret VideoFrame {
     ret noVideoFrame()
   }
   let sample: Int = this.order.copyAtDefault(index: frameIndex)
-  let keyframe: Int = this.reader.keyframeAtOrBefore(
-    trackIndex: this.trackIndex
-    sampleIndex: sample
-  )
+  let keyframe: Int = this.decodeStartOf(frameIndex: frameIndex)
   var waiting: Int = this.pendingIndexOf(frameIndex: frameIndex)
   # behind the decoder and no longer waiting, or a keyframe ahead of it is
   # closer: start again there
@@ -231,4 +228,31 @@ func close(this: mod FrameStream) {
   this.dropPending(frameIndex: 0, everything: true)
   this.decoder.close()
   this.reader.close()
+}
+
+# The sample a decode that must reach frame `frameIndex` starts from: the last
+# keyframe at or before its sample (in decode order) that is not shown after
+# it. In an open GOP (HEVC's CRA pictures) the frames decoded just after a
+# keyframe but shown before it are its leading frames: they refer to frames
+# before the keyframe, so a decode that starts at the keyframe cannot give them,
+# and starts at the keyframe before instead.
+func decodeStartOf(this: view FrameStream, frameIndex: view Int) ret Int {
+  let sample: Int = this.order.copyAtDefault(index: frameIndex)
+  var keyframe: Int = this.reader.keyframeAtOrBefore(
+    trackIndex: this.trackIndex
+    sampleIndex: sample
+  )
+  loop keyframe > 0 and this.frameOfSample.copyAtDefault(index: keyframe) > frameIndex {
+    keyframe = this.reader.keyframeAtOrBefore(
+      trackIndex: this.trackIndex
+      sampleIndex: keyframe - 1
+    )
+  }
+  ret keyframe
+}
+
+# The frame (presentation index) of the keyframe a decode of frame `frameIndex`
+# starts from (decodeStartOf), shown at or before it
+func keyframeIndexOf(this: view FrameStream, frameIndex: view Int) ret Int {
+  ret this.frameOfSample.copyAtDefault(index: this.decodeStartOf(frameIndex: frameIndex))
 }

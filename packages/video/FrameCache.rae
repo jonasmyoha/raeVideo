@@ -1,0 +1,408 @@
+# video/FrameCache — decoded frames kept on the GPU (docs/design.md §5 V3,
+# §6.2), with a budget of GPU memory: the frame pipeline's cache.
+#
+# A cached frame is its planes as textures (the decoder's Y'CbCr, 1.5 bytes a
+# pixel for 4:2:0, not RGB at 4), with the parameters its conversion needs
+# (video/YuvPicture's) in a small uniform buffer of its own. Showing one
+# converts it into a FrameOutput's RGBA texture, recorded into the caller's
+# recording (FramePipeline.recordShow), never waited for.
+#
+# The budget counts every texture the cache holds. When a frame does not fit,
+# the frame used longest ago that is not `pinned` (shown this refresh) gives
+# its place: its textures are kept for the next frame of the same size and
+# layout (no texture is made per frame while playing), and released when only
+# another size or layout would fit. A frame that cannot fit even then is
+# refused, and counted.
+import Math
+open gpu/GpuIds
+open gpu/GpuLifetime
+open gpu/GpuResources
+open video/VideoDecoder
+open video/YuvPicture
+open webgpu/WebgpuEnums
+
+type CachedFrame {
+  # 0 for a slot holding no frame (its textures waiting to be used again)
+  sourceNumber: Int
+  frameIndex: Int
+  width: Int
+  height: Int
+  layout: FrameLayout
+  planes: List(TextureId)
+  planeViews: List(TextureViewId)
+  parameters: BufferId
+  # the bind group of the FrameOutput it was last shown in (its picture's
+  # slot), for that output's conversion
+  bindGroup: BindGroupId
+  boundOutput: Int
+  bytes: Int
+  lastUsed: Int
+}
+
+type FrameCache {
+  budgetBytes: Int
+  frames: List(CachedFrame)
+  bytes: Int
+  # the most the cache has ever held: the budget is never passed
+  mostBytes: Int
+  tick: Int
+  # statistics
+  uploaded: Int
+  evicted: Int
+  refused: Int
+}
+
+func createFrameCache(budgetBytes: view Int) ret FrameCache {
+  ret FrameCache {
+    budgetBytes: budgetBytes
+    frames: {}
+    bytes: 0
+    mostBytes: 0
+    tick: 0
+    uploaded: 0
+    evicted: 0
+    refused: 0
+  }
+}
+
+# A frame's planes in GPU memory
+func frameBytes(width: view Int, height: view Int, layout: view FrameLayout) ret Int {
+  let chromaWidth: Int = (width + chromaWidthDivisorOf(layout: layout) - 1) / chromaWidthDivisorOf(
+    layout: layout
+  )
+  let chromaHeight: Int = (height + chromaHeightDivisorOf(layout: layout) - 1) / chromaHeightDivisorOf(
+    layout: layout
+  )
+  ret width * height + 2 * chromaWidth * chromaHeight
+}
+
+# The index of the cached frame, or -1
+func indexOf(this: view FrameCache, sourceNumber: view Int, frameIndex: view Int) ret Int {
+  loop var i: Int = 0, i < this.frames.length(), ++i {
+    if let entry: view CachedFrame = this.frames.viewAt(index: i) {
+      if entry.sourceNumber is sourceNumber and entry.frameIndex is frameIndex {
+        ret i
+      }
+    }
+  }
+  ret -1
+}
+
+func contains(this: view FrameCache, sourceNumber: view Int, frameIndex: view Int) ret Bool {
+  ret this.indexOf(sourceNumber: sourceNumber, frameIndex: frameIndex) >= 0
+}
+
+# Marks the frame as just used (it is the last to be given up)
+func touch(this: mod FrameCache, index: view Int) {
+  this.tick = this.tick + 1
+  if let entry: mod CachedFrame = this.frames.modAt(index: index) {
+    entry.lastUsed = this.tick
+  }
+}
+
+func releaseSlot(resources: mod GpuResources, entry: mod CachedFrame) {
+  retireTextureIds(resources: resources, list: entry.planes)
+  retireTextureViewIds(resources: resources, list: entry.planeViews)
+  let parametersGone: Bool = retireBuffer(resources: resources, id: entry.parameters)
+  if entry.boundOutput >= 0 {
+    let bindGroupGone: Bool = retireBindGroup(resources: resources, id: entry.bindGroup)
+  }
+}
+
+# Makes a slot's textures for frames of this size and layout; false when the
+# GPU refuses
+func makeSlot(
+  resources: mod GpuResources
+  entry: mod CachedFrame
+  width: view Int
+  height: view Int
+  layout: view FrameLayout
+) ret Bool {
+  let chromaWidth: Int = (width + chromaWidthDivisorOf(layout: layout) - 1) / chromaWidthDivisorOf(
+    layout: layout
+  )
+  let chromaHeight: Int = (height + chromaHeightDivisorOf(layout: layout) - 1) / chromaHeightDivisorOf(
+    layout: layout
+  )
+  loop var plane: Int = 0, plane < planeCountOf(layout: layout), ++plane {
+    var planeWidth: Int = width
+    var planeHeight: Int = height
+    var format: Int32 = WGPUTextureFormat_R8Unorm
+    if plane > 0 {
+      planeWidth = chromaWidth
+      planeHeight = chromaHeight
+      if layout is FrameLayout.nv12 {
+        format = WGPUTextureFormat_RG8Unorm
+      }
+    }
+    if let texture: TextureId = createPlaneTexture(
+      resources: resources
+      width: planeWidth
+      height: planeHeight
+      format: format
+    ) {
+      entry.planes.add(value: texture)
+      if let planeView: TextureViewId = createTextureView(resources: resources, texture: texture) {
+        entry.planeViews.add(value: planeView)
+      } else {
+        ret false
+      }
+    } else {
+      ret false
+    }
+  }
+  if let parameters: BufferId = createBuffer(
+    resources: resources
+    size: 48
+    usage: WGPUBufferUsage_Uniform + WGPUBufferUsage_CopyDst
+  ) {
+    entry.parameters = parameters
+    ret true
+  }
+  ret false
+}
+
+func emptySlot() ret CachedFrame {
+  ret CachedFrame {
+    sourceNumber: 0
+    frameIndex: -1
+    width: 0
+    height: 0
+    layout: FrameLayout.unsupported
+    planes: {}
+    planeViews: {}
+    parameters: noBufferId()
+    bindGroup: noBindGroupId()
+    boundOutput: -1
+    bytes: 0
+    lastUsed: 0
+  }
+}
+
+# The least recently used frame that may give its place (not the pinned
+# one), or -1
+func evictionCandidate(
+  this: view FrameCache
+  pinnedSource: view Int
+  pinnedFrame: view Int
+) ret Int {
+  var found: Int = -1
+  var oldest: Int = 0
+  loop var i: Int = 0, i < this.frames.length(), ++i {
+    if let entry: view CachedFrame = this.frames.viewAt(index: i) {
+      let pinned: Bool = entry.sourceNumber is pinnedSource and entry.frameIndex is pinnedFrame
+      if entry.sourceNumber is not 0 and not pinned {
+        if found < 0 or entry.lastUsed < oldest {
+          found = i
+          oldest = entry.lastUsed
+        }
+      }
+    }
+  }
+  ret found
+}
+
+# A free slot of this size and layout, or -1
+func freeSlotFor(
+  this: view FrameCache
+  width: view Int
+  height: view Int
+  layout: view FrameLayout
+) ret Int {
+  loop var i: Int = 0, i < this.frames.length(), ++i {
+    if let entry: view CachedFrame = this.frames.viewAt(index: i) {
+      if entry.sourceNumber is 0 and entry.width is width and entry.height is height and entry.layout is layout {
+        ret i
+      }
+    }
+  }
+  ret -1
+}
+
+# Releases a free slot of another size or layout, to make room; false when
+# there is none
+func releaseOtherFreeSlot(
+  this: mod FrameCache
+  resources: mod GpuResources
+  width: view Int
+  height: view Int
+  layout: view FrameLayout
+) ret Bool {
+  loop var i: Int = 0, i < this.frames.length(), ++i {
+    var release: Bool = false
+    if let entry: view CachedFrame = this.frames.viewAt(index: i) {
+      release = entry.sourceNumber is 0 and (entry.width is not width or entry.height is not height or entry.layout is not layout)
+    }
+    if release {
+      if let entry: mod CachedFrame = this.frames.modAt(index: i) {
+        releaseSlot(resources: resources, entry: entry)
+        this.bytes = this.bytes - entry.bytes
+      }
+      this.frames.remove(index: i)
+      ret true
+    }
+  }
+  ret false
+}
+
+# The slot the frame goes into: a free one of its size and layout, a new one
+# within the budget, or the least recently used frame's place. -1 when it
+# cannot fit without passing the budget.
+func slotFor(
+  this: mod FrameCache
+  resources: mod GpuResources
+  width: view Int
+  height: view Int
+  layout: view FrameLayout
+  pinnedSource: view Int
+  pinnedFrame: view Int
+) ret Int {
+  let need: Int = frameBytes(width: width, height: height, layout: layout)
+  loop true {
+    let free: Int = this.freeSlotFor(width: width, height: height, layout: layout)
+    if free >= 0 {
+      ret free
+    }
+    if this.bytes + need <= this.budgetBytes {
+      var entry: CachedFrame = emptySlot()
+      if not makeSlot(
+        resources: resources
+        entry: entry
+        width: width
+        height: height
+        layout: layout
+      ) {
+        releaseSlot(resources: resources, entry: entry)
+        ret -1
+      }
+      entry.width = width
+      entry.height = height
+      entry.layout = layout
+      entry.bytes = need
+      this.bytes = this.bytes + need
+      this.mostBytes = max(a: this.mostBytes, b: this.bytes)
+      this.frames.add(value: own entry)
+      ret this.frames.length() - 1
+    }
+    if not this.releaseOtherFreeSlot(
+      resources: resources
+      width: width
+      height: height
+      layout: layout
+    ) {
+      let victim: Int = this.evictionCandidate(pinnedSource: pinnedSource, pinnedFrame: pinnedFrame)
+      if victim < 0 {
+        ret -1
+      }
+      if let entry: mod CachedFrame = this.frames.modAt(index: victim) {
+        entry.sourceNumber = 0
+        entry.frameIndex = -1
+      }
+      this.evicted = this.evicted + 1
+    }
+  }
+  ret -1
+}
+
+# Puts a decoded frame on the GPU (its planes copied from the decoder's
+# memory by the queue) as frame `frameIndex` of source `sourceNumber`. The
+# caller still releases the frame. False when it could not be kept.
+func store(
+  this: mod FrameCache
+  resources: mod GpuResources
+  sourceNumber: view Int
+  frameIndex: view Int
+  frame: view VideoFrame
+  pinnedSource: view Int
+  pinnedFrame: view Int
+) ret Bool {
+  if frame.handle is 0 or frame.layout is FrameLayout.unsupported {
+    ret false
+  }
+  if this.contains(sourceNumber: sourceNumber, frameIndex: frameIndex) {
+    ret true
+  }
+  let slot: Int = this.slotFor(
+    resources: resources
+    width: frame.width
+    height: frame.height
+    layout: frame.layout
+    pinnedSource: pinnedSource
+    pinnedFrame: pinnedFrame
+  )
+  if slot < 0 {
+    this.refused = this.refused + 1
+    ret false
+  }
+  if not frame.lockPlanes() {
+    ret false
+  }
+  var written: Bool = true
+  if let entry: mod CachedFrame = this.frames.modAt(index: slot) {
+    loop var plane: Int = 0, plane < entry.planes.length(), ++plane {
+      if let texture: TextureId = entry.planes.copyAt(index: plane) {
+        written = written and writePlane(
+          resources: resources
+          texture: texture
+          frame: frame
+          plane: plane
+        )
+      }
+    }
+    written = written and writeBuffer(
+      resources: resources
+      id: entry.parameters
+      offset: 0
+      bytes: parameterBytes(
+        matrix: effectiveMatrix(frame: frame)
+        fullRange: frame.fullRange
+        width: frame.width
+        height: frame.height
+        layout: frame.layout
+      )
+    )
+    if written {
+      entry.sourceNumber = sourceNumber
+      entry.frameIndex = frameIndex
+    }
+  }
+  frame.unlockPlanes()
+  if written {
+    this.uploaded = this.uploaded + 1
+    this.touch(index: slot)
+  }
+  ret written
+}
+
+# Forgets a source's frames (their slots stay for others)
+func forgetSource(this: mod FrameCache, sourceNumber: view Int) {
+  loop var i: Int = 0, i < this.frames.length(), ++i {
+    if let entry: mod CachedFrame = this.frames.modAt(index: i) {
+      if entry.sourceNumber is sourceNumber {
+        entry.sourceNumber = 0
+        entry.frameIndex = -1
+      }
+    }
+  }
+}
+
+# How many frames of a source are cached
+func cachedCount(this: view FrameCache, sourceNumber: view Int) ret Int {
+  var count: Int = 0
+  loop let entry: view CachedFrame in this.frames {
+    if entry.sourceNumber is sourceNumber {
+      count = count + 1
+    }
+  }
+  ret count
+}
+
+func releaseFrameCache(this: mod FrameCache, resources: mod GpuResources) {
+  loop var i: Int = 0, i < this.frames.length(), ++i {
+    if let entry: mod CachedFrame = this.frames.modAt(index: i) {
+      releaseSlot(resources: resources, entry: entry)
+    }
+  }
+  this.frames.clear()
+  this.bytes = 0
+}

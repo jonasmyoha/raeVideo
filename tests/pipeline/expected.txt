@@ -1,0 +1,6 @@
+counter709.mp4: 30 random seeks show the frame asked for: true
+counterHevc.mp4: 30 random seeks show the frame asked for: true
+after the GOP behind frame 60 is asked for, 21 steps back to frame 40 are all cache hits, nothing decoded again: true
+90 frames played with a budget of 12 frames: each right, the cache gave frames up and never held more than its budget: true
+a cut to a second file after one second, its first frames named half a second ahead: the refresh at the cut shows its frame 0 from the cache (true), and no refresh misses its frame (true)
+done

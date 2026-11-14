@@ -406,14 +406,19 @@ func convertNow(this: view YuvPicture, resources: mod GpuResources) ret Bool {
   ret false
 }
 
-# The picture's RGBA bytes, rows packed (width x 4 each), read back from the
-# GPU: for tests
-func readPicture(this: view YuvPicture, resources: mod GpuResources) ret List(UInt8) {
-  var pixels: List(UInt8) = List.create(UInt8, cap: this.width * this.height * 4)
-  let rowBytes: Int = (this.width * 4 + 255) / 256 * 256
+# An RGBA8 texture's bytes, rows packed (width x 4 each), read back from the
+# GPU (waited for): for tests
+func readTexture(
+  resources: mod GpuResources
+  texture: view TextureId
+  width: view Int
+  height: view Int
+) ret List(UInt8) {
+  var pixels: List(UInt8) = List.create(UInt8, cap: width * height * 4)
+  let rowBytes: Int = (width * 4 + 255) / 256 * 256
   if let buffer: BufferId = createBuffer(
     resources: resources
-    size: rowBytes * this.height
+    size: rowBytes * height
     usage: WGPUBufferUsage_MapRead + WGPUBufferUsage_CopyDst
   ) {
     var copied: Bool = false
@@ -421,7 +426,7 @@ func readPicture(this: view YuvPicture, resources: mod GpuResources) ret List(UI
       if recordCopyTextureToBuffer(
         recording: recording
         resources: resources
-        texture: this.picture
+        texture: texture
         buffer: buffer
         bytesPerRow: rowBytes
       ) {
@@ -435,7 +440,7 @@ func readPicture(this: view YuvPicture, resources: mod GpuResources) ret List(UI
         resources: resources
         id: buffer
         offset: 0
-        size: rowBytes * this.height
+        size: rowBytes * height
       ) {
         var status: Int = 0
         var spins: Int = 0
@@ -444,11 +449,11 @@ func readPicture(this: view YuvPicture, resources: mod GpuResources) ret List(UI
           spins = spins + 1
         }
         if status is 1 {
-          var rows: List(UInt8) = List.create(UInt8, cap: rowBytes * this.height)
-          rows.addDefaults(count: rowBytes * this.height)
+          var rows: List(UInt8) = List.create(UInt8, cap: rowBytes * height)
+          rows.addDefaults(count: rowBytes * height)
           if request.copyToBytes(destination: rows) {
-            loop var y: Int = 0, y < this.height, ++y {
-              loop var i: Int = 0, i < this.width * 4, ++i {
+            loop var y: Int = 0, y < height, ++y {
+              loop var i: Int = 0, i < width * 4, ++i {
                 pixels.add(value: rows.copyAtDefault(index: y * rowBytes + i))
               }
             }
@@ -459,4 +464,14 @@ func readPicture(this: view YuvPicture, resources: mod GpuResources) ret List(UI
     retireBuffer(resources: resources, id: buffer)
   }
   ret pixels
+}
+
+# The picture's RGBA bytes, rows packed (width x 4 each): for tests
+func readPicture(this: view YuvPicture, resources: mod GpuResources) ret List(UInt8) {
+  ret readTexture(
+    resources: resources
+    texture: this.picture
+    width: this.width
+    height: this.height
+  )
 }

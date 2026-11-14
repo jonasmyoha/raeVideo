@@ -1,0 +1,125 @@
+# video/DecodeWorker — one file decoded on a thread of its own (docs/design.md §5
+# V3): the frame pipeline (video/FramePipeline) starts one per open file and
+# talks to it only through channels and two atomics.
+#
+# The worker owns its file's FrameStream (its reader and its decoder): a
+# request names frames by their index in presentation order, and FrameStream
+# decodes from the keyframe at or before them, forward, keeping frames that
+# come out early (B-frames) until their turn. Each decoded frame (a platform
+# handle, VideoToolbox's CVPixelBuffer) is sent to the pipeline's results
+# channel; the main thread uploads it to the GPU and releases it. Frames move
+# between threads, pixels do not.
+#
+# `generation` cancels: the pipeline raises it when what it wants changes (a
+# scrub to another place), and the worker skips the requests made before, and
+# stops a range it is in the middle of. `running` false ends the thread; it
+# closes the stream before it returns.
+open Atomic
+open Channel
+open video/FrameStream
+open video/VideoBackends
+open video/VideoDecoder
+
+enum DecodeRequestKind {
+  # frames first..last, in order
+  range
+  # frame `last`, and before it frame `first` (its keyframe) when first >= 0:
+  # the frame that can be shown fast, then the exact one
+  scrub
+}
+
+type DecodeRequest {
+  kind: DecodeRequestKind
+  first: Int
+  last: Int
+  generation: Int
+}
+
+type DecodedFrame {
+  # the pipeline's number for the file
+  sourceNumber: Int
+  frameIndex: Int
+  generation: Int
+  # handle 0 when the frame could not be decoded
+  frame: VideoFrame
+}
+
+func sendFrame(
+  results: view Channel(DecodedFrame)
+  stream: mod FrameStream
+  sourceNumber: view Int
+  frameIndex: view Int
+  generation: view Int
+) {
+  let frame: VideoFrame = stream.takeFrame(frameIndex: frameIndex)
+  results.channelSend(
+    value: DecodedFrame {
+      sourceNumber: sourceNumber
+      frameIndex: frameIndex
+      generation: generation
+      frame: frame
+    }
+  )
+}
+
+# The thread's body (`spawn thread decodeWorker(...)`): the number of frames it
+# decoded and sent
+func decodeWorker(
+  path: own String
+  table: own List(VideoBackendChoice)
+  sourceNumber: own Int
+  requests: own Channel(DecodeRequest)
+  results: own Channel(DecodedFrame)
+  running: own Atomic(Bool)
+  generation: own Atomic(Int)
+) ret Int {
+  var stream: FrameStream = openFrameStream(path: path, table: table)
+  var sent: Int = 0
+  loop running.load() {
+    if requests.pending() is 0 {
+      # nothing asked: a channel has no blocking receive, so the worker naps
+      sleep(ms: 1)
+    } else {
+      let request: DecodeRequest = requests.receive()
+      if request.generation is generation.load() and stream.error.length() is 0 {
+        if request.kind is DecodeRequestKind.scrub {
+          if request.first >= 0 {
+            sendFrame(
+              results: results
+              stream: stream
+              sourceNumber: sourceNumber
+              frameIndex: request.first
+              generation: request.generation
+            )
+            sent = sent + 1
+          }
+          if generation.load() is request.generation {
+            sendFrame(
+              results: results
+              stream: stream
+              sourceNumber: sourceNumber
+              frameIndex: request.last
+              generation: request.generation
+            )
+            sent = sent + 1
+          }
+        } else {
+          var frameIndex: Int = request.first
+          loop frameIndex <= request.last and generation.load() is request.generation and running.load() {
+            sendFrame(
+              results: results
+              stream: stream
+              sourceNumber: sourceNumber
+              frameIndex: frameIndex
+              generation: request.generation
+            )
+            sent = sent + 1
+            frameIndex = frameIndex + 1
+          }
+        }
+      }
+    }
+  }
+  stream.close()
+  ret sent
+}

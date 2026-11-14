@@ -1,0 +1,308 @@
+# video/FramePipeline (docs/design.md §5 V3, §6.2): decode-ahead on worker
+# threads, the frame cache on the GPU, scrubbing, and frames shown by a
+# conversion recorded into the caller's recording. Every frame checked here is
+# read back from the output texture it was shown in, and its burned-in counter
+# (tests/media/make.sh) compared with the frame asked for, which is what a full
+# decode gives (tests/decode).
+#
+# 1. Random seeks (scrub to a frame, wait for it) in the H.264 file with
+#    B-frames and the HEVC file show the frame asked for.
+# 2. After the GOP behind frame 60 is asked for (prefetchBack), stepping back
+#    one frame at a time to its keyframe is all cache hits, nothing decoded
+#    again: reverse play serves a GOP backwards.
+# 3. Playing all 90 frames with a budget of 12 frames: the cache gives frames up
+#    (least recently used first) and never holds more than its budget.
+# 4. A cut, on a real 60 Hz clock: one file for a second, then another file,
+#    whose first frames are named ahead (decode-ahead); the refresh at the cut
+#    shows the second file's frame 0, cached, and no refresh misses a frame.
+import Math
+open gpu/GpuIds
+open gpu/GpuLifetime
+open gpu/GpuResources
+open video/FrameCache
+open video/FramePipeline
+open video/VideoBackends
+open video/YuvPicture
+open webgpu/Context
+
+const smallFrameBytes: Int = 86400
+
+func counterOf(pixels: view List(UInt8), width: view Int, height: view Int) ret Int {
+  let row: Int = height * 3 / 4 + height / 16
+  var value: Int = 0
+  loop var bit: Int = 0, bit < 16, ++bit {
+    let x: Int = bit * width / 16 + width / 32
+    value = value * 2
+    if (pixels.copyAtDefault(index: (row * width + x) * 4) as Int) > 128 {
+      value = value + 1
+    }
+  }
+  ret value
+}
+
+# Waits (bounded) until the frame is cached, uploading what arrives
+func waitCached(
+  pipeline: mod FramePipeline
+  resources: mod GpuResources
+  sourceNumber: view Int
+  frameIndex: view Int
+) ret Bool {
+  loop var tries: Int = 0, tries < 5000, ++tries {
+    let arrived: Bool = pipeline.update(resources: resources, maxUploads: 8)
+    if pipeline.isCached(sourceNumber: sourceNumber, frameIndex: frameIndex) {
+      ret true
+    }
+    sleep(ms: 1)
+  }
+  ret false
+}
+
+# Shows the frame in the output (recorded, submitted, waited for only so it
+# can be read back) and reads its counter; -1 when it was not cached
+func shownCounter(
+  pipeline: mod FramePipeline
+  resources: mod GpuResources
+  output: view FrameOutput
+  sourceNumber: view Int
+  frameIndex: view Int
+) ret Int {
+  var shown: Bool = false
+  if var recording: Recording = beginRecording(resources: resources) {
+    shown = pipeline.recordShow(
+      resources: resources
+      recording: recording
+      output: output
+      sourceNumber: sourceNumber
+      frameIndex: frameIndex
+    )
+    if let submission: SubmissionId = submit(resources: resources, recording: recording) {
+      let done: Bool = awaitSubmission(resources: resources, id: submission)
+    }
+  }
+  if not shown {
+    ret -1
+  }
+  let pixels: List(UInt8) = readOutput(output: output, resources: resources)
+  ret counterOf(pixels: pixels, width: output.width, height: output.height)
+}
+
+func randomSeeks(
+  resources: mod GpuResources
+  output: view FrameOutput
+  name: view String
+) ret Bool {
+  var pipeline: FramePipeline = createFramePipeline(budgetBytes: 64 * 1024 * 1024)
+  let source: Int = pipeline.addSource(path: "tests/media/{name}", table: defaultVideoBackends())
+  let count: Int = pipeline.frameCountOf(sourceNumber: source)
+  var seed: Int = 12345
+  var wrong: Int = 0
+  loop var seek: Int = 0, seek < 30, ++seek {
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    let target: Int = seed % count
+    let now: Int = pipeline.scrub(sourceNumber: source, frameIndex: target)
+    if not waitCached(
+      pipeline: pipeline
+      resources: resources
+      sourceNumber: source
+      frameIndex: target
+    ) {
+      wrong = wrong + 1
+    } else if shownCounter(
+      pipeline: pipeline
+      resources: resources
+      output: output
+      sourceNumber: source
+      frameIndex: target
+    ) is not target {
+      wrong = wrong + 1
+    }
+  }
+  log("{name}: 30 random seeks show the frame asked for: {wrong is 0}")
+  pipeline.close(resources: resources)
+  ret wrong is 0
+}
+
+func stepBack(resources: mod GpuResources, output: view FrameOutput) ret Bool {
+  var pipeline: FramePipeline = createFramePipeline(budgetBytes: 64 * 1024 * 1024)
+  let source: Int = pipeline.addSource(
+    path: "tests/media/counter709.mp4"
+    table: defaultVideoBackends()
+  )
+  pipeline.prefetchBack(sourceNumber: source, frameIndex: 60, count: 20)
+  var first: Int = 60
+  loop var frameIndex: Int = 60, frameIndex >= 0, --frameIndex {
+    if frameIndex >= 40 or pipeline.isCached(sourceNumber: source, frameIndex: frameIndex) {
+      first = frameIndex
+    }
+  }
+  var ready: Bool = true
+  loop var frameIndex: Int = 40, frameIndex <= 60, ++frameIndex {
+    ready = ready and waitCached(
+      pipeline: pipeline
+      resources: resources
+      sourceNumber: source
+      frameIndex: frameIndex
+    )
+  }
+  let uploadedBefore: Int = pipeline.cache.uploaded
+  var wrong: Int = 0
+  var steps: Int = 0
+  var frameIndex: Int = 60
+  loop frameIndex >= 40 {
+    if shownCounter(
+      pipeline: pipeline
+      resources: resources
+      output: output
+      sourceNumber: source
+      frameIndex: frameIndex
+    ) is not frameIndex {
+      wrong = wrong + 1
+    }
+    steps = steps + 1
+    frameIndex = frameIndex - 1
+  }
+  let ok: Bool = ready and wrong is 0 and pipeline.cache.uploaded is uploadedBefore and pipeline.misses is 0
+  log(
+    "after the GOP behind frame 60 is asked for, {steps} steps back to frame 40 are all cache hits, nothing decoded again: {ok}"
+  )
+  pipeline.close(resources: resources)
+  ret ok
+}
+
+func budgetHolds(resources: mod GpuResources, output: view FrameOutput) ret Bool {
+  let budget: Int = 12 * smallFrameBytes
+  var pipeline: FramePipeline = createFramePipeline(budgetBytes: budget)
+  let source: Int = pipeline.addSource(
+    path: "tests/media/counter709.mp4"
+    table: defaultVideoBackends()
+  )
+  var wrong: Int = 0
+  loop var frameIndex: Int = 0, frameIndex < 90, ++frameIndex {
+    pipeline.prefetch(sourceNumber: source, first: frameIndex, last: frameIndex + 6)
+    if not waitCached(
+      pipeline: pipeline
+      resources: resources
+      sourceNumber: source
+      frameIndex: frameIndex
+    ) {
+      wrong = wrong + 1
+    } else if shownCounter(
+      pipeline: pipeline
+      resources: resources
+      output: output
+      sourceNumber: source
+      frameIndex: frameIndex
+    ) is not frameIndex {
+      wrong = wrong + 1
+    }
+    if pipeline.cache.bytes > budget {
+      wrong = wrong + 1
+    }
+  }
+  let ok: Bool = wrong is 0 and pipeline.cache.mostBytes <= budget and pipeline.cache.evicted > 0
+  log(
+    "90 frames played with a budget of 12 frames: each right, the cache gave frames up and never held more than its budget: {ok}"
+  )
+  pipeline.close(resources: resources)
+  ret ok
+}
+
+func cutOnTime(resources: mod GpuResources, output: view FrameOutput) ret Bool {
+  var pipeline: FramePipeline = createFramePipeline(budgetBytes: 64 * 1024 * 1024)
+  let first: Int = pipeline.addSource(
+    path: "tests/media/counter709.mp4"
+    table: defaultVideoBackends()
+  )
+  let second: Int = pipeline.addSource(
+    path: "tests/media/counterProres.mov"
+    table: defaultVideoBackends()
+  )
+  pipeline.prefetch(sourceNumber: first, first: 0, last: 6)
+  let started: Bool = waitCached(
+    pipeline: pipeline
+    resources: resources
+    sourceNumber: first
+    frameIndex: 0
+  )
+  let refreshNs: Int = 16666667
+  let cutNs: Int = 1000000000
+  let start: Int = nowNs()
+  var cutCounter: Int = -1
+  var cutCached: Bool = false
+  var misses: Int = 0
+  var refresh: Int = 0
+  loop refresh < 90 {
+    refresh = refresh + 1
+    let deadline: Int = start + refresh * refreshNs
+    loop nowNs() < deadline {
+      sleep(ms: 1)
+    }
+    let movieNs: Int = refresh * refreshNs
+    let arrived: Bool = pipeline.update(resources: resources, maxUploads: 4)
+    # the caller names what it will want: the playing file ahead, and from half
+    # a second before the cut, the next file's first frames
+    var sourceNumber: Int = first
+    var frameIndex: Int = movieNs / 1000 * 30000 / 1001 / 1000000
+    if movieNs >= cutNs {
+      sourceNumber = second
+      frameIndex = (movieNs - cutNs) / 1000 * 30 / 1000000
+    }
+    if movieNs < cutNs {
+      pipeline.prefetch(sourceNumber: first, first: frameIndex, last: frameIndex + 6)
+    }
+    # the second file's frame at this time (0 until the cut)
+    let secondFrame: Int = max(a: 0, b: (movieNs - cutNs) / 1000 * 30 / 1000000)
+    if movieNs >= cutNs - 500000000 {
+      pipeline.prefetch(sourceNumber: second, first: secondFrame, last: secondFrame + 6)
+    }
+    let atCut: Bool = movieNs >= cutNs and movieNs - refreshNs < cutNs
+    if atCut {
+      cutCached = pipeline.isCached(sourceNumber: second, frameIndex: 0)
+      cutCounter = shownCounter(
+        pipeline: pipeline
+        resources: resources
+        output: output
+        sourceNumber: second
+        frameIndex: 0
+      )
+    } else if not pipeline.isCached(sourceNumber: sourceNumber, frameIndex: frameIndex) {
+      misses = misses + 1
+    }
+  }
+  let ok: Bool = started and cutCached and cutCounter is 0 and misses is 0
+  log(
+    "a cut to a second file after one second, its first frames named half a second ahead: the refresh at the cut shows its frame 0 from the cache ({cutCounter is 0 and cutCached}), and no refresh misses its frame ({misses is 0})"
+  )
+  pipeline.close(resources: resources)
+  ret ok
+}
+
+func main() ret Int {
+  var ready: Int = 0
+  unsafe {
+    ready = webgpuBootstrap()
+  }
+  if ready is not 1 {
+    log("SKIP: no GPU")
+    ret 0
+  }
+  var issuer: IdIssuer = IdIssuer.create()
+  if var resources: GpuResources = GpuResources.create(issuer: issuer, capacity: 256) {
+    if let output: FrameOutput = createFrameOutput(resources: resources, width: 320, height: 180) {
+      var ok: Bool = true
+      ok = randomSeeks(resources: resources, output: output, name: "counter709.mp4") and ok
+      ok = randomSeeks(resources: resources, output: output, name: "counterHevc.mp4") and ok
+      ok = stepBack(resources: resources, output: output) and ok
+      ok = budgetHolds(resources: resources, output: output) and ok
+      ok = cutOnTime(resources: resources, output: output) and ok
+      if not ok {
+        log("FAIL")
+        ret 1
+      }
+      log("done")
+      ret 0
+    }
+  }
+  log("FAIL: no GPU resources")
+  ret 1
+}
