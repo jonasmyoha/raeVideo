@@ -1,0 +1,63 @@
+# video/VideoBackends — which backend decodes which codec (docs/design.md §5
+# V2): a Rae table, not C. Each codec (the sample entry's four characters)
+# lists its backends in the order they are tried; a program may reorder the
+# table or add to it (the FFmpeg package adds itself as one more backend,
+# docs/design.md §4).
+#
+# Apple: VideoToolbox for H.264, HEVC and ProRes. Other platforms have no
+# backend yet (docs/design.md §11 step 6), so their table is empty and a
+# decoder there reports that it has none.
+enum VideoBackend { none, videoToolbox }
+
+type VideoBackendChoice {
+  # "avc1", "hvc1", "apcn", ...
+  codec: String
+  backends: List(VideoBackend)
+}
+
+func choice(codec: view String, backend: view VideoBackend) ret VideoBackendChoice {
+  var backends: List(VideoBackend) = {}
+  backends.add(value: backend)
+  ret VideoBackendChoice { codec: "{codec}", backends: backends }
+}
+
+# The codecs VideoToolbox decodes: H.264 (avc1, avc3), HEVC (hvc1, hev1) and
+# ProRes (Proxy, LT, 422, HQ, 4444, 4444 XQ)
+func videoToolboxCodecs() ret List(String) {
+  ret List(String) {
+    "avc1"
+    "avc3"
+    "hvc1"
+    "hev1"
+    "apco"
+    "apcs"
+    "apcn"
+    "apch"
+    "ap4h"
+    "ap4x"
+  }
+}
+
+func defaultVideoBackends() ret List(VideoBackendChoice) {
+  var table: List(VideoBackendChoice) = {}
+  if Target.isApple {
+    loop let codec: String in videoToolboxCodecs() {
+      table.add(value: choice(codec: codec, backend: VideoBackend.videoToolbox))
+    }
+  }
+  ret table
+}
+
+# The backends for `codec`, in order; empty when none decodes it
+func backendsFor(table: view List(VideoBackendChoice), codec: view String) ret List(VideoBackend) {
+  loop let entry: view VideoBackendChoice in table {
+    if entry.codec is codec {
+      var backends: List(VideoBackend) = {}
+      loop let backend: VideoBackend in entry.backends {
+        backends.add(value: backend)
+      }
+      ret backends
+    }
+  }
+  ret List(VideoBackend) {}
+}

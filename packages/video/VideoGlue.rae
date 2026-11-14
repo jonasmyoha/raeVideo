@@ -27,6 +27,13 @@ func rae_video_vt_open(
   configKind: Int
 ) unsafe extern("rae_video_vt_open") ret Int
 
+func rae_video_vt_set_color_tags(
+  primaries: Int
+  transfer: Int
+  matrix: Int
+  fullRange: Int
+) unsafe extern("rae_video_vt_set_color_tags")
+
 func rae_video_vt_decode(
   decoder: Int
   packet: Buffer(UInt8)

@@ -1,0 +1,234 @@
+# video/FrameStream — a file's video frames in the order they are shown, any
+# one of them on request (docs/design.md §6.2): frame n by its index in
+# presentation order, decoded from the keyframe at or before it.
+#
+#     var stream: FrameStream = openFrameStream(path: "clip.mp4", table: defaultVideoBackends())
+#     var frame: VideoFrame = stream.takeFrame(frameIndex: 41)   # the 42nd frame shown
+#     ... releaseFrame(frame: frame) ...
+#     stream.close()
+#
+# Asking for the next frame (n, then n + 1, ...) decodes forward only as far
+# as needed: with B-frames a decoded frame may be shown later, so it waits in
+# `pending`. Asking for a frame behind the decoder, or far ahead of it, starts
+# again at that frame's keyframe. Decoding is on the calling thread, one packet
+# at a time; the decode-ahead on worker threads and the frame cache are the
+# frame pipeline (docs/design.md §5 V3), which comes later.
+import Math
+open media/MediaTime
+open media/Mp4
+open video/MediaReader
+open video/VideoBackends
+open video/VideoDecoder
+
+type FrameStream {
+  reader: MediaReader
+  trackIndex: Int
+  decoder: VideoDecoder
+  # presentation index -> sample index, and back
+  order: List(Int)
+  frameOfSample: List(Int)
+  # presentation index -> its time (track units), ascending
+  times: List(Int)
+  timebase: Rational
+  # the next sample to decode, in decode order
+  nextDecode: Int
+  # decoded frames not yet taken, any order
+  pending: List(VideoFrame)
+  # packets decoded so far (each seek and each frame counts)
+  decodedPackets: Int
+  # "" when the stream can give frames
+  error: String
+}
+
+func openFrameStream(path: view String, table: view List(VideoBackendChoice)) ret FrameStream {
+  var reader: MediaReader = openMediaReader(path: path)
+  let trackIndex: Int = reader.videoTrackIndex()
+  var error: String = "{reader.error}"
+  if error.length() is 0 and trackIndex < 0 {
+    error = "{path} has no video track"
+  }
+  let track: Mp4Track = reader.track(trackIndex: trackIndex)
+  var decoder: VideoDecoder = openVideoDecoder(
+    track: track
+    tags: reader.colorTagsOfTrack(trackIndex: trackIndex)
+    table: table
+  )
+  if error.length() is 0 and decoder.handle is 0 {
+    error = "{decoder.error}"
+  }
+  let order: List(Int) = reader.presentationOrder(trackIndex: trackIndex)
+  var frameOfSample: List(Int) = List.create(Int, cap: max(a: 1, b: order.length()))
+  frameOfSample.addDefaults(count: order.length())
+  var times: List(Int) = List.create(Int, cap: max(a: 1, b: order.length()))
+  loop var i: Int = 0, i < order.length(), ++i {
+    let sample: Int = order.copyAtDefault(index: i)
+    frameOfSample.set(index: sample, value: i)
+    times.add(value: trackPresentationValue(track: track, sampleIndex: sample))
+  }
+  ret FrameStream {
+    reader: reader
+    trackIndex: trackIndex
+    decoder: decoder
+    order: order
+    frameOfSample: frameOfSample
+    times: times
+    timebase: reader.trackTimebase(trackIndex: trackIndex)
+    nextDecode: 0
+    pending: {}
+    decodedPackets: 0
+    error: error
+  }
+}
+
+func frameCount(this: view FrameStream) ret Int {
+  ret this.order.length()
+}
+
+# When frame `frameIndex` is shown
+func frameTime(this: view FrameStream, frameIndex: view Int) ret MediaTime {
+  ret MediaTime { value: this.times.copyAtDefault(index: frameIndex), timebase: this.timebase }
+}
+
+# When the last frame stops being shown: its time plus the time to the one
+# before it (the track's own end when it has a single frame)
+func endTime(this: view FrameStream) ret MediaTime {
+  let count: Int = this.times.length()
+  if count is 0 {
+    ret MediaTime { value: 0, timebase: this.timebase }
+  }
+  let last: Int = this.times.copyAtDefault(index: count - 1)
+  var step: Int = 1
+  if count > 1 {
+    step = last - this.times.copyAtDefault(index: count - 2)
+  }
+  ret MediaTime { value: last + step, timebase: this.timebase }
+}
+
+# The frame shown at `time`: the last one that starts at or before it (the
+# first before the first, the last after the last)
+func frameIndexAt(this: view FrameStream, time: view MediaTime) ret Int {
+  let count: Int = this.times.length()
+  if count is 0 {
+    ret 0
+  }
+  let value: Int = time.rescaledDown(timebase: this.timebase)
+  var low: Int = 0
+  var high: Int = count - 1
+  var found: Int = 0
+  loop low <= high {
+    let middle: Int = (low + high) / 2
+    if this.times.copyAtDefault(index: middle) <= value {
+      found = middle
+      low = middle + 1
+    } else {
+      high = middle - 1
+    }
+  }
+  ret found
+}
+
+# `time` in `timebase`, rounded down: a frame starts at or before the time
+# even when the two timebases do not divide
+func rescaledDown(this: view MediaTime, timebase: view Rational) ret Int {
+  # value * (n1 / d1) / (n2 / d2) = value * n1 * d2 / (d1 * n2)
+  let multiply: Int = this.timebase.numerator * timebase.denominator
+  let divide: Int = this.timebase.denominator * timebase.numerator
+  if divide <= 0 {
+    ret 0
+  }
+  let product: Int = this.value * multiply
+  var quotient: Int = product / divide
+  if product < 0 and quotient * divide is not product {
+    quotient = quotient - 1
+  }
+  ret quotient
+}
+
+func pendingIndexOf(this: view FrameStream, frameIndex: view Int) ret Int {
+  loop var i: Int = 0, i < this.pending.length(), ++i {
+    if let frame: view VideoFrame = this.pending.viewAt(index: i) {
+      if this.frameOfSample.copyAtDefault(index: frame.sampleIndex) is frameIndex {
+        ret i
+      }
+    }
+  }
+  ret -1
+}
+
+# Releases the waiting frames shown before `frameIndex` (all of them when
+# `everything`)
+func dropPending(this: mod FrameStream, frameIndex: view Int, everything: view Bool) {
+  var i: Int = 0
+  loop i < this.pending.length() {
+    var drop: Bool = false
+    if var frame: VideoFrame = this.pending.copyAt(index: i) {
+      let shown: Int = this.frameOfSample.copyAtDefault(index: frame.sampleIndex)
+      if everything or shown < frameIndex {
+        releaseFrame(frame: frame)
+        drop = true
+      }
+    }
+    if drop {
+      this.pending.remove(index: i)
+    } else {
+      i = i + 1
+    }
+  }
+}
+
+# Frame `frameIndex` (in presentation order), decoded if it has to be; the
+# caller now holds it and releases it. Handle 0 when it cannot be had.
+func takeFrame(this: mod FrameStream, frameIndex: view Int) ret VideoFrame {
+  let count: Int = this.order.length()
+  if this.error.length() > 0 or frameIndex < 0 or frameIndex >= count {
+    ret noVideoFrame()
+  }
+  let sample: Int = this.order.copyAtDefault(index: frameIndex)
+  let keyframe: Int = this.reader.keyframeAtOrBefore(
+    trackIndex: this.trackIndex
+    sampleIndex: sample
+  )
+  var waiting: Int = this.pendingIndexOf(frameIndex: frameIndex)
+  # behind the decoder and no longer waiting, or a keyframe ahead of it is
+  # closer: start again there
+  if waiting < 0 and (sample < this.nextDecode or keyframe > this.nextDecode) {
+    this.dropPending(frameIndex: 0, everything: true)
+    this.nextDecode = keyframe
+  }
+  this.dropPending(frameIndex: frameIndex, everything: false)
+  loop waiting < 0 and this.nextDecode < count {
+    let packet: MediaPacket = this.reader.readPacket(
+      trackIndex: this.trackIndex
+      sampleIndex: this.nextDecode
+    )
+    this.nextDecode = this.nextDecode + 1
+    this.decodedPackets = this.decodedPackets + 1
+    var frame: VideoFrame = this.decoder.decodePacket(packet: packet)
+    if frame.handle is not 0 {
+      let shown: Int = this.frameOfSample.copyAtDefault(index: frame.sampleIndex)
+      if shown < frameIndex {
+        # decoded only to decode the ones after it
+        releaseFrame(frame: frame)
+      } else {
+        this.pending.add(value: frame)
+        if shown is frameIndex {
+          waiting = this.pending.length() - 1
+        }
+      }
+    }
+  }
+  if waiting < 0 {
+    ret noVideoFrame()
+  }
+  if let taken: VideoFrame = this.pending.copyAt(index: waiting) {
+    this.pending.remove(index: waiting)
+    ret taken
+  }
+  ret noVideoFrame()
+}
+
+func close(this: mod FrameStream) {
+  this.dropPending(frameIndex: 0, everything: true)
+  this.decoder.close()
+  this.reader.close()
+}

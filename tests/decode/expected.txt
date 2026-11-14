@@ -1,0 +1,13 @@
+counter709.mp4: 90 frames, 320x180, 420v (limited range), matrix BT.709, primaries BT.709, transfer BT.709
+counter709.mp4: frames 0..89 in order show counters 0..89 at n x 1001/30000 s (90 packets decoded)
+counter709.mp4: seeks to 45 3 89 30 31 32 0 show 45 3 89 30 31 32 0 (27 packets decoded)
+counter601full.mp4: 20 frames, 320x180, 420f (full range), matrix BT.601, primaries BT.709, transfer BT.709
+counter601full.mp4: frames 0..19 in order show counters 0..19 at n x 24/600 s (20 packets decoded)
+counter601full.mp4: seeks to 10 3 19 6 7 8 0 show 10 3 19 6 7 8 0 (38 packets decoded)
+counterHevc.mp4: 48 frames, 320x180, 420v (limited range), matrix BT.709, primaries BT.709, transfer BT.709
+counterHevc.mp4: frames 0..47 in order show counters 0..47 at n x 1001/24000 s (48 packets decoded)
+counterHevc.mp4: seeks to 24 3 47 16 17 18 0 show 24 3 47 16 17 18 0 (69 packets decoded)
+counterProres.mov: 30 frames, 320x180, 420v (limited range), matrix BT.709, primaries BT.709, transfer BT.709
+counterProres.mov: frames 0..29 in order show counters 0..29 at n x 100/3000 s (30 packets decoded)
+counterProres.mov: seeks to 15 3 29 10 11 12 0 show 15 3 29 10 11 12 0 (7 packets decoded)
+done

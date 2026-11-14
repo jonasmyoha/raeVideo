@@ -1,0 +1,325 @@
+# video/VideoDecoder — packets in, frames out (docs/design.md §5 V2), through
+# the first backend of video/VideoBackends that opens for the track's codec.
+#
+#     var decoder: VideoDecoder = openVideoDecoder(track: track, table: defaultVideoBackends())
+#     var frame: VideoFrame = decoder.decodePacket(packet: packet)
+#     if frame.handle is not 0 { ... frame.copyPlane(plane: 0) ...; releaseFrame(frame: frame) }
+#     decoder.close()
+#
+# Frames come out in decode order, one per packet (VideoToolbox decodes each
+# packet synchronously, without reordering); video/FrameStream puts them in
+# the order they are shown. A frame is 8-bit 4:2:0 in two planes (NV12: Y,
+# then Cb and Cr interleaved at half width and height) and carries the
+# stream's color tags; video/YuvPicture turns it into RGB on the GPU. Its
+# holder releases it (releaseFrame).
+import Math
+open media/MediaTime
+open media/Mp4
+open video/MediaReader
+open video/VideoBackends
+open video/VideoGlue
+
+# The Y'CbCr to R'G'B' matrix a frame was encoded with
+enum YuvMatrix {
+  unknown
+  bt709
+  bt601
+  bt2020
+  smpte240
+}
+
+enum ColorPrimaries {
+  unknown
+  bt709
+  bt2020
+  displayP3
+  bt601
+}
+
+enum TransferFunction {
+  unknown
+  bt709
+  pq
+  hlg
+  srgb
+  linear
+}
+
+type VideoFrame {
+  # the platform's frame (a CVPixelBuffer on Apple); 0 for none
+  handle: Int
+  sampleIndex: Int
+  presentationTime: MediaTime
+  width: Int
+  height: Int
+  # the pixel format's four characters as an integer ("420v", "420f")
+  pixelFormat: Int
+  # full range (0-255) rather than limited (16-235 luma, 16-240 chroma)
+  fullRange: Bool
+  matrix: YuvMatrix
+  primaries: ColorPrimaries
+  transfer: TransferFunction
+}
+
+type VideoDecoder {
+  backend: VideoBackend
+  # the backend's decoder; 0 when none opened
+  handle: Int
+  codec: String
+  width: Int
+  height: Int
+  # "" when a backend opened
+  error: String
+}
+
+func noVideoFrame() ret VideoFrame {
+  ret VideoFrame {
+    handle: 0
+    sampleIndex: -1
+    presentationTime: mediaTime(value: 0, numerator: 1, denominator: 1)
+    width: 0
+    height: 0
+    pixelFormat: 0
+    fullRange: false
+    matrix: YuvMatrix.unknown
+    primaries: ColorPrimaries.unknown
+    transfer: TransferFunction.unknown
+  }
+}
+
+# The configuration box a codec's decoder takes (its payload is the track's
+# codecConfig): avcC for H.264, hvcC for HEVC, none for ProRes
+func configKindOf(codec: view String) ret String {
+  if codec is "avc1" or codec is "avc3" {
+    ret "avcC"
+  }
+  if codec is "hvc1" or codec is "hev1" {
+    ret "hvcC"
+  }
+  ret ""
+}
+
+func openVideoToolbox(track: view Mp4Track, tags: view ColorTags) ret Int {
+  let kind: String = configKindOf(codec: track.codec)
+  var config: List(UInt8) = List.create(UInt8, cap: max(a: 1, b: track.codecConfig.length()))
+  loop let byte: UInt8 in track.codecConfig {
+    config.add(value: byte)
+  }
+  if config.length() is 0 {
+    config.add(value: 0 as UInt8)
+  }
+  var kindCode: Int = 0
+  if kind.length() > 0 {
+    kindCode = fourCharacterCode(text: kind)
+  }
+  unsafe {
+    if tags.present {
+      var fullRange: Int = 0
+      if tags.fullRange {
+        fullRange = 1
+      }
+      rae_video_vt_set_color_tags(
+        primaries: tags.primaries
+        transfer: tags.transfer
+        matrix: tags.matrix
+        fullRange: fullRange
+      )
+    }
+    ret rae_video_vt_open(
+      codec: fourCharacterCode(text: track.codec)
+      width: track.width
+      height: track.height
+      config: config.data
+      configSize: track.codecConfig.length()
+      configKind: kindCode
+    )
+  }
+}
+
+# A decoder for the track: the first backend of `table` for its codec that
+# opens. `tags` are the container's color tags (MediaReader.colorTagsOfTrack),
+# which its frames then carry. `error` says why when none opens.
+func openVideoDecoder(
+  track: view Mp4Track
+  tags: view ColorTags
+  table: view List(VideoBackendChoice)
+) ret VideoDecoder {
+  var decoder: VideoDecoder = {
+    backend: VideoBackend.none
+    handle: 0
+    codec: "{track.codec}"
+    width: track.width
+    height: track.height
+    error: "no backend decodes {track.codec} on this platform"
+  }
+  loop let backend: VideoBackend in backendsFor(table: table, codec: track.codec) {
+    if decoder.handle is 0 and backend is VideoBackend.videoToolbox {
+      let handle: Int = openVideoToolbox(track: track, tags: tags)
+      if handle is not 0 {
+        decoder.backend = backend
+        decoder.handle = handle
+        decoder.error = ""
+      } else {
+        decoder.error = "VideoToolbox refused the {track.codec} stream"
+      }
+    }
+  }
+  ret decoder
+}
+
+func matrixOfCode(code: view Int) ret YuvMatrix {
+  if code is 1 {
+    ret YuvMatrix.bt709
+  }
+  if code is 2 {
+    ret YuvMatrix.bt601
+  }
+  if code is 3 {
+    ret YuvMatrix.bt2020
+  }
+  if code is 4 {
+    ret YuvMatrix.smpte240
+  }
+  ret YuvMatrix.unknown
+}
+
+func primariesOfCode(code: view Int) ret ColorPrimaries {
+  if code is 1 {
+    ret ColorPrimaries.bt709
+  }
+  if code is 2 {
+    ret ColorPrimaries.bt2020
+  }
+  if code is 3 {
+    ret ColorPrimaries.displayP3
+  }
+  if code is 4 {
+    ret ColorPrimaries.bt601
+  }
+  ret ColorPrimaries.unknown
+}
+
+func transferOfCode(code: view Int) ret TransferFunction {
+  if code is 1 {
+    ret TransferFunction.bt709
+  }
+  if code is 2 {
+    ret TransferFunction.pq
+  }
+  if code is 3 {
+    ret TransferFunction.hlg
+  }
+  if code is 4 {
+    ret TransferFunction.srgb
+  }
+  if code is 5 {
+    ret TransferFunction.linear
+  }
+  ret TransferFunction.unknown
+}
+
+# The frame for a platform handle, its size, format and tags read
+func frameOfHandle(handle: view Int, packet: view MediaPacket) ret VideoFrame {
+  var frame: VideoFrame = noVideoFrame()
+  frame.handle = handle
+  frame.sampleIndex = packet.sampleIndex
+  frame.presentationTime = packet.presentationTime
+  unsafe {
+    frame.width = rae_video_frame_width(frame: handle)
+    frame.height = rae_video_frame_height(frame: handle)
+    frame.pixelFormat = rae_video_frame_pixel_format(frame: handle)
+    frame.matrix = matrixOfCode(code: rae_video_frame_matrix(frame: handle))
+    frame.primaries = primariesOfCode(code: rae_video_frame_primaries(frame: handle))
+    frame.transfer = transferOfCode(code: rae_video_frame_transfer(frame: handle))
+  }
+  frame.fullRange = frame.pixelFormat is fourCharacterCode(text: "420f")
+  ret frame
+}
+
+# The frame this packet gave (handle 0 when it gave none, or failed: `error`
+# says so)
+func decodePacket(this: mod VideoDecoder, packet: view MediaPacket) ret VideoFrame {
+  if this.handle is 0 or packet.bytes.length() is 0 {
+    ret noVideoFrame()
+  }
+  var result: Int = 0
+  unsafe {
+    result = rae_video_vt_decode(
+      decoder: this.handle
+      packet: packet.bytes.data
+      size: packet.bytes.length()
+      time: packet.presentationTime.value
+      timescale: packet.presentationTime.timebase.denominator
+    )
+  }
+  if result < 0 {
+    this.error = "decoding sample {packet.sampleIndex} failed ({result})"
+    ret noVideoFrame()
+  }
+  if result is 0 {
+    ret noVideoFrame()
+  }
+  ret frameOfHandle(handle: result, packet: packet)
+}
+
+func close(this: mod VideoDecoder) {
+  if this.handle is not 0 {
+    unsafe {
+      rae_video_vt_close(decoder: this.handle)
+    }
+    this.handle = 0
+  }
+}
+
+func releaseFrame(frame: mod VideoFrame) {
+  if frame.handle is not 0 {
+    unsafe {
+      rae_video_frame_release(frame: frame.handle)
+    }
+    frame.handle = 0
+  }
+}
+
+# The bytes per pixel of an NV12 plane: 1 for Y, 2 for the interleaved CbCr
+func planePixelBytes(plane: view Int) ret Int {
+  if plane is 0 {
+    ret 1
+  }
+  ret 2
+}
+
+func planeWidth(this: view VideoFrame, plane: view Int) ret Int {
+  unsafe {
+    ret rae_video_frame_plane_width(frame: this.handle, plane: plane)
+  }
+}
+
+func planeHeight(this: view VideoFrame, plane: view Int) ret Int {
+  unsafe {
+    ret rae_video_frame_plane_height(frame: this.handle, plane: plane)
+  }
+}
+
+# A plane's bytes, its rows packed (width x bytes per pixel each): for the CPU
+# (tests, a thumbnail); drawing goes to the GPU without this copy
+func copyPlane(this: view VideoFrame, plane: view Int) ret List(UInt8) {
+  let rowBytes: Int = this.planeWidth(plane: plane) * planePixelBytes(plane: plane)
+  let rows: Int = this.planeHeight(plane: plane)
+  var bytes: List(UInt8) = List.create(UInt8, cap: max(a: 1, b: rowBytes * rows))
+  if this.handle is 0 or rowBytes <= 0 or rows <= 0 {
+    ret bytes
+  }
+  bytes.addDefaults(count: rowBytes * rows)
+  unsafe {
+    let copied: Int = rae_video_frame_copy_plane(
+      frame: this.handle
+      plane: plane
+      into: bytes.data
+      rowBytes: rowBytes
+    )
+    if copied is not rowBytes * rows {
+      bytes.clear()
+    }
+  }
+  ret bytes
+}

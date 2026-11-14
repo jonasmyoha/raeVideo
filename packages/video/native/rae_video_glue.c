@@ -86,7 +86,10 @@ void rae_video_file_close(int64_t file) {
   X(CoreFoundation, CFDictionaryValueCallBacks, kCFTypeDictionaryValueCallBacks) \
   X(CoreFoundation, CFArrayCallBacks, kCFTypeArrayCallBacks)        \
   X(CoreFoundation, CFAllocatorRef, kCFAllocatorNull)               \
+  X(CoreFoundation, CFBooleanRef, kCFBooleanTrue)                  \
+  X(CoreFoundation, CFBooleanRef, kCFBooleanFalse)                 \
   X(CoreMedia, CFStringRef, kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms) \
+  X(CoreMedia, CFStringRef, kCMFormatDescriptionExtension_FullRangeVideo) \
   X(CoreVideo, CFStringRef, kCVPixelBufferPixelFormatTypeKey)       \
   X(CoreVideo, CFStringRef, kCVImageBufferYCbCrMatrixKey)           \
   X(CoreVideo, CFStringRef, kCVImageBufferYCbCrMatrix_ITU_R_709_2)  \
@@ -153,6 +156,57 @@ static int rae_video_ready(void) {
 
 int64_t rae_video_vt_available(void) { return rae_video_ready() ? 1 : 0; }
 
+/* The tags for the next rae_video_vt_open on this thread (-1: not given) */
+static _Thread_local int64_t g_rae_video_tags[4] = {-1, -1, -1, -1};
+
+void rae_video_vt_set_color_tags(int64_t primaries, int64_t transfer, int64_t matrix,
+                                 int64_t full_range) {
+  g_rae_video_tags[0] = primaries;
+  g_rae_video_tags[1] = transfer;
+  g_rae_video_tags[2] = matrix;
+  g_rae_video_tags[3] = full_range;
+}
+
+/* H.273 code points to CoreVideo's tag values (the same strings CoreMedia's
+ * format description extensions take) */
+static const CFStringRef* rae_video_primaries_value(int64_t code) {
+  switch (code) {
+    case 1: return c_kCVImageBufferColorPrimaries_ITU_R_709_2;
+    case 5: return c_kCVImageBufferColorPrimaries_EBU_3213;
+    case 6: return c_kCVImageBufferColorPrimaries_SMPTE_C;
+    case 9: return c_kCVImageBufferColorPrimaries_ITU_R_2020;
+    case 11: return c_kCVImageBufferColorPrimaries_DCI_P3;
+    case 12: return c_kCVImageBufferColorPrimaries_P3_D65;
+    default: return NULL;
+  }
+}
+
+static const CFStringRef* rae_video_transfer_value(int64_t code) {
+  switch (code) {
+    case 1: case 6: case 14: case 15: return c_kCVImageBufferTransferFunction_ITU_R_709_2;
+    case 8: return c_kCVImageBufferTransferFunction_Linear;
+    case 13: return c_kCVImageBufferTransferFunction_sRGB;
+    case 16: return c_kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ;
+    case 18: return c_kCVImageBufferTransferFunction_ITU_R_2100_HLG;
+    default: return NULL;
+  }
+}
+
+static const CFStringRef* rae_video_matrix_value(int64_t code) {
+  switch (code) {
+    case 1: return c_kCVImageBufferYCbCrMatrix_ITU_R_709_2;
+    case 5: case 6: return c_kCVImageBufferYCbCrMatrix_ITU_R_601_4;
+    case 7: return c_kCVImageBufferYCbCrMatrix_SMPTE_240M_1995;
+    case 9: return c_kCVImageBufferYCbCrMatrix_ITU_R_2020;
+    default: return NULL;
+  }
+}
+
+static void rae_video_set_tag(CFMutableDictionaryRef extensions, const CFStringRef* key,
+                              const CFStringRef* value) {
+  if (key && value && *value) p_CFDictionarySetValue(extensions, *key, *value);
+}
+
 typedef struct {
   VTDecompressionSessionRef session;
   CMVideoFormatDescriptionRef format;
@@ -203,6 +257,18 @@ int64_t rae_video_vt_open(int64_t codec, int64_t width, int64_t height, uint8_t*
     p_CFRelease(data);
     p_CFRelease(atoms);
   }
+  rae_video_set_tag(extensions, c_kCVImageBufferColorPrimariesKey,
+                    rae_video_primaries_value(g_rae_video_tags[0]));
+  rae_video_set_tag(extensions, c_kCVImageBufferTransferFunctionKey,
+                    rae_video_transfer_value(g_rae_video_tags[1]));
+  rae_video_set_tag(extensions, c_kCVImageBufferYCbCrMatrixKey,
+                    rae_video_matrix_value(g_rae_video_tags[2]));
+  if (g_rae_video_tags[3] >= 0 && c_kCMFormatDescriptionExtension_FullRangeVideo &&
+      c_kCFBooleanTrue && c_kCFBooleanFalse) {
+    p_CFDictionarySetValue(extensions, *c_kCMFormatDescriptionExtension_FullRangeVideo,
+                           g_rae_video_tags[3] ? *c_kCFBooleanTrue : *c_kCFBooleanFalse);
+  }
+  g_rae_video_tags[0] = g_rae_video_tags[1] = g_rae_video_tags[2] = g_rae_video_tags[3] = -1;
   CMVideoFormatDescriptionRef format = NULL;
   OSStatus status = p_CMVideoFormatDescriptionCreate(NULL, (CMVideoCodecType)codec, (int32_t)width,
                                                      (int32_t)height, extensions, &format);
@@ -409,6 +475,10 @@ int64_t rae_video_vt_decode(int64_t decoder, uint8_t* packet, int64_t size, int6
   return -1;
 }
 void rae_video_vt_close(int64_t decoder) { (void)decoder; }
+void rae_video_vt_set_color_tags(int64_t primaries, int64_t transfer, int64_t matrix,
+                                 int64_t full_range) {
+  (void)primaries; (void)transfer; (void)matrix; (void)full_range;
+}
 int64_t rae_video_frame_width(int64_t frame) { (void)frame; return 0; }
 int64_t rae_video_frame_height(int64_t frame) { (void)frame; return 0; }
 int64_t rae_video_frame_pixel_format(int64_t frame) { (void)frame; return 0; }

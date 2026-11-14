@@ -1,0 +1,189 @@
+# video/VideoDecoder and video/FrameStream through VideoToolbox: decoded frame
+# n shows counter n (docs/design.md §10 "Decoders", "Seek"). Each test file
+# (tests/media/make.sh) draws its frame counter as 16 cells, white for 1, in
+# the band at 3/4 of the height; here it is read back from the decoded luma.
+#
+# 1. Every frame in presentation order: its counter is its index, its time is
+#    index x the frame duration (the B-frames of the H.264 and HEVC files come
+#    out of the decoder in another order and are put back in this one).
+# 2. Seeks, backward and forward and to the same GOP: each frame asked for is
+#    the one that comes, decoded from the keyframe at or before it.
+# 3. The format and color tags the decoder reports, which are the file's.
+open media/MediaTime
+open video/FrameStream
+open video/VideoBackends
+open video/VideoDecoder
+open video/VideoGlue
+
+# The counter drawn in the frame: 16 cells across, most significant first
+func readCounter(frame: view VideoFrame) ret Int {
+  let luma: List(UInt8) = frame.copyPlane(plane: 0)
+  let width: Int = frame.width
+  let row: Int = frame.height * 3 / 4 + frame.height / 16
+  var value: Int = 0
+  loop var bit: Int = 0, bit < 16, ++bit {
+    let x: Int = bit * width / 16 + width / 32
+    let level: Int = luma.copyAtDefault(index: row * width + x) as Int
+    value = value * 2
+    if level > 128 {
+      value = value + 1
+    }
+  }
+  ret value
+}
+
+func formatText(code: view Int) ret String {
+  var text: String = ""
+  loop var i: Int = 0, i < 4, ++i {
+    text = text.concat(other: fromCodepoint(code: (code shr (24 - 8 * i)) bitand 255))
+  }
+  ret text
+}
+
+func matrixName(matrix: view YuvMatrix) ret String {
+  if matrix is YuvMatrix.bt709 {
+    ret "BT.709"
+  }
+  if matrix is YuvMatrix.bt601 {
+    ret "BT.601"
+  }
+  if matrix is YuvMatrix.bt2020 {
+    ret "BT.2020"
+  }
+  if matrix is YuvMatrix.smpte240 {
+    ret "SMPTE 240M"
+  }
+  ret "untagged"
+}
+
+func primariesName(primaries: view ColorPrimaries) ret String {
+  if primaries is ColorPrimaries.bt709 {
+    ret "BT.709"
+  }
+  if primaries is ColorPrimaries.bt2020 {
+    ret "BT.2020"
+  }
+  if primaries is ColorPrimaries.displayP3 {
+    ret "P3"
+  }
+  if primaries is ColorPrimaries.bt601 {
+    ret "BT.601"
+  }
+  ret "untagged"
+}
+
+func transferName(transfer: view TransferFunction) ret String {
+  if transfer is TransferFunction.bt709 {
+    ret "BT.709"
+  }
+  if transfer is TransferFunction.pq {
+    ret "PQ"
+  }
+  if transfer is TransferFunction.hlg {
+    ret "HLG"
+  }
+  if transfer is TransferFunction.srgb {
+    ret "sRGB"
+  }
+  if transfer is TransferFunction.linear {
+    ret "linear"
+  }
+  ret "untagged"
+}
+
+func checkFile(name: view String, frameDuration: view Int) ret Bool {
+  var stream: FrameStream = openFrameStream(
+    path: "tests/media/{name}"
+    table: defaultVideoBackends()
+  )
+  if stream.error.length() > 0 {
+    log("FAIL: {name}: {stream.error}")
+    ret false
+  }
+  let count: Int = stream.frameCount()
+  var ok: Bool = true
+  var mismatches: Int = 0
+  loop var i: Int = 0, i < count, ++i {
+    var frame: VideoFrame = stream.takeFrame(frameIndex: i)
+    if frame.handle is 0 {
+      log("FAIL: {name}: no frame {i} ({stream.decoder.error})")
+      ret false
+    }
+    if i is 0 {
+      var range: String = "limited"
+      if frame.fullRange {
+        range = "full"
+      }
+      log(
+        "{name}: {count} frames, {frame.width}x{frame.height}, {formatText(code: frame.pixelFormat)} ({range} range), matrix {matrixName(
+          matrix: frame.matrix
+        )}, primaries {primariesName(primaries: frame.primaries)}, transfer {transferName(
+          transfer: frame.transfer
+        )}"
+      )
+    }
+    let counter: Int = readCounter(frame: frame)
+    if counter is not i or frame.presentationTime.value is not i * frameDuration {
+      if mismatches < 5 {
+        log(
+          "FAIL: {name}: frame {i} shows counter {counter} at time {frame.presentationTime.value}"
+        )
+      }
+      mismatches = mismatches + 1
+      ok = false
+    }
+    releaseFrame(frame: frame)
+  }
+  if ok {
+    log(
+      "{name}: frames 0..{count - 1} in order show counters 0..{count - 1} at n x {frameDuration}/{stream.timebase.denominator} s ({stream.decodedPackets} packets decoded)"
+    )
+  }
+  let seeks: List(Int) = {
+    count / 2
+    3
+    count - 1
+    count / 3
+    count / 3 + 1
+    count / 3 + 2
+    0
+  }
+  var asked: String = ""
+  var shown: String = ""
+  let before: Int = stream.decodedPackets
+  loop let target: Int in seeks {
+    var frame: VideoFrame = stream.takeFrame(frameIndex: target)
+    let counter: Int = readCounter(frame: frame)
+    asked = asked.concat(other: " {target}")
+    shown = shown.concat(other: " {counter}")
+    if counter is not target {
+      ok = false
+    }
+    releaseFrame(frame: frame)
+  }
+  log("{name}: seeks to{asked} show{shown} ({stream.decodedPackets - before} packets decoded)")
+  stream.close()
+  ret ok
+}
+
+func main() ret Int {
+  var available: Int = 0
+  unsafe {
+    available = rae_video_vt_available()
+  }
+  if available is 0 {
+    log("SKIP: no VideoToolbox here")
+    ret 0
+  }
+  var ok: Bool = true
+  ok = checkFile(name: "counter709.mp4", frameDuration: 1001) and ok
+  ok = checkFile(name: "counter601full.mp4", frameDuration: 24) and ok
+  ok = checkFile(name: "counterHevc.mp4", frameDuration: 1001) and ok
+  ok = checkFile(name: "counterProres.mov", frameDuration: 100) and ok
+  if not ok {
+    log("FAIL")
+    ret 1
+  }
+  log("done")
+  ret 0
+}

@@ -31,6 +31,12 @@ void rae_video_file_close(int64_t file);
 int64_t rae_video_vt_available(void);
 int64_t rae_video_vt_open(int64_t codec, int64_t width, int64_t height, uint8_t* config,
                           int64_t config_size, int64_t config_kind);
+/* The container's color tags (ITU-T H.273 code points: primaries, transfer,
+ * matrix; full_range 0 or 1) for the next decoder opened on this thread, so
+ * its frames carry them; -1 for a tag the container does not give. Without
+ * them VideoToolbox guesses (BT.601 for a picture of SD size). */
+void rae_video_vt_set_color_tags(int64_t primaries, int64_t transfer, int64_t matrix,
+                                 int64_t full_range);
 /* Decodes one packet (synchronously; frames come out in decode order) shown
  * at `time` / `timescale`. The frame (a handle the caller releases), 0 when
  * the packet gave none, or a negative OSStatus. */
