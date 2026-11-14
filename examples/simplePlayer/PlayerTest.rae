@@ -12,7 +12,9 @@
 #   4. play, then a drag along the bar (to frames 18, 31, 45, 58, 72): the
 #      frames follow the pointer and the sound is silent; on release the sound
 #      starts again from the new place (the tone there) and the frames follow it;
-#   5. play to the end: it stops on frame 89, the button back to "play".
+#   5. play to the end: it stops on frame 89, the button back to "play";
+#   6. Open...: the panel (answered by RAE_SDL_FILE_DIALOG_RESULT, config.env)
+#      gives tests/media/counterHevc.mp4, shown paused on its first frame.
 import Gpu2d
 open Gpu2dSimulatedInput
 import Math
@@ -433,6 +435,38 @@ func runPlayerTest(
         test: test
         name: "at the end it stops on frame {counter}, the button showing {icon}"
         passed: app.player.ended and not app.player.playing and counter is 89 and icon is "mat:play_arrow"
+      )
+      nextStep(test: test)
+    }
+    ret
+  }
+  if test.step is 7 {
+    # Open...: the panel answers with config.env's RAE_SDL_FILE_DIALOG_RESULT
+    if since is 1 {
+      pointer(
+        kind: simulatedTouchDown
+        point: pressPoint(
+          world: world
+          uiSystems: uiSystems
+          nodeId: "OpenButton"
+          along: 0.5
+        )
+      )
+    } else if since is 2 {
+      pointer(
+        kind: simulatedTouchUp
+        point: pressPoint(
+          world: world
+          uiSystems: uiSystems
+          nodeId: "OpenButton"
+          along: 0.5
+        )
+      )
+    } else if since is 8 {
+      check(
+        test: test
+        name: "Open... opens {app.path}: {app.player.frames.frameCount()} frames, frame {counter} shown, paused"
+        passed: app.path is "tests/media/counterHevc.mp4" and app.player.frames.frameCount() is 48 and counter is 0 and not app.player.playing
       )
       test.done = true
     }

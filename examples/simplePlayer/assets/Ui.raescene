@@ -67,6 +67,7 @@
     }
    },
    "Children": [
+    "OpenButton",
     "PlayButton",
     "SeekBar",
     "TimeText"
@@ -220,6 +221,49 @@
    "Text": {
     "text": "",
     "styleId": "muted"
+   }
+  },
+  "OpenButton": {
+   "bundles": [
+    "pressable"
+   ],
+   "Rect": {
+    "x": 0,
+    "y": 0,
+    "w": 48,
+    "h": 48
+   },
+   "Size": {
+    "w": {
+     "mode": "Fixed"
+    },
+    "h": {
+     "mode": "Fixed"
+    }
+   },
+   "Shape": {
+    "kind": "RoundedRect",
+    "fill": "surfaceAlt",
+    "radius": "radiusPill"
+   },
+   "OnClick": {
+    "actionId": "player.open",
+    "label": "Open a file"
+   },
+   "Children": [
+    "OpenIcon"
+   ]
+  },
+  "OpenIcon": {
+   "Rect": {
+    "x": 0,
+    "y": 0,
+    "w": 48,
+    "h": 48
+   },
+   "Sprite": {
+    "textureKey": "mat:folder_open",
+    "tint": "textPrimary"
    }
   }
  }

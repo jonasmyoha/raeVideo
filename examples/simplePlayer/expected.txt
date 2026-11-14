@@ -8,6 +8,7 @@ a drag along the bar shows frames 18 31 45 58 72 (18 31 45 58 72) with the sound
 [audio] stream voice 5 tests/media/counter709.mp4 bus music
 on release it plays on from frame 72: the frames follow the clock, the sound is the tone at that place: true
 at the end it stops on frame 89, the button showing mat:play_arrow: true
-[simplePlayer] frames shown 59, dropped 0
+Open... opens tests/media/counterHevc.mp4: 48 frames, frame 0 shown, paused: true
+[simplePlayer] frames shown 1, dropped 0
 closed: the sound stopped, the window closed
 done

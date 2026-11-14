@@ -1,6 +1,6 @@
 # A simple video player: one file in a window, its picture fitted to the window
-# (letterboxed, aspect kept), a play/pause button (or the space key) and a seek
-# bar under it. packages/video plays it (video/VideoPlayer), its sound through
+# (letterboxed, aspect kept), an Open... button, a play/pause button (or the
+# space key) and a seek bar under it. packages/video plays it (video/VideoPlayer), its sound through
 # Rae's audio engine, which is the master clock; the window is Rae's lib/ui
 # (assets/Ui.raescene).
 #
@@ -162,6 +162,7 @@ func main() ret Int {
   settings.offline = testing
   var audio: AudioEngine = audioStart(settings: settings)
   var app: PlayerApp = createPlayerApp(
+    path: path
     player: openVideoPlayer(path: path, table: defaultVideoBackends())
   )
   if app.player.error.length() > 0 {
@@ -176,6 +177,10 @@ func main() ret Int {
   loop not Gpu2d.pollClose() and not test.done {
     let resized: Bool = resizeUiToWindow(world: world, uiSystems: uiSystems, res: gpuUi)
     updateUiInput(input: input, world: world, uiSystems: uiSystems)
+    if uiActionFired(world: world, actionId: "player.open") {
+      askForFile(app: app)
+    }
+    let opened: Bool = pollOpenedFile(app: app, audio: audio)
     if app.player.error.length() is 0 {
       if uiActionFired(world: world, actionId: "player.toggle") or Sdl3.isKeyPressed(key: keySpace) {
         togglePlaying(app: app, audio: audio)

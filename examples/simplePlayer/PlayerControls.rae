@@ -1,6 +1,10 @@
 # What the simple player's controls do, apart from the window and its loop
-# (Main.rae): the play/pause button and the space key, the seek bar (a press,
-# a drag, a release), and the frame on the GPU.
+# (Main.rae): the Open... button, the play/pause button and the space key, the
+# seek bar (a press, a drag, a release), and the frame on the GPU.
+#
+# Open... asks for a file in the OS's panel (Sdl3.openFileDialog, answered
+# later: pollOpenedFile each frame); the file picked replaces the one playing,
+# shown paused on its first frame.
 #
 # The seek bar: a press inside it (or a little above or below it, the bar is
 # thin) takes the playhead there; while the pointer is held the picture
@@ -14,6 +18,7 @@
 # the texture's contents, not the image, so lib/ui needs nothing new for it.
 import Gpu2d
 import Math
+import Sdl3
 open app3d/UiShell
 open audio/Audio
 open ecs/ComponentTable
@@ -29,6 +34,7 @@ open ui/Transform
 open ui/Ecs
 open ui/UiSystems
 open video/FrameStream
+open video/VideoBackends
 open video/VideoDecoder
 open video/VideoPlayer
 open video/YuvPicture
@@ -51,6 +57,9 @@ type PlayerApp {
   # a press on the seek bar is held, and whether play goes on after it
   dragging: Bool
   playAfterDrag: Bool
+  # the file playing, and whether the Open... panel is waiting for a choice
+  path: String
+  choosing: Bool
   # the work of the last refreshes (ns): refresh, upload and conversion
   workTimes: List(Int)
   # the frame size, for the debug line
@@ -58,9 +67,11 @@ type PlayerApp {
   frameHeight: Int
 }
 
-func createPlayerApp(player: own VideoPlayer) ret PlayerApp {
+func createPlayerApp(path: view String, player: own VideoPlayer) ret PlayerApp {
   ret PlayerApp {
     player: own player
+    path: "{path}"
+    choosing: false
     picture: none
     inFlight: {}
     dragging: false
@@ -69,6 +80,37 @@ func createPlayerApp(player: own VideoPlayer) ret PlayerApp {
     frameWidth: 0
     frameHeight: 0
   }
+}
+
+# Open...: the OS's panel, for the file to play next
+func askForFile(app: mod PlayerApp) {
+  if not app.choosing {
+    Sdl3.openFileDialog(filters: ["mp4;mov;m4v"], defaultLocation: "")
+    app.choosing = true
+  }
+}
+
+# The file picked in the panel, if it answered this frame: it replaces the one
+# playing (stopped, closed), shown paused on its first frame. A cancel keeps
+# the one playing. True when a file was opened.
+func pollOpenedFile(app: mod PlayerApp, audio: mod AudioEngine) ret Bool {
+  if not app.choosing {
+    ret false
+  }
+  let picked: String = Sdl3.pollFileDialogResult()
+  if picked.length() is 0 {
+    ret false
+  }
+  app.choosing = false
+  app.player.close(audio: audio)
+  app.player = openVideoPlayer(path: picked, table: defaultVideoBackends())
+  app.path = "{picked}"
+  app.dragging = false
+  app.workTimes.clear()
+  if app.player.error.length() > 0 {
+    log("[simplePlayer] {picked}: {app.player.error}")
+  }
+  ret true
 }
 
 func togglePlaying(app: mod PlayerApp, audio: mod AudioEngine) {
@@ -155,13 +197,18 @@ func handleSeekBar(
 # Makes the picture for the first frame, in the canvas's GPU resources, and
 # names its texture as the canvas image the scene shows
 func ensurePicture(app: mod PlayerApp, canvas: mod Gpu2dCanvas) {
-  if app.picture is not none {
-    ret
-  }
   let frame: view VideoFrame = app.player.current
   if frame.handle is 0 {
     ret
   }
+  if let picture: view YuvPicture = app.picture {
+    if picture.width is frame.width and picture.height is frame.height and picture.layout is frame.layout {
+      ret
+    }
+  }
+  # a file of another size or layout gets a picture of its own; the canvas
+  # image key moves to it (the old one's textures stay until the window
+  # closes: a few per file opened)
   ensureBoxResources(canvas: canvas)
   if let resources: mod GpuResources = canvas.gpuResources {
     if let picture: YuvPicture = createYuvPicture(
@@ -185,6 +232,15 @@ func ensurePicture(app: mod PlayerApp, canvas: mod Gpu2dCanvas) {
   }
 }
 
+# Which picture there is (its texture's slot), -1 for none: a new one needs the
+# frame uploaded even when the frame did not change
+func pictureIdentity(app: view PlayerApp) ret Int {
+  if let picture: view YuvPicture = app.picture {
+    ret picture.picture.slot * 1000000 + picture.picture.generation
+  }
+  ret -1
+}
+
 # The player's frame for this refresh, and when it changed its upload and
 # conversion into the picture's texture (submitted, not waited for: the
 # canvas's frame, submitted after it, sees it done). The work is timed.
@@ -196,9 +252,9 @@ func refreshPicture(
 ) {
   let started: Int = nowNs()
   let changed: Bool = app.player.refresh(audio: audio, hostNs: hostNs)
-  let pictureWasMissing: Bool = app.picture is none
+  let pictureBefore: Int = pictureIdentity(app: app)
   ensurePicture(app: app, canvas: canvas)
-  if changed or (pictureWasMissing and app.picture is not none) {
+  if changed or pictureIdentity(app: app) is not pictureBefore {
     if let resources: mod GpuResources = canvas.gpuResources {
       if let picture: mod YuvPicture = app.picture {
         if picture.uploadFrame(resources: resources, frame: app.player.current) {

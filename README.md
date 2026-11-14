@@ -23,9 +23,10 @@ The design is [docs/design.md](docs/design.md); what lives here,
 
 ## Examples
 
-- `examples/simplePlayer`: one video file in a Rae UI window, a play/pause
-  button and a seek bar (its README has the 4K numbers):
-  `./rae run examples/simplePlayer/Main.rae -- clip.mp4`.
+- `examples/simplePlayer`: one video file in a Rae UI window, an Open...
+  button, a play/pause button and a seek bar (its README has the 4K numbers):
+  `make run-player FILE=clip.mp4` (or `make run`; without `FILE` it asks for
+  a file).
 
 A program takes a package by git at a release tag:
 

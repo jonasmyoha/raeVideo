@@ -1,13 +1,16 @@
 # simplePlayer — a simple video player
 
 One video file in a window: the picture fitted to the window (letterboxed,
-aspect kept), a play/pause button (the space key too) and a seek bar under it.
+aspect kept), an Open... button (another file, picked in the OS's panel, shown
+paused on its first frame), a play/pause button (the space key too) and a seek
+bar under it.
 A click on the bar moves there; a drag moves the picture with the pointer, with
 the sound stopped, and the sound starts again from the new place on release.
 The line at the bottom shows the work per refresh and the frames dropped.
 
-    ./rae run examples/simplePlayer/Main.rae -- clip.mp4
-    ./rae run examples/simplePlayer/Main.rae            # asks for a file
+    make run-player FILE=clip.mp4                        # or: make run FILE=clip.mp4
+    make run-player                                      # asks for a file
+    ./rae run examples/simplePlayer/Main.rae -- clip.mp4   # the same, without make
 
 What it uses: `packages/video`'s `VideoPlayer` (MP4 / MOV, VideoToolbox), with
 Rae's audio engine as the clock; Rae's `lib/ui` for the window
@@ -30,7 +33,8 @@ hidden window. The app runs as it does for a person on
 `tests/media/counter709.mp4`, but the audio engine is offline (800 samples per
 refresh, 60 Hz) and a script presses the simulated pointer: play, pause, a
 click at the bar's middle, a drag along the bar while playing, play to the
-end. After every refresh the texture the window shows is read back and the
+end, then Open... (the panel answered by `RAE_SDL_FILE_DIALOG_RESULT` with
+`tests/media/counterHevc.mp4`, so none is shown). After every refresh the texture the window shows is read back and the
 frame counter burned into it compared with the frame the audio clock is at;
 the sound is checked silent during pause and drag, and to be the file's tone at
 the new place after the release (`expected.txt`).
