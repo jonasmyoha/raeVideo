@@ -1,0 +1,6 @@
+counter709.mp4: the seven bars come back within 6 code values: true
+counter601full.mp4: the seven bars come back within 6 code values: true
+counterHevc.mp4: the seven bars come back within 6 code values: true
+counterProres.mov: the seven bars come back within 6 code values: true
+counter709.mp4 converted as BT.601 instead: the bars miss by more than 6: true
+done

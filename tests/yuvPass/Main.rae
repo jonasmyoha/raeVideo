@@ -1,0 +1,144 @@
+# video/YuvPicture: the copy path and the YUV to RGB pass on the GPU (docs/design.md
+# §7, §10 "Color"). Frame 0 of each test file is decoded, its planes are
+# uploaded and converted by yuvToRgb.wgsl with the frame's tags, and the picture
+# is read back. The seven 75% bars are drawn with R'G'B' values of 191 and 0
+# (tools/makeTestMedia.swift), so each bar's center must come back within a
+# few code values of them, whatever matrix and range the file was encoded with.
+# Converting the BT.709 file as if it were BT.601 must miss them: the tag is
+# what makes the colors right.
+open gpu/GpuIds
+open gpu/GpuResources
+open video/FrameStream
+open video/VideoBackends
+open video/VideoDecoder
+open video/VideoGlue
+open video/YuvPicture
+open webgpu/Context
+
+const tolerance: Int = 6
+
+func barColor(bar: view Int) ret List(Int) {
+  let high: Int = 191
+  if bar is 0 {
+    ret List(Int) { high, high, high }
+  }
+  if bar is 1 {
+    ret List(Int) { high, high, 0 }
+  }
+  if bar is 2 {
+    ret List(Int) { 0, high, high }
+  }
+  if bar is 3 {
+    ret List(Int) { 0, high, 0 }
+  }
+  if bar is 4 {
+    ret List(Int) { high, 0, high }
+  }
+  if bar is 5 {
+    ret List(Int) { high, 0, 0 }
+  }
+  ret List(Int) { 0, 0, high }
+}
+
+func absolute(value: view Int) ret Int {
+  if value < 0 {
+    ret -value
+  }
+  ret value
+}
+
+# The largest difference between a bar's center and its drawn color, over the
+# seven bars
+func barsDifference(picture: view YuvPicture, pixels: view List(UInt8)) ret Int {
+  var largest: Int = 0
+  let y: Int = picture.height / 4
+  loop var bar: Int = 0, bar < 7, ++bar {
+    let x: Int = (2 * bar + 1) * picture.width / 14
+    let expected: List(Int) = barColor(bar: bar)
+    loop var channel: Int = 0, channel < 3, ++channel {
+      let got: Int = pixels.copyAtDefault(index: (y * picture.width + x) * 4 + channel) as Int
+      let difference: Int = absolute(value: got - expected.copyAtDefault(index: channel))
+      if difference > largest {
+        largest = difference
+      }
+    }
+  }
+  ret largest
+}
+
+func checkFile(resources: mod GpuResources, name: view String, wrongMatrix: view Bool) ret Bool {
+  var stream: FrameStream = openFrameStream(
+    path: "tests/media/{name}"
+    table: defaultVideoBackends()
+  )
+  var frame: VideoFrame = stream.takeFrame(frameIndex: 0)
+  var ok: Bool = false
+  if frame.handle is 0 {
+    log("FAIL: {name}: no frame ({stream.error})")
+  } else if var picture: YuvPicture = createYuvPicture(
+    resources: resources
+    width: frame.width
+    height: frame.height
+  ) {
+    if wrongMatrix {
+      frame.matrix = YuvMatrix.bt601
+    }
+    if picture.uploadFrame(resources: resources, frame: frame) and picture.convertNow(
+      resources: resources
+    ) {
+      let pixels: List(UInt8) = picture.readPicture(resources: resources)
+      let difference: Int = barsDifference(picture: picture, pixels: pixels)
+      if wrongMatrix {
+        log(
+          "{name} converted as BT.601 instead: the bars miss by more than {tolerance}: {difference > tolerance}"
+        )
+        ok = difference > tolerance
+      } else {
+        log(
+          "{name}: the seven bars come back within {tolerance} code values: {difference <= tolerance}"
+        )
+        ok = difference <= tolerance
+        if not ok {
+          log("FAIL: {name}: a bar is off by {difference}")
+        }
+      }
+    } else {
+      log("FAIL: {name}: upload or conversion failed")
+    }
+  } else {
+    log("FAIL: {name}: no picture")
+  }
+  releaseFrame(frame: frame)
+  stream.close()
+  ret ok
+}
+
+func main() ret Int {
+  var ready: Int = 0
+  var available: Int = 0
+  unsafe {
+    ready = webgpuBootstrap()
+    available = rae_video_vt_available()
+  }
+  if ready is not 1 or available is 0 {
+    log("SKIP: no GPU or no VideoToolbox here")
+    ret 0
+  }
+  var issuer: IdIssuer = IdIssuer.create()
+  if var resources: GpuResources = GpuResources.create(issuer: issuer, capacity: 64) {
+    var ok: Bool = true
+    ok = checkFile(resources: resources, name: "counter709.mp4", wrongMatrix: false) and ok
+    ok = checkFile(resources: resources, name: "counter601full.mp4", wrongMatrix: false) and ok
+    ok = checkFile(resources: resources, name: "counterHevc.mp4", wrongMatrix: false) and ok
+    ok = checkFile(resources: resources, name: "counterProres.mov", wrongMatrix: false) and ok
+    ok = checkFile(resources: resources, name: "counter709.mp4", wrongMatrix: true) and ok
+    if not ok {
+      log("FAIL")
+      ret 1
+    }
+    log("done")
+    ret 0
+  }
+  log("FAIL: no GPU resources")
+  ret 1
+}

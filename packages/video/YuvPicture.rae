@@ -1,0 +1,442 @@
+# video/YuvPicture — a decoded frame on the GPU as an RGBA texture (docs/design.md
+# §7, the copy path): the frame's two planes are copied from the decoder's
+# memory into two textures (r8unorm Y, rg8unorm CbCr) by the queue, and a
+# compute pass (yuvToRgb.wgsl) converts them into `picture` (rgba8unorm) with
+# the matrix and range the frame is tagged with. The CPU does not touch the
+# pixels: the one copy is the queue's upload from the locked frame.
+#
+#     if var picture: YuvPicture = createYuvPicture(resources: resources, width: 1920, height:
+#     1080) {
+#       if picture.uploadFrame(resources: resources, frame: frame) {
+#         ... picture.recordConversion(recording: recording, resources: resources) ...
+#         ... draw picture.pictureView ...
+#       }
+#     }
+#
+# A frame of another size needs a picture of that size (createYuvPicture again).
+import Math
+open gpu/GpuCompute
+open gpu/GpuIds
+open gpu/GpuLifetime
+open gpu/GpuRenderTransfer
+open gpu/GpuResources
+open gpu/GpuTextures
+open video/VideoDecoder
+open video/VideoGlue
+open webgpu/Context
+open webgpu/ReadRequest
+open webgpu/Webgpu
+open webgpu/WebgpuEnums
+open webgpu/WebgpuTypes
+
+# Invocations per workgroup: a 4K frame (8.3 million pixels) fits one
+# dimension's 65 535 workgroups at 256
+const conversionWorkgroupSize: Int = 256
+
+type YuvPicture {
+  width: Int
+  height: Int
+  luma: TextureId
+  chroma: TextureId
+  # the converted frame: rgba8unorm, R'G'B' in the stream's transfer
+  picture: TextureId
+  lumaView: TextureViewId
+  chromaView: TextureViewId
+  pictureView: TextureViewId
+  parameters: BufferId
+  bounds: ComputeBounds
+  pipeline: PipelineId
+  bindGroup: BindGroupId
+  # the frame last uploaded (its sample index), -1 for none
+  uploadedSample: Int
+}
+
+# The coefficients of the R'G'B' equations for a matrix's Kr and Kb
+type YuvCoefficients {
+  crToRed: Float
+  cbToGreen: Float
+  crToGreen: Float
+  cbToBlue: Float
+}
+
+func coefficientsOf(red: view Float, blue: view Float) ret YuvCoefficients {
+  let green: Float = 1.0 - red - blue
+  ret YuvCoefficients {
+    crToRed: 2.0 * (1.0 - red)
+    cbToGreen: 2.0 * blue * (1.0 - blue) / green
+    crToGreen: 2.0 * red * (1.0 - red) / green
+    cbToBlue: 2.0 * (1.0 - blue)
+  }
+}
+
+# The matrix a frame is converted with: its tag, or for an untagged frame the
+# usual guess (docs/design.md §7): BT.709 from 720 lines up, else BT.601
+func effectiveMatrix(frame: view VideoFrame) ret YuvMatrix {
+  if frame.matrix is not YuvMatrix.unknown {
+    ret frame.matrix
+  }
+  if frame.height >= 720 {
+    ret YuvMatrix.bt709
+  }
+  ret YuvMatrix.bt601
+}
+
+func matrixCoefficients(matrix: view YuvMatrix) ret YuvCoefficients {
+  if matrix is YuvMatrix.bt601 {
+    ret coefficientsOf(red: 0.299, blue: 0.114)
+  }
+  if matrix is YuvMatrix.bt2020 {
+    ret coefficientsOf(red: 0.2627, blue: 0.0593)
+  }
+  if matrix is YuvMatrix.smpte240 {
+    ret coefficientsOf(red: 0.212, blue: 0.087)
+  }
+  ret coefficientsOf(red: 0.2126, blue: 0.0722)
+}
+
+func addWord(bytes: mod List(UInt8), word: view Int) {
+  loop var i: Int = 0, i < 4, ++i {
+    bytes.add(value: ((word shr (i * 8)) bitand 255) as UInt8)
+  }
+}
+
+func addFloat(bytes: mod List(UInt8), value: view Float) {
+  addWord(bytes: bytes, word: floatBits(value: value))
+}
+
+# The YuvParameters uniform of yuvToRgb.wgsl for a frame converted with
+# `matrix` (48 bytes)
+func parameterBytes(
+  matrix: view YuvMatrix
+  fullRange: view Bool
+  width: view Int
+  height: view Int
+) ret List(UInt8) {
+  var bytes: List(UInt8) = List.create(UInt8, cap: 48)
+  if fullRange {
+    addFloat(bytes: bytes, value: 0.0)
+    addFloat(bytes: bytes, value: 1.0)
+    addFloat(bytes: bytes, value: 128.0 / 255.0)
+    addFloat(bytes: bytes, value: 1.0)
+  } else {
+    addFloat(bytes: bytes, value: 16.0 / 255.0)
+    addFloat(bytes: bytes, value: 255.0 / 219.0)
+    addFloat(bytes: bytes, value: 128.0 / 255.0)
+    addFloat(bytes: bytes, value: 255.0 / 224.0)
+  }
+  let coefficients: YuvCoefficients = matrixCoefficients(matrix: matrix)
+  addFloat(bytes: bytes, value: coefficients.crToRed)
+  addFloat(bytes: bytes, value: coefficients.cbToGreen)
+  addFloat(bytes: bytes, value: coefficients.crToGreen)
+  addFloat(bytes: bytes, value: coefficients.cbToBlue)
+  addWord(bytes: bytes, word: width)
+  addWord(bytes: bytes, word: height)
+  addWord(bytes: bytes, word: 0)
+  addWord(bytes: bytes, word: 0)
+  ret bytes
+}
+
+func createPlaneTexture(
+  resources: mod GpuResources
+  width: view Int
+  height: view Int
+  format: view Int32
+) ret opt TextureId {
+  ret createTexture(
+    resources: resources
+    width: width
+    height: height
+    format: format
+    usage: WGPUTextureUsage_TextureBinding + WGPUTextureUsage_CopyDst
+  )
+}
+
+# The textures, the parameters and the conversion pipeline for frames of
+# width x height; none when the GPU refuses one of them
+func createYuvPicture(
+  resources: mod GpuResources
+  width: view Int
+  height: view Int
+) ret opt YuvPicture {
+  let conversion: Shader = shader(files: ["lib/gpu/computeBounds.wgsl", "yuvToRgb.wgsl"])
+  let chromaWidth: Int = (width + 1) / 2
+  let chromaHeight: Int = (height + 1) / 2
+  if let luma: TextureId = createPlaneTexture(
+    resources: resources
+    width: width
+    height: height
+    format: WGPUTextureFormat_R8Unorm
+  ) {
+    if let chroma: TextureId = createPlaneTexture(
+      resources: resources
+      width: chromaWidth
+      height: chromaHeight
+      format: WGPUTextureFormat_RG8Unorm
+    ) {
+      if let picture: TextureId = createTexture(
+        resources: resources
+        width: width
+        height: height
+        format: WGPUTextureFormat_RGBA8Unorm
+        usage: WGPUTextureUsage_StorageBinding + WGPUTextureUsage_TextureBinding + WGPUTextureUsage_CopySrc
+      ) {
+        if let lumaView: TextureViewId = createTextureView(resources: resources, texture: luma) {
+          if let chromaView: TextureViewId = createTextureView(
+            resources: resources
+            texture: chroma
+          ) {
+            if let pictureView: TextureViewId = createTextureView(
+              resources: resources
+              texture: picture
+            ) {
+              if let parameters: BufferId = createBuffer(
+                resources: resources
+                size: 48
+                usage: WGPUBufferUsage_Uniform + WGPUBufferUsage_CopyDst
+              ) {
+                if let bounds: ComputeBounds = createComputeBounds(
+                  resources: resources
+                  workgroupSize: conversionWorkgroupSize
+                ) {
+                  if let pipeline: PipelineId = createBoundedComputePipeline(
+                    resources: resources
+                    wgsl: conversion.text
+                    entryPoint: "main"
+                    bounds: bounds
+                  ) {
+                    var buffers: List(BufferId) = {}
+                    buffers.add(value: parameters)
+                    var views: List(TextureViewId) = {}
+                    views.add(value: lumaView)
+                    views.add(value: chromaView)
+                    views.add(value: pictureView)
+                    let noSamplers: List(SamplerId) = {}
+                    if let bindGroup: BindGroupId = createBoundedBindGroup(
+                      resources: resources
+                      pipeline: pipeline
+                      bounds: bounds
+                      buffers: buffers
+                      textureViews: views
+                      samplers: noSamplers
+                    ) {
+                      ret YuvPicture {
+                        width: width
+                        height: height
+                        luma: luma
+                        chroma: chroma
+                        picture: picture
+                        lumaView: lumaView
+                        chromaView: chromaView
+                        pictureView: pictureView
+                        parameters: parameters
+                        bounds: bounds
+                        pipeline: pipeline
+                        bindGroup: bindGroup
+                        uploadedSample: -1
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  ret none
+}
+
+# Copies one plane from the locked frame into its texture through the queue
+func writePlane(
+  resources: view GpuResources
+  texture: view TextureId
+  frame: view VideoFrame
+  plane: view Int
+) ret Bool {
+  unsafe {
+    let address: Ptr = rae_video_frame_plane_address(frame: frame.handle, plane: plane)
+    if address is webgpuNull() {
+      ret false
+    }
+    let rowBytes: Int = rae_video_frame_plane_bytes_per_row(frame: frame.handle, plane: plane)
+    let rows: Int = rae_video_frame_plane_height(frame: frame.handle, plane: plane)
+    let columns: Int = rae_video_frame_plane_width(frame: frame.handle, plane: plane)
+    let destination: WGPUTexelCopyTextureInfo = {
+      texture: textureHandle(resources: resources, id: texture)
+      aspect: WGPUTextureAspect_All
+    }
+    let layout: WGPUTexelCopyBufferLayout = {
+      bytesPerRow: rowBytes as UInt32
+      rowsPerImage: rows as UInt32
+    }
+    let extent: WGPUExtent3D = {
+      width: columns as UInt32
+      height: rows as UInt32
+      depthOrArrayLayers: 1
+    }
+    wgpuQueueWriteTexture(
+      queue: webgpuQueue()
+      destination: destination
+      data: address
+      dataSize: (rowBytes * rows) as UInt64
+      dataLayout: layout
+      writeSize: extent
+    )
+  }
+  ret true
+}
+
+# Uploads the frame's planes and the parameters its tags give. False when the
+# frame is not an NV12 frame of this picture's size.
+func uploadFrame(
+  this: mod YuvPicture
+  resources: mod GpuResources
+  frame: view VideoFrame
+) ret Bool {
+  if frame.handle is 0 or frame.width is not this.width or frame.height is not this.height {
+    ret false
+  }
+  var planes: Int = 0
+  unsafe {
+    planes = rae_video_frame_plane_count(frame: frame.handle)
+  }
+  if planes is not 2 {
+    ret false
+  }
+  var locked: Int = -1
+  unsafe {
+    locked = rae_video_frame_lock(frame: frame.handle)
+  }
+  if locked is not 0 {
+    ret false
+  }
+  let written: Bool = writePlane(
+    resources: resources
+    texture: this.luma
+    frame: frame
+    plane: 0
+  ) and writePlane(
+    resources: resources
+    texture: this.chroma
+    frame: frame
+    plane: 1
+  )
+  unsafe {
+    rae_video_frame_unlock(frame: frame.handle)
+  }
+  if not written {
+    ret false
+  }
+  if not writeBuffer(
+    resources: resources
+    id: this.parameters
+    offset: 0
+    bytes: parameterBytes(
+      matrix: effectiveMatrix(frame: frame)
+      fullRange: frame.fullRange
+      width: this.width
+      height: this.height
+    )
+  ) {
+    ret false
+  }
+  this.uploadedSample = frame.sampleIndex
+  ret true
+}
+
+# Records the conversion of the uploaded planes into `picture`
+func recordConversion(
+  this: view YuvPicture
+  recording: mod Recording
+  resources: view GpuResources
+) ret Bool {
+  ret recordBoundedCompute(
+    recording: recording
+    resources: resources
+    pipeline: this.pipeline
+    bindGroup: this.bindGroup
+    bounds: this.bounds
+    elementCount: this.width * this.height
+  )
+}
+
+func awaitSubmission(resources: mod GpuResources, id: view SubmissionId) ret Bool {
+  var status: Int = 0
+  var spins: Int = 0
+  loop status is 0 and spins < 100000000 {
+    status = pollSubmission(resources: resources, id: id)
+    spins = spins + 1
+  }
+  retireSubmission(resources: resources, id: id)
+  ret status is 1
+}
+
+# Converts the uploaded planes now and waits for the GPU: for tests and
+# measurements (a renderer records the conversion into its own frame)
+func convertNow(this: view YuvPicture, resources: mod GpuResources) ret Bool {
+  if var recording: Recording = beginRecording(resources: resources) {
+    if not this.recordConversion(recording: recording, resources: resources) {
+      ret false
+    }
+    if let submission: SubmissionId = submit(resources: resources, recording: recording) {
+      ret awaitSubmission(resources: resources, id: submission)
+    }
+  }
+  ret false
+}
+
+# The picture's RGBA bytes, rows packed (width x 4 each), read back from the
+# GPU: for tests
+func readPicture(this: view YuvPicture, resources: mod GpuResources) ret List(UInt8) {
+  var pixels: List(UInt8) = List.create(UInt8, cap: this.width * this.height * 4)
+  let rowBytes: Int = (this.width * 4 + 255) / 256 * 256
+  if let buffer: BufferId = createBuffer(
+    resources: resources
+    size: rowBytes * this.height
+    usage: WGPUBufferUsage_MapRead + WGPUBufferUsage_CopyDst
+  ) {
+    var copied: Bool = false
+    if var recording: Recording = beginRecording(resources: resources) {
+      if recordCopyTextureToBuffer(
+        recording: recording
+        resources: resources
+        texture: this.picture
+        buffer: buffer
+        bytesPerRow: rowBytes
+      ) {
+        if let submission: SubmissionId = submit(resources: resources, recording: recording) {
+          copied = awaitSubmission(resources: resources, id: submission)
+        }
+      }
+    }
+    if copied {
+      if let request: ReadRequest = readBuffer(
+        resources: resources
+        id: buffer
+        offset: 0
+        size: rowBytes * this.height
+      ) {
+        var status: Int = 0
+        var spins: Int = 0
+        loop status is 0 and spins < 100000000 {
+          status = request.poll()
+          spins = spins + 1
+        }
+        if status is 1 {
+          var rows: List(UInt8) = List.create(UInt8, cap: rowBytes * this.height)
+          rows.addDefaults(count: rowBytes * this.height)
+          if request.copyToBytes(destination: rows) {
+            loop var y: Int = 0, y < this.height, ++y {
+              loop var i: Int = 0, i < this.width * 4, ++i {
+                pixels.add(value: rows.copyAtDefault(index: y * rowBytes + i))
+              }
+            }
+          }
+        }
+      }
+    }
+    retireBuffer(resources: resources, id: buffer)
+  }
+  ret pixels
+}
