@@ -10,13 +10,16 @@ The design is [docs/design.md](docs/design.md); what lives here,
 
 ## Packages
 
-- `packages/video` (0.1.0): MP4 and MOV reading (`MediaReader`), decoding
+- `packages/video` (0.2.0): MP4 and MOV reading (`MediaReader`), decoding
   through VideoToolbox on Apple (H.264, HEVC, ProRes: `VideoDecoder`,
-  `FrameStream`), a frame on the GPU as RGBA (`YuvPicture`), and a simple
-  player on Rae's audio clock (`VideoPlayer`). It depends on Rae's `audio`
-  package 0.15.1.
-- `packages/ffmpeg` (planned): FFmpeg (LGPL, dynamically linked) as one more
-  backend.
+  `FrameStream`) or a registered backend, a frame on the GPU as RGBA
+  (`YuvPicture`), and a simple player on Rae's audio clock (`VideoPlayer`). It
+  depends on Rae's `audio` package 0.15.1.
+- `packages/ffmpeg` (0.1.0): FFmpeg 9.0.2, built LGPL-only from its pinned
+  tarball the first time a program uses the package, loaded at run time, as
+  one more decoder of the video package (DNxHD/DNxHR, VP8, VP9, FFV1, ProRes):
+  `addFfmpegBackend(table:)`. A program that uses it ships the files in its
+  build's `legal/` folder (`packages/ffmpeg/legal/NOTICE.md`). macOS; never iOS.
 
 A program takes a package by git at a release tag:
 
@@ -24,13 +27,19 @@ A program takes a package by git at a release tag:
 dep video: {
   git: "https://github.com/jonasmyoha/raeVideo.git"
   subdir: "packages/video"
+  version: "0.2.0"
+  hash: "git-tree:1402b15d972caed9bc00d4a239659a4f1e809e9f"
+}
+dep ffmpeg: {
+  git: "https://github.com/jonasmyoha/raeVideo.git"
+  subdir: "packages/ffmpeg"
   version: "0.1.0"
-  hash: "git-tree:e35feff5392866848a906bb1d722b9456cb6ab52"
+  hash: "git-tree:fa511e78cde5aecc56ba2eb3f2e568796cc4b716"
 }
 ```
 
-The `video/v0.1.0` tag and the `audio/v0.15.1` tag it needs from Rae must be
-pushed before another machine can fetch them.
+The `video/v*` and `ffmpeg/v*` tags, and the `audio/v0.15.1` tag the video
+package needs from Rae, must be pushed before another machine can fetch them.
 
 ## Building and testing
 

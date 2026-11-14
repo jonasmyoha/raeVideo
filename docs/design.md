@@ -200,6 +200,21 @@ legal advice):
 3. not use `--enable-gpl` or `--enable-nonfree`;
 4. think about codec patents for the countries it ships in (§3.1).
 
+**Landed 2026-11-14: `packages/ffmpeg` 0.1.0.** FFmpeg 9.0.2 (SHA-256 pinned
+in `native/build.sh`), LGPL 2.1 or later, built shared with the decoders
+DNxHD/DNxHR, ProRes, VP8, VP9 and FFV1, the encoders DNxHD and FFV1, the MOV,
+Matroska and MXF demuxers and the MOV and Matroska muxers, and nothing found on
+the machine (`--disable-autodetect`). Rae has no function values, so the
+backend seam is C: the package hands a struct of its decoder's calls
+(`RaeVideoBackendCalls`, `packages/video/native/rae_video.h`) to the video
+package from Rae (`addFfmpegBackend`), and neither package's C names the
+other's symbols. Its glue loads libavcodec and libavutil with `dlopen` from the
+package's build (or `RAE_FFMPEG_LIBRARY_DIR`), so no program links FFmpeg
+(`tools/checkNoFfmpeg.sh`). It decodes packets from our own demuxer; reading
+WebM / MXF through its demuxers is not wired yet. Frames come as three planes,
+which `YuvPicture` converts with `yuvPlanarToRgb.wgsl` (8-bit; 10-bit DNxHR
+HQX and VP9 profile 2 are not shown yet).
+
 Platform notes:
 
 - **iOS:** an LGPL dynamic library inside an App Store app is legally debated
@@ -528,8 +543,8 @@ Depends on the audio steps for its clock (audio 1/6 to 4/6).
    behind `VideoEncoder` / `MediaWriter` in `packages/video` (the box writing in
    Rae's `lib/media`); the offline loop with audio and the round-trip tests
    where the timeline is, in `mediaeditor`.
-5. **The FFmpeg package** (`packages/ffmpeg`, `ffmpeg/v0.1.0`), dav1d, libvpx,
-   the WebM reader.
+5. **The FFmpeg package** (`packages/ffmpeg`, `ffmpeg/v0.1.0`, **landed
+   2026-11-14**, §4), dav1d, libvpx, the WebM reader.
 6. **Other platforms.** Windows (Media Foundation, NVENC), Linux (VA-API, the
    FFmpeg package), Android (`MediaCodec`), the web (WebCodecs,
    `importExternalTexture`).
@@ -543,9 +558,11 @@ Depends on the audio steps for its clock (audio 1/6 to 4/6).
 
 - **V1 — the FFmpeg package repo. Decided 2026-11-14:** `packages/ffmpeg` in
   this repository, which is public (LGPL obligations are easier with the build
-  recipe public), released as `ffmpeg/v<version>` (§4). Still open: which
-  codecs it enables by default. Recommendation: decoders on, software
-  H.264/HEVC decoders on only as a fallback a program enables.
+  recipe public), released as `ffmpeg/v<version>` (§4). Its codecs (0.1.0):
+  only what the platforms lack (DNxHD/DNxHR, VP8, VP9, FFV1, and ProRes for
+  where there is no VideoToolbox); FFmpeg's software H.264 / HEVC decoders are
+  not built at all, so their patents stay out (§3.1). A program that needs
+  them would get a second, opt-in build of the package.
 - **V2 — where video and the permissive libraries live.** Decided 2026-11-11
   as `packages/video` in the Rae repository, like `packages/audio`
   (`audio-design.md` §13 D6). **Changed 2026-11-14:** Rae takes only
