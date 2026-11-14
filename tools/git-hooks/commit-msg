@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Refuse a commit whose MESSAGE contains a banned term (the pre-commit hook
+# cannot see the message). Installed by `make install-hooks`. No term list on
+# this machine -> skipped.
+exec bash "$(git rev-parse --show-toplevel)/tools/banned-terms-gate.sh" --message "$1"

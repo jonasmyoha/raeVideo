@@ -77,6 +77,9 @@ Read `docs/scope.md` first. In short:
 - Releases: each package is tagged `<package>/v<version>` (`video/v0.1.0`),
   its `meta.version` raised in the same commit; programs take a package by
   that tag.
+- `make install-hooks` once per clone: the banned-terms gate (`tools/banned-terms-gate.sh`,
+  the same term list as Rae's, kept outside the repository) runs before every commit and on
+  its message, and `make test` runs it over the tree. Never commit the list or its terms.
 - Binary files are in Git LFS (`.gitattributes`); a new binary type gets its
   line there in the same commit as its first file.
 
