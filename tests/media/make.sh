@@ -1,6 +1,6 @@
 #!/bin/sh
 # Makes the test media from simple math (tools/makeTestMedia.swift: color bars,
-# a moving square, the frame counter as 16 cells and as digits, a 1 kHz tone)
+# a moving square, the frame counter as 16 cells and as digits, a rising tone)
 # through Apple's encoders. macOS only. The small files are committed (Git
 # LFS); the 4K one is made on demand into build/media (not committed).
 #

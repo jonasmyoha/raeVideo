@@ -1,0 +1,240 @@
+# video/VideoPlayer against the audio clock (docs/design.md §6.3, §11 step 1):
+# play, seek and pause stay frame-accurate. The audio engine runs offline
+# (it renders on this thread, so the heard sample is the samples rendered so
+# far), and the display refreshes every 800 samples (60 Hz at 48 kHz).
+#
+# At each refresh the frame shown must be the one the audio clock is at: the
+# counter burned into it (tests/media/make.sh) is read back and compared with
+# floor(position x 30000 / (48000 x 1001)) for counter709.mp4 at 29.97 fps,
+# where position is where the media is in samples. And the sound the engine
+# rendered must be the file's rising tone at that same position, so picture and
+# sound are at one place: play from the start, seek to frame 45 while playing,
+# pause (the picture holds and the sound stops), play again to the end (play
+# stops on the last frame; at 60 Hz no 29.97 fps frame is skipped).
+import Math
+open audio/Audio
+open media/MediaTime
+open video/VideoBackends
+open video/VideoDecoder
+open video/VideoGlue
+open video/VideoPlayer
+
+const refreshSamples: Int = 800
+
+const sampleRate: Int = 48000
+
+# a little more than the 5 ms fade a voice starts or stops with
+const fadeSamples: Int = 300
+
+func readCounter(frame: view VideoFrame) ret Int {
+  let luma: List(UInt8) = frame.copyPlane(plane: 0)
+  let row: Int = frame.height * 3 / 4 + frame.height / 16
+  var value: Int = 0
+  loop var bit: Int = 0, bit < 16, ++bit {
+    let x: Int = bit * frame.width / 16 + frame.width / 32
+    value = value * 2
+    if (luma.copyAtDefault(index: row * frame.width + x) as Int) > 128 {
+      value = value + 1
+    }
+  }
+  ret value
+}
+
+# The 29.97 fps frame at `position` samples
+func frameAtPosition(position: view Int) ret Int {
+  ret min(a: 89, b: position * 30000 / (sampleRate * 1001))
+}
+
+# The file's rising tone at `position` samples (tools/makeTestMedia.swift):
+# 500 Hz at the start to 1500 Hz at the end of its 3.003 s, so a sound that is
+# off by even two samples is off by more than the tolerance
+func toneAt(position: view Int) ret Float {
+  let seconds: Float64 = (position as Float64) / 48000.0
+  let length: Float64 = ((90 * 1001) as Float64) / 30000.0
+  let rising: Float64 = seconds * seconds * 1000.0 / (length * 2.0)
+  let cycles: Float64 = seconds * 500.0 + rising
+  # whole cycles dropped first, so the Float keeps its precision
+  let within: Float64 = cycles - ((cycles as Int) as Float64)
+  ret 0.25 * sin(x: 2.0 * pi * (within as Float))
+}
+
+type Check {
+  refreshes: Int
+  frameMismatches: Int
+  firstFrame: Int
+  lastFrame: Int
+  # the largest difference between the rendered sound and the tone where it
+  # should be, and the loudest sample where it should be silent
+  toneError: Float
+  silenceLevel: Float
+}
+
+func newCheck() ret Check {
+  ret Check {
+    refreshes: 0
+    frameMismatches: 0
+    firstFrame: -1
+    lastFrame: -1
+    toneError: 0.0
+    silenceLevel: 0.0
+  }
+}
+
+# Renders `count` refreshes; after each, the frame shown must be the one at
+# `position + (heard - since)` (`position` alone when `holding`), and the sound
+# the tone at that place (silence when `holding`)
+func run(
+  audio: mod AudioEngine
+  player: mod VideoPlayer
+  count: view Int
+  since: view Int
+  position: view Int
+  holding: view Bool
+  check: mod Check
+) {
+  loop var r: Int = 0, r < count, ++r {
+    let first: Int = audio.renderedFrames
+    let sound: List(Float) = audio.renderOffline(frames: refreshSamples)
+    loop var i: Int = 0, i < refreshSamples, ++i {
+      let sample: Int = first + i
+      let left: Float = sound.copyAtDefault(index: i * 2) as Float
+      if holding {
+        if sample >= since + fadeSamples {
+          check.silenceLevel = max(a: check.silenceLevel, b: abs(value: left))
+        }
+      } else if sample >= since + fadeSamples and position + sample - since < 89 * 1601 {
+        let error: Float = abs(value: left - toneAt(position: position + sample - since))
+        check.toneError = max(a: check.toneError, b: error)
+      }
+    }
+    let changed: Bool = player.refresh(audio: audio, hostNs: 0)
+    var expected: Int = frameAtPosition(position: position)
+    if not holding {
+      expected = frameAtPosition(position: position + audio.renderedFrames - since)
+    }
+    let shown: Int = readCounter(frame: player.current)
+    if shown is not expected or player.shownFrame is not expected {
+      if check.frameMismatches < 3 {
+        log(
+          "FAIL: at sample {audio.renderedFrames} frame {shown} is shown, the clock is at {expected}"
+        )
+      }
+      check.frameMismatches = check.frameMismatches + 1
+    }
+    if check.firstFrame < 0 {
+      check.firstFrame = shown
+    }
+    check.lastFrame = shown
+    check.refreshes = check.refreshes + 1
+  }
+}
+
+func report(name: view String, check: view Check, holding: view Bool) ret Bool {
+  var ok: Bool = check.frameMismatches is 0
+  log(
+    "{name}: {check.refreshes} refreshes show frames {check.firstFrame}..{check.lastFrame}, each the one the audio clock is at: {check.frameMismatches is 0}"
+  )
+  if holding {
+    log("{name}: the sound is silent: {check.silenceLevel < 0.001}")
+    ok = ok and check.silenceLevel < 0.001
+  } else {
+    log(
+      "{name}: the sound is the file's tone at the same place (within 0.02): {check.toneError < 0.02}"
+    )
+    ok = ok and check.toneError < 0.02
+    if check.toneError >= 0.02 {
+      log("FAIL: {name}: the sound is off by {check.toneError}")
+    }
+  }
+  ret ok
+}
+
+func main() ret Int {
+  var available: Int = 0
+  unsafe {
+    available = rae_video_vt_available()
+  }
+  if available is 0 {
+    log("SKIP: no VideoToolbox here")
+    ret 0
+  }
+  var audio: AudioEngine = audioStartOffline(sampleRate: sampleRate, channels: 2, blockFrames: 256)
+  var player: VideoPlayer = openVideoPlayer(
+    path: "tests/media/counter709.mp4"
+    table: defaultVideoBackends()
+  )
+  if player.error.length() > 0 {
+    log("FAIL: {player.error}")
+    ret 1
+  }
+  var ok: Bool = true
+
+  player.startPlaying(audio: audio, hostNs: 0)
+  var playing: Check = newCheck()
+  run(
+    audio: audio
+    player: player
+    count: 60
+    since: player.anchorSample
+    position: 0
+    holding: false
+    check: playing
+  )
+  ok = report(name: "play from the start", check: playing, holding: false) and ok
+
+  player.seekToFrame(audio: audio, hostNs: 0, frameIndex: 45)
+  log(
+    "seek to frame 45 while playing: the media is at sample {player.anchorPosition} (45 x 1601.6)"
+  )
+  var sought: Check = newCheck()
+  run(
+    audio: audio
+    player: player
+    count: 30
+    since: player.anchorSample
+    position: player.anchorPosition
+    holding: false
+    check: sought
+  )
+  ok = report(name: "after the seek", check: sought, holding: false) and ok
+
+  let pauseSample: Int = audio.nextSafeSampleTime()
+  player.pausePlaying(audio: audio, hostNs: 0)
+  var paused: Check = newCheck()
+  run(
+    audio: audio
+    player: player
+    count: 20
+    since: pauseSample
+    position: player.anchorPosition
+    holding: true
+    check: paused
+  )
+  ok = report(name: "paused", check: paused, holding: true) and ok
+
+  player.startPlaying(audio: audio, hostNs: 0)
+  var resumed: Check = newCheck()
+  let remaining: Int = (player.endPosition() - player.anchorPosition) / refreshSamples + 2
+  run(
+    audio: audio
+    player: player
+    count: remaining
+    since: player.anchorSample
+    position: player.anchorPosition
+    holding: false
+    check: resumed
+  )
+  ok = report(name: "play again to the end", check: resumed, holding: false) and ok
+  log(
+    "at the end: stopped {player.ended and not player.playing} on frame {player.shownFrame}; frames dropped {player.droppedFrames}"
+  )
+  ok = ok and player.ended and player.shownFrame is 89 and player.droppedFrames is 0
+  player.close(audio: audio)
+  let stopped: Int = stopAudio(this: audio)
+  if not ok {
+    log("FAIL")
+    ret 1
+  }
+  log("done")
+  ret 0
+}

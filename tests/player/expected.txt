@@ -1,0 +1,14 @@
+[audio] stream voice 1 tests/media/counter709.mp4 bus music
+play from the start: 60 refreshes show frames 0..29, each the one the audio clock is at: true
+play from the start: the sound is the file's tone at the same place (within 0.02): true
+[audio] stream voice 3 tests/media/counter709.mp4 bus music
+seek to frame 45 while playing: the media is at sample 72072 (45 x 1601.6)
+after the seek: 30 refreshes show frames 45..59, each the one the audio clock is at: true
+after the seek: the sound is the file's tone at the same place (within 0.02): true
+paused: 20 refreshes show frames 59..59, each the one the audio clock is at: true
+paused: the sound is silent: true
+[audio] stream voice 5 tests/media/counter709.mp4 bus music
+play again to the end: 62 refreshes show frames 60..89, each the one the audio clock is at: true
+play again to the end: the sound is the file's tone at the same place (within 0.02): true
+at the end: stopped true on frame 89; frames dropped 0
+done

@@ -1,0 +1,246 @@
+# video/VideoPlayer — the simple player (docs/design.md §5 V6, §6.3): one file,
+# its picture and its sound, play, pause and seek, with the audio engine as the
+# master clock. (Its methods are not named play / pause / seek / update: those are
+# audio's, and Rae resolves a method name across packages.)
+#
+#     var audio: AudioEngine = audioStart(settings: defaultAudioSettings())
+#     var player: VideoPlayer = openVideoPlayer(path: "clip.mp4", table: defaultVideoBackends())
+#     player.startPlaying(audio: audio, hostNs: nowNs())
+#     # each display refresh, with the refresh's presentation time:
+#     if player.refresh(audio: audio, hostNs: refreshNs) { ... upload player.current (YuvPicture)
+#     ... }
+#     player.seekTo(audio: audio, hostNs: nowNs(), time: mediaTime(value: 12, numerator: 1,
+#     denominator: 1))
+#     player.pausePlaying(audio: audio, hostNs: nowNs())
+#     player.close(audio: audio)
+#
+# The file's sound plays as an audio stream voice (audio/AudioStreams) started
+# at a stated sample time from a stated place in the file. The player keeps
+# that pair, the anchor: engine sample `anchorSample` is where the media is at
+# `anchorPosition` (in samples at the engine's rate, so no time is rounded
+# twice). At a refresh it asks the engine which sample is heard at the
+# refresh's host time (offline: the samples rendered so far), and shows the
+# frame whose time span covers anchorPosition + (heard - anchorSample). Video
+# never moves the audio: a late refresh skips frames (`droppedFrames`), an
+# early one shows the same frame again. Pause and seek stop the voice on a
+# stated sample and start a new one from the new place. A file without sound
+# runs on the host clock instead.
+import Math
+open audio/Audio
+open audio/AudioMixer
+open audio/AudioSchedule
+open audio/AudioStreams
+open media/MediaTime
+open video/FrameStream
+open video/MediaReader
+open video/VideoBackends
+open video/VideoDecoder
+
+type VideoPlayer {
+  path: String
+  frames: FrameStream
+  # the file has a sound track (else the host clock is the clock)
+  hasSound: Bool
+  # the stream voice playing the sound; meaningful while `playing`
+  voice: VoiceId
+  playing: Bool
+  # the anchor: at clock sample `anchorSample` the media is at `anchorPosition`
+  # (samples at the engine's rate from the start of the file)
+  anchorSample: Int
+  anchorPosition: Int
+  sampleRate: Int
+  # the frame being shown (its index in presentation order), -1 before the first
+  shownFrame: Int
+  current: VideoFrame
+  # frames shown, and frames a refresh came too late for
+  shownFrames: Int
+  droppedFrames: Int
+  # play reached the end and stopped there
+  ended: Bool
+  error: String
+}
+
+func openVideoPlayer(path: view String, table: view List(VideoBackendChoice)) ret VideoPlayer {
+  var frames: FrameStream = openFrameStream(path: path, table: table)
+  let hasSound: Bool = frames.reader.audioTrackIndex() >= 0
+  ret VideoPlayer {
+    path: "{path}"
+    frames: frames
+    hasSound: hasSound
+    voice: { value: 0 }
+    playing: false
+    anchorSample: 0
+    anchorPosition: 0
+    sampleRate: 48000
+    shownFrame: -1
+    current: noVideoFrame()
+    shownFrames: 0
+    droppedFrames: 0
+    ended: false
+    error: "{frames.error}"
+  }
+}
+
+# The clock's sample at host time `hostNs`: the sample being heard (offline,
+# the samples rendered so far); without sound, the host clock at the engine's
+# rate
+func clockSample(this: view VideoPlayer, audio: view AudioEngine, hostNs: view Int) ret Int {
+  if not this.hasSound {
+    ret hostNs / 1000 * this.sampleRate / 1000000
+  }
+  if audio.offline {
+    ret audio.renderedFrames
+  }
+  ret audio.heardSampleTimeAt(hostNs: hostNs)
+}
+
+# Where a command sent now takes effect on the clock: the engine's next safe
+# sample (never late, docs/design.md §6.3); without sound, now
+func startSample(this: view VideoPlayer, audio: view AudioEngine, hostNs: view Int) ret Int {
+  if not this.hasSound {
+    ret this.clockSample(audio: audio, hostNs: hostNs)
+  }
+  ret audio.nextSafeSampleTime()
+}
+
+# The end of the media, in samples at the engine's rate
+func endPosition(this: view VideoPlayer) ret Int {
+  ret this.frames.endTime().toSamples(sampleRate: this.sampleRate)
+}
+
+# Where the media is at clock sample `sample`
+func positionAt(this: view VideoPlayer, sample: view Int) ret Int {
+  if not this.playing {
+    ret this.anchorPosition
+  }
+  ret this.anchorPosition + max(a: 0, b: sample - this.anchorSample)
+}
+
+# The media's time now (at the clock sample heard at `hostNs`)
+func timeAt(this: view VideoPlayer, audio: view AudioEngine, hostNs: view Int) ret MediaTime {
+  let position: Int = this.positionAt(sample: this.clockSample(audio: audio, hostNs: hostNs))
+  ret sampleTime(frames: min(a: position, b: this.endPosition()), sampleRate: this.sampleRate)
+}
+
+func startSound(this: mod VideoPlayer, audio: mod AudioEngine, atSample: view Int) {
+  if this.hasSound {
+    this.voice = audio.playStreamFromAt(
+      path: this.path
+      bus: AudioBusKind.music
+      gainDecibels: 0.0
+      skipFrames: this.anchorPosition
+      atSample: atSample
+    )
+  }
+}
+
+func stopSound(this: mod VideoPlayer, audio: mod AudioEngine, atSample: view Int) {
+  if this.hasSound and this.playing {
+    audio.stopVoiceAt(voiceId: this.voice, atSample: atSample)
+  }
+}
+
+func startPlaying(this: mod VideoPlayer, audio: mod AudioEngine, hostNs: view Int) {
+  if this.playing or this.error.length() > 0 {
+    ret
+  }
+  this.sampleRate = audio.sampleRate
+  if this.ended or this.anchorPosition >= this.endPosition() {
+    this.anchorPosition = 0
+    this.ended = false
+  }
+  let start: Int = this.startSample(audio: audio, hostNs: hostNs)
+  this.startSound(audio: audio, atSample: start)
+  this.anchorSample = start
+  this.playing = true
+}
+
+func pausePlaying(this: mod VideoPlayer, audio: mod AudioEngine, hostNs: view Int) {
+  if not this.playing {
+    ret
+  }
+  let at: Int = this.startSample(audio: audio, hostNs: hostNs)
+  this.stopSound(audio: audio, atSample: at)
+  this.anchorPosition = min(a: this.positionAt(sample: at), b: this.endPosition())
+  this.playing = false
+}
+
+# Moves to `time` (from the start of the file), playing on if it was playing
+func seekTo(
+  this: mod VideoPlayer
+  audio: mod AudioEngine
+  hostNs: view Int
+  time: view MediaTime
+) {
+  this.sampleRate = audio.sampleRate
+  let target: Int = max(
+    a: 0
+    b: min(a: time.toSamples(sampleRate: this.sampleRate), b: this.endPosition())
+  )
+  this.ended = false
+  # the jump is not frames dropped: counting starts again from the new place
+  this.shownFrame = -1
+  if this.playing {
+    let at: Int = this.startSample(audio: audio, hostNs: hostNs)
+    this.stopSound(audio: audio, atSample: at)
+    this.anchorPosition = target
+    this.anchorSample = at
+    this.startSound(audio: audio, atSample: at)
+  } else {
+    this.anchorPosition = target
+  }
+}
+
+# Moves to frame `frameIndex` (its start time)
+func seekToFrame(
+  this: mod VideoPlayer
+  audio: mod AudioEngine
+  hostNs: view Int
+  frameIndex: view Int
+) {
+  this.seekTo(audio: audio, hostNs: hostNs, time: this.frames.frameTime(frameIndex: frameIndex))
+}
+
+# The index of the frame to show at `hostNs`
+func frameIndexNow(this: view VideoPlayer, audio: view AudioEngine, hostNs: view Int) ret Int {
+  ret this.frames.frameIndexAt(time: this.timeAt(audio: audio, hostNs: hostNs))
+}
+
+# Once per display refresh, with its presentation host time: makes `current`
+# the frame to show then. True when it changed. Reaching the end stops play
+# on the last frame.
+func refresh(this: mod VideoPlayer, audio: mod AudioEngine, hostNs: view Int) ret Bool {
+  if this.error.length() > 0 {
+    ret false
+  }
+  if this.playing and this.positionAt(sample: this.clockSample(audio: audio, hostNs: hostNs)) >= this.endPosition() {
+    this.stopSound(audio: audio, atSample: this.startSample(audio: audio, hostNs: hostNs))
+    this.anchorPosition = this.endPosition()
+    this.playing = false
+    this.ended = true
+  }
+  let wanted: Int = this.frameIndexNow(audio: audio, hostNs: hostNs)
+  if wanted is this.shownFrame and this.current.handle is not 0 {
+    ret false
+  }
+  var frame: VideoFrame = this.frames.takeFrame(frameIndex: wanted)
+  if frame.handle is 0 {
+    this.error = "frame {wanted}: {this.frames.decoder.error}"
+    ret false
+  }
+  if this.playing and this.shownFrame >= 0 and wanted > this.shownFrame + 1 {
+    this.droppedFrames = this.droppedFrames + wanted - this.shownFrame - 1
+  }
+  releaseFrame(frame: this.current)
+  this.current = frame
+  this.shownFrame = wanted
+  this.shownFrames = this.shownFrames + 1
+  ret true
+}
+
+func close(this: mod VideoPlayer, audio: mod AudioEngine) {
+  this.stopSound(audio: audio, atSample: audio.nextSafeSampleTime())
+  this.playing = false
+  releaseFrame(frame: this.current)
+  this.frames.close()
+}

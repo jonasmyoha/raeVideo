@@ -7,7 +7,10 @@
 //
 //   codec:  h264 | hevc | prores
 //   matrix: 709 | 601     range: limited | full
-//   audio:  "tone" adds a 1 kHz sine at -12 dBFS, 48 kHz stereo AAC
+//   audio:  "tone" adds a rising tone at -12 dBFS, 48 kHz stereo AAC: from
+//           500 Hz at the start to 1500 Hz at the end, so no two places in
+//           the file sound the same (a player's sync can be checked to the
+//           sample: tests/player)
 //
 // Every frame n is drawn the same way, in four bands from the top:
 //   1. rows [0, h/2): seven 75% color bars (white, yellow, cyan, green,
@@ -257,6 +260,15 @@ CMAudioFormatDescriptionCreate(
   allocator: nil, asbd: &audioDescription, layoutSize: 0, layout: nil, magicCookieSize: 0,
   magicCookie: nil, extensions: nil, formatDescriptionOut: &audioFormat)
 
+// The rising tone's phase at sample n: its frequency goes from 500 Hz to
+// 1500 Hz over the file's length T, so the phase is
+// 2 pi (500 t + 1000 t^2 / (2 T))
+let toneSeconds = Double(Int64(frameCount) * frameDuration) / Double(timescale)
+func tonePhase(_ n: Int) -> Double {
+  let t = Double(n) / Double(sampleRate)
+  return 2.0 * Double.pi * (500.0 * t + 1000.0 * t * t / (2.0 * toneSeconds))
+}
+
 // One block of the tone from frame `first`
 func toneBuffer(first: Int, count: Int) -> CMSampleBuffer {
   let bytes = count * channels * 4
@@ -267,7 +279,7 @@ func toneBuffer(first: Int, count: Int) -> CMSampleBuffer {
   CMBlockBufferAssureBlockMemory(block!)
   var samples = [Float](repeating: 0, count: count * channels)
   for i in 0..<count {
-    let value = Float(0.25 * sin(2.0 * Double.pi * 1000.0 * Double(first + i) / Double(sampleRate)))
+    let value = Float(0.25 * sin(tonePhase(first + i)))
     for c in 0..<channels { samples[i * channels + c] = value }
   }
   samples.withUnsafeBytes { raw in
