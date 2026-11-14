@@ -1,0 +1,24 @@
+pack Ffmpeg {
+  format: "raepack"
+  version: 1
+  meta: {
+    version: "0.1.0"
+  }
+  rae: {
+    version: "0.3.123"
+  }
+  dependencies: {
+    dep video: {
+      git: "https://github.com/jonasmyoha/raeVideo.git"
+      subdir: "packages/video"
+      version: "0.2.0"
+      hash: "git-tree:1402b15d972caed9bc00d4a239659a4f1e809e9f"
+    }
+  }
+  native: {
+    build: "native/build.sh"
+    header: "rae_ffmpeg.h"
+    include: "include"
+    link: "lib/libraeffmpeg.a"
+  }
+}

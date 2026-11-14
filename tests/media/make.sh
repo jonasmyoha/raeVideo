@@ -15,6 +15,11 @@
 #                       full range: the YUV to RGB pass honors other tags
 #   counterHevc.mp4     HEVC, 320x180, 48 frames at 24000/1001, BT.709, tone
 #   counterProres.mov   ProRes 422 Proxy, 320x180, 30 frames at 30 fps (MOV)
+#   counterDnxhr.mov    DNxHR LB (8-bit 4:2:2), 320x180, 30 frames at 29.97 fps,
+#                       BT.709 (MOV): a codec the platform cannot decode, for
+#                       packages/ffmpeg. Apple has no DNxHR encoder, so the frames
+#                       are made raw here and encoded by an `ffmpeg` command
+#                       (any build: it is a tool run once, not linked)
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 mkdir -p "$root/build/tools"
@@ -33,3 +38,12 @@ here="$root/tests/media"
 "$tool" "$here/counter601full.mp4" h264 320 180 20 600 24 601 full
 "$tool" "$here/counterHevc.mp4" hevc 320 180 48 24000 1001 709 limited tone
 "$tool" "$here/counterProres.mov" prores 320 180 30 3000 100 709 limited
+raw="$root/build/tools/counterDnxhr.yuv"
+"$tool" "$raw" raw422 320 180 30 30000 1001 709 limited
+# the input is tagged as what it is, so the command converts nothing; the output
+# tags go into the MOV's colr box
+ffmpeg -v error -y -f rawvideo -pix_fmt yuv422p -s 320x180 -framerate 30000/1001 \
+  -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv -i "$raw" \
+  -c:v dnxhd -profile:v dnxhr_lb -color_primaries bt709 -color_trc bt709 -colorspace bt709 \
+  -color_range tv -movflags +write_colr "$here/counterDnxhr.mov"
+echo "made $here/counterDnxhr.mov: DNxHR LB from the raw frames"

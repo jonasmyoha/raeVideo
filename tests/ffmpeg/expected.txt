@@ -1,0 +1,8 @@
+FFmpeg 9.0.2: LGPL version 2.1 or later
+its configure line has --disable-gpl and no --enable-gpl or --enable-nonfree: true
+without the FFmpeg backend: no backend decodes AVdh here
+with it: 30 frames, 320x180, three planes, 4:2:2 (limited range), matrix BT.709: true
+frames 0..29 in order show counters 0..29: true
+seeks to 15 3 29 10 11 12 0 show 15 3 29 10 11 12 0
+on the GPU the seven bars come back within 6 code values: true
+done

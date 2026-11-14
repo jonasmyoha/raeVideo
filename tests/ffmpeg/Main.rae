@@ -1,0 +1,217 @@
+# packages/ffmpeg as a backend of the video package (docs/design.md §4): a
+# file the platform cannot decode decodes through it, with the same
+# frame-counter test as tests/decode.
+#
+# tests/media/counterDnxhr.mov is DNxHR LB (8-bit 4:2:2) in MOV, which neither
+# VideoToolbox nor AVFoundation decodes. Without the FFmpeg backend the video
+# package has no decoder for it; with it (addFfmpegBackend), every frame in
+# order and after seeks shows its own counter, comes out as three planes at
+# 4:2:2 with the file's BT.709 tags, and its bars come back through the GPU
+# (yuvPlanarToRgb.wgsl) within a few code values. And the FFmpeg that loaded
+# says it is LGPL, with no --enable-gpl or --enable-nonfree in its configure
+# line.
+open ffmpeg/Ffmpeg
+open gpu/GpuIds
+open gpu/GpuResources
+open video/FrameStream
+open video/VideoBackends
+open video/VideoDecoder
+open video/YuvPicture
+open webgpu/Context
+
+const file: String = "tests/media/counterDnxhr.mov"
+
+func readCounter(frame: view VideoFrame) ret Int {
+  let luma: List(UInt8) = frame.copyPlane(plane: 0)
+  let row: Int = frame.height * 3 / 4 + frame.height / 16
+  var value: Int = 0
+  loop var bit: Int = 0, bit < 16, ++bit {
+    let x: Int = bit * frame.width / 16 + frame.width / 32
+    value = value * 2
+    if (luma.copyAtDefault(index: row * frame.width + x) as Int) > 128 {
+      value = value + 1
+    }
+  }
+  ret value
+}
+
+func layoutName(layout: view FrameLayout) ret String {
+  if layout is FrameLayout.nv12 {
+    ret "NV12"
+  }
+  if layout is FrameLayout.planar420 {
+    ret "three planes, 4:2:0"
+  }
+  if layout is FrameLayout.planar422 {
+    ret "three planes, 4:2:2"
+  }
+  if layout is FrameLayout.planar444 {
+    ret "three planes, 4:4:4"
+  }
+  ret "unsupported"
+}
+
+func barColor(bar: view Int, channel: view Int) ret Int {
+  # white, yellow, cyan, green, magenta, red, blue at 75%: which channels are on
+  let red: List(Int) = List(Int) {
+    1
+    1
+    0
+    0
+    1
+    1
+    0
+  }
+  let green: List(Int) = List(Int) {
+    1
+    1
+    1
+    1
+    0
+    0
+    0
+  }
+  let blue: List(Int) = List(Int) {
+    1
+    0
+    1
+    0
+    1
+    0
+    1
+  }
+  var on: Int = blue.copyAtDefault(index: bar)
+  if channel is 0 {
+    on = red.copyAtDefault(index: bar)
+  } else if channel is 1 {
+    on = green.copyAtDefault(index: bar)
+  }
+  ret on * 191
+}
+
+# The largest difference between a bar's center and its drawn color
+func barsDifference(resources: mod GpuResources, frame: view VideoFrame) ret Int {
+  if var picture: YuvPicture = createYuvPicture(
+    resources: resources
+    width: frame.width
+    height: frame.height
+    layout: frame.layout
+  ) {
+    if picture.uploadFrame(resources: resources, frame: frame) and picture.convertNow(
+      resources: resources
+    ) {
+      let pixels: List(UInt8) = picture.readPicture(resources: resources)
+      var largest: Int = 0
+      let y: Int = frame.height / 4
+      loop var bar: Int = 0, bar < 7, ++bar {
+        let x: Int = (2 * bar + 1) * frame.width / 14
+        loop var channel: Int = 0, channel < 3, ++channel {
+          let got: Int = pixels.copyAtDefault(index: (y * frame.width + x) * 4 + channel) as Int
+          var difference: Int = got - barColor(bar: bar, channel: channel)
+          if difference < 0 {
+            difference = -difference
+          }
+          if difference > largest {
+            largest = difference
+          }
+        }
+      }
+      ret largest
+    }
+  }
+  ret 1000
+}
+
+func main() ret Int {
+  if not ffmpegAvailable() {
+    log("FAIL: FFmpeg did not load: {ffmpegProblem()}")
+    ret 1
+  }
+  let configuration: String = ffmpegConfiguration()
+  log("FFmpeg {ffmpegVersion()}: {ffmpegLicense()}")
+  let clean: Bool = not configuration.contains(sub: "--enable-gpl") and not configuration.contains(
+    sub: "--enable-nonfree"
+  ) and configuration.contains(sub: "--disable-gpl")
+  log("its configure line has --disable-gpl and no --enable-gpl or --enable-nonfree: {clean}")
+  var ok: Bool = clean and ffmpegLicense() is "LGPL version 2.1 or later"
+
+  var platformOnly: FrameStream = openFrameStream(path: file, table: defaultVideoBackends())
+  log("without the FFmpeg backend: {platformOnly.error}")
+  ok = ok and platformOnly.error.length() > 0
+  platformOnly.close()
+
+  var table: List(VideoBackendChoice) = defaultVideoBackends()
+  if not addFfmpegBackend(table: table) {
+    log("FAIL: the FFmpeg backend could not be added")
+    ret 1
+  }
+  var stream: FrameStream = openFrameStream(path: file, table: table)
+  if stream.error.length() > 0 {
+    log("FAIL: {stream.error}")
+    ret 1
+  }
+  let count: Int = stream.frameCount()
+  var mismatches: Int = 0
+  loop var i: Int = 0, i < count, ++i {
+    var frame: VideoFrame = stream.takeFrame(frameIndex: i)
+    if i is 0 {
+      var range: String = "limited"
+      if frame.fullRange {
+        range = "full"
+      }
+      log(
+        "with it: {count} frames, {frame.width}x{frame.height}, {layoutName(layout: frame.layout)} ({range} range), matrix BT.709: {frame.matrix is YuvMatrix.bt709}"
+      )
+    }
+    if frame.handle is 0 or readCounter(frame: frame) is not i or frame.presentationTime.value is not i * 1001 {
+      mismatches = mismatches + 1
+    }
+    releaseFrame(frame: frame)
+  }
+  log("frames 0..{count - 1} in order show counters 0..{count - 1}: {mismatches is 0}")
+  ok = ok and mismatches is 0
+  let seeks: List(Int) = List(Int) {
+    15
+    3
+    29
+    10
+    11
+    12
+    0
+  }
+  var shown: String = ""
+  var seeksOk: Bool = true
+  loop let target: Int in seeks {
+    var frame: VideoFrame = stream.takeFrame(frameIndex: target)
+    let counter: Int = readCounter(frame: frame)
+    shown = shown.concat(other: " {counter}")
+    seeksOk = seeksOk and counter is target
+    releaseFrame(frame: frame)
+  }
+  log("seeks to 15 3 29 10 11 12 0 show{shown}")
+  ok = ok and seeksOk
+
+  var ready: Int = 0
+  unsafe {
+    ready = webgpuBootstrap()
+  }
+  if ready is 1 {
+    var issuer: IdIssuer = IdIssuer.create()
+    if var resources: GpuResources = GpuResources.create(issuer: issuer, capacity: 64) {
+      var frame: VideoFrame = stream.takeFrame(frameIndex: 0)
+      let difference: Int = barsDifference(resources: resources, frame: frame)
+      log("on the GPU the seven bars come back within 6 code values: {difference <= 6}")
+      ok = ok and difference <= 6
+      releaseFrame(frame: frame)
+    }
+  } else {
+    log("no GPU: the bars were not checked")
+  }
+  stream.close()
+  if not ok {
+    log("FAIL")
+    ret 1
+  }
+  log("done")
+  ret 0
+}

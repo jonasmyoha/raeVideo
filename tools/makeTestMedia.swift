@@ -5,7 +5,9 @@
 //   swift tools/makeTestMedia.swift <out> <codec> <width> <height> <frames>
 //     <timescale> <frameDuration> <matrix> <range> [audio]
 //
-//   codec:  h264 | hevc | prores
+//   codec:  h264 | hevc | prores, or raw422: the frames as raw planar 4:2:2
+//           Y'CbCr (Y, then Cb and Cr at half width), for an encoder this
+//           platform does not have (tests/media/make.sh: DNxHR)
 //   matrix: 709 | 601     range: limited | full
 //   audio:  "tone" adds a rising tone at -12 dBFS, 48 kHz stereo AAC: from
 //           500 Hz at the start to 1500 Hz at the end, so no two places in
@@ -179,6 +181,37 @@ func makePixelBuffer(_ n: Int, _ pool: CVPixelBufferPool) -> CVPixelBuffer {
     buffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2,
     .shouldPropagate)
   return buffer
+}
+
+// raw422: each frame's Y plane, then Cb and Cr at half width (the mean of
+// each pair), no container
+if codecName == "raw422" {
+  var bytes = [UInt8]()
+  bytes.reserveCapacity(frameCount * width * height * 2)
+  for n in 0..<frameCount {
+    var cbPlane = [UInt8](repeating: 0, count: width / 2 * height)
+    var crPlane = [UInt8](repeating: 0, count: width / 2 * height)
+    for y in 0..<height {
+      for cx in 0..<(width / 2) {
+        var cbSum = 0.0
+        var crSum = 0.0
+        for dx in 0..<2 {
+          let (r, g, b) = pixel(cx * 2 + dx, y, n)
+          let (luma, cb, cr) = ycbcr(r, g, b)
+          bytes.append(UInt8(max(0, min(255, luma.rounded()))))
+          cbSum += cb
+          crSum += cr
+        }
+        cbPlane[y * width / 2 + cx] = UInt8(max(0, min(255, (cbSum / 2).rounded())))
+        crPlane[y * width / 2 + cx] = UInt8(max(0, min(255, (crSum / 2).rounded())))
+      }
+    }
+    bytes.append(contentsOf: cbPlane)
+    bytes.append(contentsOf: crPlane)
+  }
+  FileManager.default.createFile(atPath: outPath, contents: Data(bytes))
+  print("made \(outPath): raw 4:2:2, \(width)x\(height), \(frameCount) frames, BT.\(matrixName) \(fullRange ? "full" : "limited")")
+  exit(0)
 }
 
 let url = URL(fileURLWithPath: outPath)

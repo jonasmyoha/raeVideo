@@ -1,0 +1,106 @@
+# ffmpeg/Ffmpeg — FFmpeg as one more decoder of the video package (docs/design.md
+# §4): what the platform cannot decode (DNxHD / DNxHR, VP8 and VP9, FFV1; ProRes
+# where there is no VideoToolbox).
+#
+#     var table: List(VideoBackendChoice) = defaultVideoBackends()
+#     let added: Bool = addFfmpegBackend(table: table)
+#     var stream: FrameStream = openFrameStream(path: "clip.mov", table: table)
+#
+# FFmpeg is LGPL: built by this package from one pinned release, LGPL-only and
+# shared (native/build.sh), and loaded at run time, so a program that does not
+# import this package never builds or links it, and one that does ships the
+# notice and license text in its build's legal/ folder (legal/NOTICE.md). It is
+# never offered on iOS (docs/design.md §4).
+open ffmpeg/FfmpegGlue
+open video/VideoBackends
+
+type FfmpegCodec {
+  # the sample entry's four characters in MP4 / MOV
+  codec: String
+  # FFmpeg's decoder for it
+  decoder: String
+}
+
+func ffmpegCodec(codec: view String, decoder: view String) ret FfmpegCodec {
+  ret FfmpegCodec { codec: "{codec}", decoder: "{decoder}" }
+}
+
+# The codecs this package decodes, by their MP4 / MOV four characters: the ones
+# its build includes (native/build.sh)
+func ffmpegCodecs() ret List(FfmpegCodec) {
+  var codecs: List(FfmpegCodec) = {}
+  codecs.add(value: ffmpegCodec(codec: "AVdh", decoder: "dnxhd"))
+  codecs.add(value: ffmpegCodec(codec: "AVdn", decoder: "dnxhd"))
+  codecs.add(value: ffmpegCodec(codec: "vp08", decoder: "vp8"))
+  codecs.add(value: ffmpegCodec(codec: "vp09", decoder: "vp9"))
+  codecs.add(value: ffmpegCodec(codec: "FFV1", decoder: "ffv1"))
+  codecs.add(value: ffmpegCodec(codec: "apco", decoder: "prores"))
+  codecs.add(value: ffmpegCodec(codec: "apcs", decoder: "prores"))
+  codecs.add(value: ffmpegCodec(codec: "apcn", decoder: "prores"))
+  codecs.add(value: ffmpegCodec(codec: "apch", decoder: "prores"))
+  codecs.add(value: ffmpegCodec(codec: "ap4h", decoder: "prores"))
+  codecs.add(value: ffmpegCodec(codec: "ap4x", decoder: "prores"))
+  ret codecs
+}
+
+# Whether FFmpeg's libraries load (ffmpegProblem says why not)
+func ffmpegAvailable() ret Bool {
+  if Target.os is Os.ios {
+    ret false
+  }
+  unsafe {
+    ret rae_ffmpeg_available() is 1
+  }
+}
+
+# Adds FFmpeg to `table` as the last backend of each codec it decodes, so the
+# platform's decoder stays first where there is one. False when FFmpeg is not
+# available here.
+func addFfmpegBackend(table: mod List(VideoBackendChoice)) ret Bool {
+  if not ffmpegAvailable() {
+    ret false
+  }
+  var number: Int = 0
+  unsafe {
+    number = registerBackend(calls: rae_ffmpeg_backend_calls())
+  }
+  if number is 0 {
+    ret false
+  }
+  loop let entry: FfmpegCodec in ffmpegCodecs() {
+    table.addBackend(
+      codec: entry.codec
+      backend: registeredRef(number: number, codecName: entry.decoder)
+    )
+  }
+  ret true
+}
+
+func ffmpegText(which: view Int) ret String {
+  var bytes: List(UInt8) = List.create(UInt8, cap: 4096)
+  bytes.addDefaults(count: 4096)
+  var length: Int = 0
+  unsafe {
+    length = rae_ffmpeg_text(which: which, into: bytes.data, capacity: 4096)
+  }
+  ret fromBytes(bytes: bytes, start: 0, count: length)
+}
+
+# The loaded FFmpeg's configure line (as its libavcodec reports it)
+func ffmpegConfiguration() ret String {
+  ret ffmpegText(which: 1)
+}
+
+# Its license ("LGPL version 2.1 or later")
+func ffmpegLicense() ret String {
+  ret ffmpegText(which: 2)
+}
+
+func ffmpegVersion() ret String {
+  ret ffmpegText(which: 3)
+}
+
+# Why FFmpeg did not load ("" when it did)
+func ffmpegProblem() ret String {
+  ret ffmpegText(which: 4)
+}

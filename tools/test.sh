@@ -27,5 +27,21 @@ for dir in tests/*/; do
     failed=$((failed + 1))
   fi
 done
+# Checks that are scripts, not programs: tools/check<Name>.sh (on macOS)
+if [ "$(uname -s)" = Darwin ]; then
+  for script in tools/check*.sh; do
+    [ -f "$script" ] || continue
+    name=$(basename "$script" .sh)
+    case "$name" in *"$filter"*) ;; *) continue ;; esac
+    if output=$(sh "$script" 2>&1); then
+      echo "PASS: $name"
+      passed=$((passed + 1))
+    else
+      echo "FAIL: $name"
+      printf '%s\n' "$output" | tail -20
+      failed=$((failed + 1))
+    fi
+  done
+fi
 echo "Results: $passed passed, $failed failed"
 [ "$failed" -eq 0 ]
