@@ -1,0 +1,6 @@
+9 exact thumbnails 160 x 90 (frames 0 7 45 89 33 34 of the H.264 file, 26 3 47 of the HEVC file) each show their frame's counter: true
+a keyframe thumbnail of frame 45 shows frame 29 (it says 29)
+a thumbnail 40 px wide is 40 x 23, 3680 bytes
+a frame past the end gives no thumbnail: tests/media/counter709.mp4 has no frame 900
+no call on this thread took longer than 1 ms: true
+done

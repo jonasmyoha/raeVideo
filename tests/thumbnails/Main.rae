@@ -1,0 +1,156 @@
+# video/Thumbnails: frames made into small RGBA images on a worker thread (the
+# media editor's filmstrip). A thumbnail 160 px wide of a test file still shows
+# the frame counter's 16 cells (tests/media/make.sh) 10 px each, so the test
+# reads the counter from it as blocks, no OCR.
+#
+# 1. Exact thumbnails of frames of the H.264 file (B-frames) and the HEVC file
+#    show their counters; a keyframe thumbnail (`exact: false`) of frame 45
+#    shows frame 29, the keyframe it is decoded from, and says so.
+# 2. Thumbnails 40 px wide are 40 x 23.
+# 3. While they are made, no call on this thread (asking, taking) takes longer
+#    than 1 ms: the decoding, the GPU work and the readback are the worker's.
+open video/Thumbnails
+open video/VideoBackends
+open webgpu/Context
+
+type Asked {
+  requestId: Int
+  path: String
+  frameIndex: Int
+  exact: Bool
+  width: Int
+}
+
+func counterOf(thumbnail: view Thumbnail) ret Int {
+  let row: Int = thumbnail.height * 3 / 4 + thumbnail.height / 16
+  var value: Int = 0
+  loop var bit: Int = 0, bit < 16, ++bit {
+    let x: Int = bit * thumbnail.width / 16 + thumbnail.width / 32
+    value = value * 2
+    if (thumbnail.pixels.copyAtDefault(index: (row * thumbnail.width + x) * 4) as Int) > 128 {
+      value = value + 1
+    }
+  }
+  ret value
+}
+
+func main() ret Int {
+  var ready: Int = 0
+  unsafe {
+    ready = webgpuBootstrap()
+  }
+  if ready is not 1 {
+    log("SKIP: no GPU")
+    ret 0
+  }
+  var maker: ThumbnailMaker = startThumbnailMaker(table: defaultVideoBackends())
+  var asked: List(Asked) = {}
+  var longestCall: Int = 0
+  let frames: List(Int) = List(Int) {
+    0
+    7
+    45
+    89
+    33
+    34
+  }
+  loop let frameIndex: Int in frames {
+    let callStart: Int = nowNs()
+    let requestId: Int = maker.requestThumbnail(
+      path: "tests/media/counter709.mp4"
+      frameIndex: frameIndex
+      exact: true
+      width: 160
+    )
+    longestCall = max(a: longestCall, b: nowNs() - callStart)
+    asked.add(value: {
+      requestId: requestId
+      path: "counter709.mp4"
+      frameIndex: frameIndex
+      exact: true
+      width: 160
+    })
+  }
+  let hevcFrames: List(Int) = List(Int) { 26, 3, 47 }
+  loop let frameIndex: Int in hevcFrames {
+    let requestId: Int = maker.requestThumbnail(
+      path: "tests/media/counterHevc.mp4"
+      frameIndex: frameIndex
+      exact: true
+      width: 160
+    )
+    asked.add(value: {
+      requestId: requestId
+      path: "counterHevc.mp4"
+      frameIndex: frameIndex
+      exact: true
+      width: 160
+    })
+  }
+  let keyframeId: Int = maker.requestThumbnail(
+    path: "tests/media/counter709.mp4"
+    frameIndex: 45
+    exact: false
+    width: 160
+  )
+  let smallId: Int = maker.requestThumbnail(
+    path: "tests/media/counter709.mp4"
+    frameIndex: 12
+    exact: true
+    width: 40
+  )
+  let missingId: Int = maker.requestThumbnail(
+    path: "tests/media/counter709.mp4"
+    frameIndex: 900
+    exact: true
+    width: 160
+  )
+  var exactRight: Int = 0
+  var exactCount: Int = 0
+  var keyframeLine: String = "the keyframe thumbnail never came"
+  var smallLine: String = "the 40 px thumbnail never came"
+  var missingLine: String = "the thumbnail of a frame past the end never came"
+  var arrived: Int = 0
+  var waited: Int = 0
+  loop arrived < asked.length() + 3 and waited < 20000 {
+    let callStart: Int = nowNs()
+    if let thumbnail: Thumbnail = maker.takeThumbnail() {
+      longestCall = max(a: longestCall, b: nowNs() - callStart)
+      arrived = arrived + 1
+      if thumbnail.requestId is keyframeId {
+        keyframeLine = "a keyframe thumbnail of frame 45 shows frame {counterOf(
+          thumbnail: thumbnail
+        )} (it says {thumbnail.shownFrame})"
+      } else if thumbnail.requestId is smallId {
+        smallLine = "a thumbnail 40 px wide is {thumbnail.width} x {thumbnail.height}, {thumbnail.pixels.length()} bytes"
+      } else if thumbnail.requestId is missingId {
+        missingLine = "a frame past the end gives no thumbnail: {thumbnail.error}"
+      } else {
+        exactCount = exactCount + 1
+        loop let entry: view Asked in asked {
+          if entry.requestId is thumbnail.requestId and counterOf(thumbnail: thumbnail) is entry.frameIndex and thumbnail.width is 160 and thumbnail.height is 90 {
+            exactRight = exactRight + 1
+          }
+        }
+      }
+    } else {
+      longestCall = max(a: longestCall, b: nowNs() - callStart)
+      sleep(ms: 1)
+      waited = waited + 1
+    }
+  }
+  log(
+    "{exactCount} exact thumbnails 160 x 90 (frames 0 7 45 89 33 34 of the H.264 file, 26 3 47 of the HEVC file) each show their frame's counter: {exactRight is asked.length()}"
+  )
+  log(keyframeLine)
+  log(smallLine)
+  log(missingLine)
+  log("no call on this thread took longer than 1 ms: {longestCall < 1000000}")
+  maker.stopThumbnailMaker()
+  if exactRight is not asked.length() or longestCall >= 1000000 {
+    log("FAIL")
+    ret 1
+  }
+  log("done")
+  ret 0
+}

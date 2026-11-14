@@ -1,0 +1,104 @@
+# Thumbnails of a 4K file, measured (video/Thumbnails; docs/measurements.md):
+# not a test (it needs `sh tests/media/make.sh 4k`), a measurement to run by
+# hand.
+#
+#   ./rae run checks/thumbnails4k/Main.rae
+#   ./rae run checks/thumbnails4k/Main.rae -- build/media/counter4kHevc.mp4
+#   ./rae run checks/thumbnails4k/Main.rae -- build/media/counter4k.mp4 keyframes
+#
+# 100 exact thumbnails, 160 px wide, of frames spread over the 4K file are asked
+# for at once, and this thread then runs a 60 Hz loop taking them as they come,
+# as an editor's frame loop would. Every call on this thread (asking, taking) is
+# timed: none may take 1 ms. Every thumbnail's counter is read (its 16 cells are
+# 10 px each at 160 px) and must be its frame's (with `keyframes`, the frame
+# the thumbnail says it shows: the keyframe each frame is decoded from).
+import Math
+open Sys
+open Time
+open video/Thumbnails
+open video/VideoBackends
+open webgpu/Context
+
+func counterOf(thumbnail: view Thumbnail) ret Int {
+  let row: Int = thumbnail.height * 3 / 4 + thumbnail.height / 16
+  var value: Int = 0
+  loop var bit: Int = 0, bit < 16, ++bit {
+    let x: Int = bit * thumbnail.width / 16 + thumbnail.width / 32
+    value = value * 2
+    if (thumbnail.pixels.copyAtDefault(index: (row * thumbnail.width + x) * 4) as Int) > 128 {
+      value = value + 1
+    }
+  }
+  ret value
+}
+
+func main() ret Int {
+  var path: String = "build/media/counter4k.mp4"
+  if argCount() > 0 {
+    path = argAt(index: 0)
+  }
+  let exact: Bool = not (argCount() > 1 and argAt(index: 1) is "keyframes")
+  var kind: String = "exact"
+  if not exact {
+    kind = "keyframe"
+  }
+  var ready: Int = 0
+  unsafe {
+    ready = webgpuBootstrap()
+  }
+  if ready is not 1 {
+    log("no GPU")
+    ret 1
+  }
+  var maker: ThumbnailMaker = startThumbnailMaker(table: defaultVideoBackends())
+  var longestCall: Int = 0
+  let started: Int = nowNs()
+  loop var i: Int = 0, i < 100, ++i {
+    let callStart: Int = nowNs()
+    let requestId: Int = maker.requestThumbnail(
+      path: path
+      frameIndex: i * 3
+      exact: exact
+      width: 160
+    )
+    longestCall = max(a: longestCall, b: nowNs() - callStart)
+  }
+  var arrived: Int = 0
+  var right: Int = 0
+  var failed: String = ""
+  var refreshes: Int = 0
+  var lateWakes: Int = 0
+  loop arrived < 100 and refreshes < 60 * 120 {
+    refreshes = refreshes + 1
+    let deadline: Int = started + refreshes * 16666667
+    waitUntil(deadlineNs: deadline)
+    if nowNs() - deadline > 1000000 {
+      lateWakes = lateWakes + 1
+    }
+    var taking: Bool = true
+    loop taking {
+      let callStart: Int = nowNs()
+      if let thumbnail: Thumbnail = maker.takeThumbnail() {
+        longestCall = max(a: longestCall, b: nowNs() - callStart)
+        arrived = arrived + 1
+        if thumbnail.error.length() > 0 {
+          failed = "{thumbnail.error}"
+        } else if counterOf(thumbnail: thumbnail) is thumbnail.shownFrame and (not exact or thumbnail.shownFrame is thumbnail.frameIndex) {
+          right = right + 1
+        }
+      } else {
+        longestCall = max(a: longestCall, b: nowNs() - callStart)
+        taking = false
+      }
+    }
+  }
+  let seconds: Int = (nowNs() - started) / 1000000
+  log("{path}: 100 {kind} thumbnails 160 px wide, asked at once, taken in a 60 Hz loop")
+  log("  arrived {arrived}, showing the frame they say: {right} {failed}")
+  log("  all made in {seconds} ms ({seconds / 100} ms each on the worker)")
+  log(
+    "  the longest call on this thread: {longestCall / 1000} us; refreshes woken more than 1 ms late: {lateWakes} of {refreshes}"
+  )
+  maker.stopThumbnailMaker()
+  ret 0
+}

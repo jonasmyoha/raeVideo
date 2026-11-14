@@ -108,3 +108,37 @@ frame (the next one repeating it). `VideoPlayer.frameToShow` now calls a refresh
 landing within 2 ms after a frame's start, two frames after the one shown,
 jitter, and shows the frame in between: one frame per refresh, at most 2 ms
 behind the clock. Before it, 1 or 2 frames of 600 were skipped in some runs.
+
+## Thumbnails of a 4K file — 2026-11-15
+
+What it measures: `checks/thumbnails4k/Main.rae`, run by hand after
+`sh tests/media/make.sh 4k`.
+
+    ./rae run checks/thumbnails4k/Main.rae -- build/media/counter4k.mp4
+    ./rae run checks/thumbnails4k/Main.rae -- build/media/counter4k.mp4 keyframes
+
+100 thumbnails 160 px wide, of frames 0, 3, ... 297 of the 3840x2160 file, are
+asked of `video/Thumbnails` at once; this thread then runs a 60 Hz loop taking
+them as they come, as an editor's frame loop would, and times every call it
+makes (asking, taking). The worker thread decodes each frame (the exact one, or
+with `keyframes` the keyframe it is decoded from), converts it to RGBA and
+scales it down on the GPU with a GPU manager of its own, and reads it back.
+Every thumbnail's counter is read from it (its 16 cells are 10 px each at
+160 px) and is the frame it says it shows. Apple M1 Max, macOS 27.0.
+
+| file | kind | all 100 made in | each, on the worker | longest call on the calling thread | refreshes woken over 1 ms late |
+|---|---|---|---|---|---|
+| H.264 | exact | 1533 ms | 15 ms | 3 µs | 2 of 92 |
+| H.264 | exact | 1250 ms | 12 ms | 14 µs | 0 of 75 |
+| HEVC | exact | 1383 ms | 13 ms | 2 µs | 0 of 83 |
+| HEVC | exact | 1250 ms | 12 ms | 3 µs | 0 of 75 |
+| H.264 | keyframe | 1083 ms | 10 ms | 3 µs | 0 of 65 |
+| HEVC | keyframe | 866 ms | 8 ms | 1 µs | 0 of 52 |
+
+All 600 thumbnails showed the frame they say. The calling thread never waits:
+asking and taking are channel operations of a few microseconds (the bar was
+1 ms). The two late wakes of one run are the OS scheduling the loop's sleep,
+not a call (the longest call of that run was 3 µs). Most of a thumbnail's time
+is the 4K frame's conversion and the wait for the readback on the worker; a
+keyframe thumbnail saves the decode of the frames between the keyframe and the
+frame.

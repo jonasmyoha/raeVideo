@@ -539,7 +539,10 @@ Depends on the audio steps for its clock (audio 1/6 to 4/6).
    in `packages/video`'s frame pipeline, **landed 2026-11-15** as
    `FramePipeline`: decode-ahead on a worker thread per file, a GPU frame cache
    with a budget, scrub, the conversion recorded into the caller's recording;
-   4K at 59.94 fps plays with no frame skipped, [measurements.md](measurements.md); the timeline ECS, proxies and the
+   4K at 59.94 fps plays with no frame skipped, [measurements.md](measurements.md);
+   and thumbnails, **landed 2026-11-15** as `Thumbnails`: a frame decoded,
+   scaled down on the GPU and read back on a worker thread, keyframes or exact
+   frames, the calling thread never waiting; the timeline ECS, proxies and the
    simple composite of layers, opacity, cross dissolve and titles in
    `mediaeditor`).
 4. **Export.** VideoToolbox encode (H.264, HEVC, ProRes) and the MP4/MOV writer

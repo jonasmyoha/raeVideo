@@ -1,0 +1,468 @@
+# video/Thumbnails — small RGBA images of frames, made on a worker thread
+# (asked by the media editor's filmstrip: its docs/video-design.md §4).
+#
+#     var maker: ThumbnailMaker = startThumbnailMaker(table: defaultVideoBackends())
+#     let requestId: Int = maker.requestThumbnail(path: "clip.mov", frameIndex: 120, exact: false,
+#     width: 160)
+#     # each frame, never waiting:
+#     if let thumbnail: Thumbnail = maker.takeThumbnail() { ... thumbnail.pixels ... }
+#     maker.stopThumbnailMaker()
+#
+# The calling thread only sends a request and takes a finished thumbnail, two
+# channel operations (microseconds). The worker does the rest, in the order
+# asked: it keeps the last few files open (their FrameStreams), decodes the
+# frame (`exact: false` takes the keyframe it would be decoded from, the fast
+# way, and says which frame that is; `exact: true` decodes the frame itself),
+# converts it to RGBA and scales it to `width` (the height keeps the picture's
+# aspect) on the GPU, with a GPU resource manager of its own, and reads the
+# result back. The caller keeps the bytes (the editor on disk, by the media's
+# content hash). The GPU must have been set up first (webgpuBootstrap).
+import Math
+open Atomic
+open Channel
+open gpu/GpuCompute
+open gpu/GpuIds
+open gpu/GpuLifetime
+open gpu/GpuResources
+open video/FrameStream
+open video/VideoBackends
+open video/VideoDecoder
+open video/YuvPicture
+open webgpu/WebgpuEnums
+
+# Files kept open on the worker; the one used longest ago is closed for a new one
+const openFilesKept: Int = 4
+
+type ThumbnailRequest {
+  requestId: Int
+  path: String
+  frameIndex: Int
+  exact: Bool
+  width: Int
+}
+
+type Thumbnail {
+  requestId: Int
+  path: String
+  # the frame asked for, and the frame shown (its keyframe when not exact)
+  frameIndex: Int
+  shownFrame: Int
+  width: Int
+  height: Int
+  # RGBA, rows packed (width x 4 bytes each); empty when `error` says why
+  pixels: List(UInt8)
+  error: String
+}
+
+type ThumbnailMaker {
+  requests: Channel(ThumbnailRequest)
+  results: Channel(Thumbnail)
+  running: Atomic(Bool)
+  worker: Task(Int)
+  nextRequestId: Int
+  stopped: Bool
+}
+
+func startThumbnailMaker(table: view List(VideoBackendChoice)) ret ThumbnailMaker {
+  let requests: Channel(ThumbnailRequest) = createChannel(ThumbnailRequest)
+  let results: Channel(Thumbnail) = createChannel(Thumbnail)
+  let running: Atomic(Bool) = createAtomic(Bool, value: true)
+  var tableCopy: List(VideoBackendChoice) = {}
+  loop let entry: VideoBackendChoice in table {
+    tableCopy.add(value: entry)
+  }
+  var worker: Task(Int) = spawn thread thumbnailWorker(
+    table: own tableCopy
+    requests: requests
+    results: results
+    running: running
+  )
+  ret ThumbnailMaker {
+    requests: requests
+    results: results
+    running: running
+    worker: own worker
+    nextRequestId: 1
+    stopped: false
+  }
+}
+
+# Asks for a thumbnail: its request id (the thumbnail carries it)
+func requestThumbnail(
+  this: mod ThumbnailMaker
+  path: view String
+  frameIndex: view Int
+  exact: view Bool
+  width: view Int
+) ret Int {
+  let requestId: Int = this.nextRequestId
+  this.nextRequestId = this.nextRequestId + 1
+  this.requests.channelSend(value: ThumbnailRequest {
+    requestId: requestId
+    path: "{path}"
+    frameIndex: frameIndex
+    exact: exact
+    width: width
+  })
+  ret requestId
+}
+
+# A finished thumbnail, if one is ready; never waits
+func takeThumbnail(this: mod ThumbnailMaker) ret opt Thumbnail {
+  if this.results.pending() is 0 {
+    ret none
+  }
+  ret this.results.receive()
+}
+
+# Ends the worker (after the thumbnail it is making) and drops the ones not
+# taken
+func stopThumbnailMaker(this: mod ThumbnailMaker) {
+  if this.stopped {
+    ret
+  }
+  this.stopped = true
+  this.running.store(value: false)
+  let made: Int = this.worker.get()
+  this.requests.freeChannel()
+  this.results.freeChannel()
+  this.running.freeAtomic()
+}
+
+# ----- the worker -----
+type OpenFile {
+  path: String
+  stream: FrameStream
+  lastUsed: Int
+}
+
+# A converted frame's picture and the scaling pass from it to one thumbnail size
+type Scaler {
+  sourceWidth: Int
+  sourceHeight: Int
+  layout: FrameLayout
+  width: Int
+  height: Int
+  picture: YuvPicture
+  thumbnail: TextureId
+  thumbnailView: TextureViewId
+  parameters: BufferId
+  bounds: ComputeBounds
+  pipeline: PipelineId
+  bindGroup: BindGroupId
+}
+
+func failedThumbnail(request: view ThumbnailRequest, error: view String) ret Thumbnail {
+  ret Thumbnail {
+    requestId: request.requestId
+    path: "{request.path}"
+    frameIndex: request.frameIndex
+    shownFrame: -1
+    width: 0
+    height: 0
+    pixels: {}
+    error: "{error}"
+  }
+}
+
+func addSizeWord(bytes: mod List(UInt8), word: view Int) {
+  loop var i: Int = 0, i < 4, ++i {
+    bytes.add(value: ((word shr (i * 8)) bitand 255) as UInt8)
+  }
+}
+
+func createScaler(
+  resources: mod GpuResources
+  sourceWidth: view Int
+  sourceHeight: view Int
+  layout: view FrameLayout
+  width: view Int
+  height: view Int
+) ret opt Scaler {
+  let scaling: Shader = shader(files: ["lib/gpu/computeBounds.wgsl", "thumbnail.wgsl"])
+  if let picture: YuvPicture = createYuvPicture(
+    resources: resources
+    width: sourceWidth
+    height: sourceHeight
+    layout: layout
+  ) {
+    if let thumbnail: TextureId = createTexture(
+      resources: resources
+      width: width
+      height: height
+      format: WGPUTextureFormat_RGBA8Unorm
+      usage: WGPUTextureUsage_StorageBinding + WGPUTextureUsage_CopySrc
+    ) {
+      if let thumbnailView: TextureViewId = createTextureView(
+        resources: resources
+        texture: thumbnail
+      ) {
+        if let parameters: BufferId = createBuffer(
+          resources: resources
+          size: 16
+          usage: WGPUBufferUsage_Uniform + WGPUBufferUsage_CopyDst
+        ) {
+          var sizes: List(UInt8) = List.create(UInt8, cap: 16)
+          addSizeWord(bytes: sizes, word: sourceWidth)
+          addSizeWord(bytes: sizes, word: sourceHeight)
+          addSizeWord(bytes: sizes, word: width)
+          addSizeWord(bytes: sizes, word: height)
+          if writeBuffer(
+            resources: resources
+            id: parameters
+            offset: 0
+            bytes: sizes
+          ) {
+            if let bounds: ComputeBounds = createComputeBounds(
+              resources: resources
+              workgroupSize: 64
+            ) {
+              if let pipeline: PipelineId = createBoundedComputePipeline(
+                resources: resources
+                wgsl: scaling.text
+                entryPoint: "main"
+                bounds: bounds
+              ) {
+                var buffers: List(BufferId) = {}
+                buffers.add(value: parameters)
+                var views: List(TextureViewId) = {}
+                views.add(value: picture.pictureView)
+                views.add(value: thumbnailView)
+                let noSamplers: List(SamplerId) = {}
+                if let bindGroup: BindGroupId = createBoundedBindGroup(
+                  resources: resources
+                  pipeline: pipeline
+                  bounds: bounds
+                  buffers: buffers
+                  textureViews: views
+                  samplers: noSamplers
+                ) {
+                  ret Scaler {
+                    sourceWidth: sourceWidth
+                    sourceHeight: sourceHeight
+                    layout: layout
+                    width: width
+                    height: height
+                    picture: own picture
+                    thumbnail: thumbnail
+                    thumbnailView: thumbnailView
+                    parameters: parameters
+                    bounds: bounds
+                    pipeline: pipeline
+                    bindGroup: bindGroup
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  ret none
+}
+
+# The index of the open file, opening it (and closing the one used longest
+# ago when too many are open)
+func openFileIndex(
+  files: mod List(OpenFile)
+  path: view String
+  table: view List(VideoBackendChoice)
+  tick: view Int
+) ret Int {
+  loop var i: Int = 0, i < files.length(), ++i {
+    if let file: mod OpenFile = files.modAt(index: i) {
+      if file.path is path {
+        file.lastUsed = tick
+        ret i
+      }
+    }
+  }
+  if files.length() >= openFilesKept {
+    var oldest: Int = 0
+    var oldestTick: Int = tick
+    loop var i: Int = 0, i < files.length(), ++i {
+      if let file: view OpenFile = files.viewAt(index: i) {
+        if file.lastUsed < oldestTick {
+          oldest = i
+          oldestTick = file.lastUsed
+        }
+      }
+    }
+    if let file: mod OpenFile = files.modAt(index: oldest) {
+      file.stream.close()
+    }
+    files.remove(index: oldest)
+  }
+  files.add(
+    value: OpenFile {
+      path: "{path}"
+      stream: openFrameStream(path: path, table: table)
+      lastUsed: tick
+    }
+  )
+  ret files.length() - 1
+}
+
+# The scaler for this source and thumbnail size, made when there is none
+func scalerIndex(
+  scalers: mod List(Scaler)
+  resources: mod GpuResources
+  frame: view VideoFrame
+  width: view Int
+  height: view Int
+) ret Int {
+  loop var i: Int = 0, i < scalers.length(), ++i {
+    if let scaler: view Scaler = scalers.viewAt(index: i) {
+      if scaler.sourceWidth is frame.width and scaler.sourceHeight is frame.height and scaler.layout is frame.layout and scaler.width is width and scaler.height is height {
+        ret i
+      }
+    }
+  }
+  if let scaler: Scaler = createScaler(
+    resources: resources
+    sourceWidth: frame.width
+    sourceHeight: frame.height
+    layout: frame.layout
+    width: width
+    height: height
+  ) {
+    scalers.add(value: own scaler)
+    ret scalers.length() - 1
+  }
+  ret -1
+}
+
+# One thumbnail, on the worker
+func makeThumbnail(
+  request: view ThumbnailRequest
+  files: mod List(OpenFile)
+  scalers: mod List(Scaler)
+  resources: mod GpuResources
+  table: view List(VideoBackendChoice)
+  tick: view Int
+) ret Thumbnail {
+  let fileIndex: Int = openFileIndex(
+    files: files
+    path: request.path
+    table: table
+    tick: tick
+  )
+  var shownFrame: Int = request.frameIndex
+  var frame: VideoFrame = noVideoFrame()
+  if let file: mod OpenFile = files.modAt(index: fileIndex) {
+    if file.stream.error.length() > 0 {
+      ret failedThumbnail(request: request, error: file.stream.error)
+    }
+    if request.frameIndex < 0 or request.frameIndex >= file.stream.frameCount() {
+      ret failedThumbnail(
+        request: request
+        error: "{request.path} has no frame {request.frameIndex}"
+      )
+    }
+    if not request.exact {
+      shownFrame = file.stream.keyframeIndexOf(frameIndex: request.frameIndex)
+    }
+    frame = file.stream.takeFrame(frameIndex: shownFrame)
+  }
+  if frame.handle is 0 {
+    ret failedThumbnail(request: request, error: "frame {shownFrame} could not be decoded")
+  }
+  let width: Int = max(a: 1, b: request.width)
+  let height: Int = max(
+    a: 1
+    b: (frame.height * width + frame.width / 2) / max(a: 1, b: frame.width)
+  )
+  let index: Int = scalerIndex(
+    scalers: scalers
+    resources: resources
+    frame: frame
+    width: width
+    height: height
+  )
+  var made: Bool = false
+  var pixels: List(UInt8) = {}
+  if let scaler: mod Scaler = scalers.modAt(index: index) {
+    if scaler.picture.uploadFrame(resources: resources, frame: frame) {
+      if var recording: Recording = beginRecording(resources: resources) {
+        let converted: Bool = scaler.picture.recordConversion(
+          recording: recording
+          resources: resources
+        )
+        let scaled: Bool = recordBoundedCompute(
+          recording: recording
+          resources: resources
+          pipeline: scaler.pipeline
+          bindGroup: scaler.bindGroup
+          bounds: scaler.bounds
+          elementCount: width * height
+        )
+        if let submission: SubmissionId = submit(resources: resources, recording: recording) {
+          made = converted and scaled and awaitSubmission(resources: resources, id: submission)
+        }
+      }
+    }
+    if made {
+      pixels = readTexture(
+        resources: resources
+        texture: scaler.thumbnail
+        width: width
+        height: height
+      )
+    }
+  }
+  releaseFrame(frame: frame)
+  if not made or pixels.length() is 0 {
+    ret failedThumbnail(request: request, error: "the GPU could not make it")
+  }
+  ret Thumbnail {
+    requestId: request.requestId
+    path: "{request.path}"
+    frameIndex: request.frameIndex
+    shownFrame: shownFrame
+    width: width
+    height: height
+    pixels: own pixels
+    error: ""
+  }
+}
+
+# The thread's body (`spawn thread thumbnailWorker(...)`): the number of
+# thumbnails it made
+func thumbnailWorker(
+  table: own List(VideoBackendChoice)
+  requests: own Channel(ThumbnailRequest)
+  results: own Channel(Thumbnail)
+  running: own Atomic(Bool)
+) ret Int {
+  var files: List(OpenFile) = {}
+  var scalers: List(Scaler) = {}
+  var made: Int = 0
+  var tick: Int = 0
+  var issuer: IdIssuer = IdIssuer.create()
+  if var resources: GpuResources = GpuResources.create(issuer: issuer, capacity: 256) {
+    loop running.load() {
+      if requests.pending() is 0 {
+        sleep(ms: 1)
+      } else {
+        let request: ThumbnailRequest = requests.receive()
+        tick = tick + 1
+        results.channelSend(value: makeThumbnail(
+          request: request
+          files: files
+          scalers: scalers
+          resources: resources
+          table: table
+          tick: tick
+        ))
+        made = made + 1
+      }
+    }
+  }
+  loop var i: Int = 0, i < files.length(), ++i {
+    if let file: mod OpenFile = files.modAt(index: i) {
+      file.stream.close()
+    }
+  }
+  ret made
+}
