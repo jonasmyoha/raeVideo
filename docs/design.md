@@ -525,9 +525,13 @@ Depends on the audio steps for its clock (audio 1/6 to 4/6).
    `VideoDecoder` (VideoToolbox), `FrameStream`, `YuvPicture` (the copy path and
    `yuvToRgb.wgsl`), `VideoPlayer`; tests in `tests/` (demux against ffprobe,
    the frame counter, the bars through the GPU, the player against the audio
-   clock), the 4K measurement in [measurements.md](measurements.md). Not yet:
-   10-bit frames (decoded to 8-bit NV12 for now), filtered chroma upsampling,
-   the transfer to linear (step 2). `MediaReader` over Rae's MP4/MOV demuxer, VideoToolbox
+   clock), the 4K measurement in [measurements.md](measurements.md). **Then,
+   2026-11-15:** 10-bit frames (HEVC Main10 and ProRes 422 as 16-bit samples,
+   `FrameDepth.source`), bilinear chroma upsampling with the MPEG-2 siting, and
+   the transfer to linear (BT.709 / BT.2020, PQ, HLG, sRGB) into rgba16float in
+   the source's gamut: `LinearPicture` and `linearCommon.wgsl`, whose curves
+   move to `lib/color` when it is written (§8.2). The display path
+   (`YuvPicture`) stays 8-bit R'G'B'. `MediaReader` over Rae's MP4/MOV demuxer, VideoToolbox
    decode (H.264, HEVC, ProRes), the copy path to textures, the YUV to RGB
    shader with tags, rational time, a simple player synced to the audio engine;
    demux and decode tests. Measure the copy path at 4K (decides §12 V3).

@@ -1,0 +1,24 @@
+ramp10Hevc.mp4: 10-bit, two planes 4:2:0, full range
+  the ramp decodes to 1024 distinct codes of 1024, each its column's: true
+  through the linear pass the ramp keeps 1024 distinct rising values of 1024
+  the bars' linear light is within 3e-3 of the drawn 75% bars: true
+  BT.709: the bars and their edges match the reference within 1e-3: true
+  PQ: the bars and their edges match the reference within 1e-3: true
+  HLG: the bars and their edges match the reference within 1e-3: true
+  sRGB: the bars and their edges match the reference within 1e-3: true
+ramp10Prores.mov: 10-bit, two planes 4:2:2, limited range
+  the ramp decodes to 877 distinct codes of 877, each its column's: true
+  through the linear pass the ramp keeps 877 distinct rising values of 877
+  the bars' linear light is within 3e-3 of the drawn 75% bars: true
+  BT.709: the bars and their edges match the reference within 1e-3: true
+  PQ: the bars and their edges match the reference within 1e-3: true
+  HLG: the bars and their edges match the reference within 1e-3: true
+  sRGB: the bars and their edges match the reference within 1e-3: true
+counter709.mp4: 8-bit, two planes 4:2:0, limited range
+  the bars' linear light is within 3e-2 of the drawn 75% bars: true
+  BT.709: the bars and their edges match the reference within 1e-3: true
+  PQ: the bars and their edges match the reference within 1e-3: true
+  HLG: the bars and their edges match the reference within 1e-3: true
+  sRGB: the bars and their edges match the reference within 1e-3: true
+the HEVC ramp decoded at 8 bits instead keeps 256 distinct codes of 1024: banded true
+done

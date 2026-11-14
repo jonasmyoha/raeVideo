@@ -248,6 +248,9 @@ int64_t rae_video_vt_available(void) { return rae_video_ready() ? 1 : 0; }
 
 /* The tags for the next rae_video_vt_open on this thread (-1: not given) */
 static _Thread_local int64_t g_rae_video_tags[4] = {-1, -1, -1, -1};
+static _Thread_local int64_t g_rae_video_output = 0;
+
+void rae_video_vt_set_output(int64_t output) { g_rae_video_output = output; }
 
 void rae_video_vt_set_color_tags(int64_t primaries, int64_t transfer, int64_t matrix,
                                  int64_t full_range) {
@@ -367,10 +370,17 @@ int64_t rae_video_vt_open(int64_t codec, int64_t width, int64_t height, uint8_t*
 
   /* NV12, limited or full range as the stream is: VideoToolbox takes the
    * first of the list it can give without converting the range */
-  CFNumberRef formats[2] = {
-      rae_video_number(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-      rae_video_number(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
-  };
+  int32_t limited = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+  int32_t full = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+  if (g_rae_video_output == 1) {
+    limited = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
+    full = kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
+  } else if (g_rae_video_output == 2) {
+    limited = kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange;
+    full = kCVPixelFormatType_422YpCbCr10BiPlanarFullRange;
+  }
+  g_rae_video_output = 0;
+  CFNumberRef formats[2] = {rae_video_number(limited), rae_video_number(full)};
   CFArrayRef formatList = p_CFArrayCreate(NULL, (const void**)formats, 2, c_kCFTypeArrayCallBacks);
   CFMutableDictionaryRef attributes = p_CFDictionaryCreateMutable(
       NULL, 0, c_kCFTypeDictionaryKeyCallBacks, c_kCFTypeDictionaryValueCallBacks);
@@ -569,6 +579,7 @@ void rae_video_vt_set_color_tags(int64_t primaries, int64_t transfer, int64_t ma
                                  int64_t full_range) {
   (void)primaries; (void)transfer; (void)matrix; (void)full_range;
 }
+void rae_video_vt_set_output(int64_t output) { (void)output; }
 int64_t rae_video_frame_width(int64_t frame) { (void)frame; return 0; }
 int64_t rae_video_frame_height(int64_t frame) { (void)frame; return 0; }
 int64_t rae_video_frame_pixel_format(int64_t frame) { (void)frame; return 0; }

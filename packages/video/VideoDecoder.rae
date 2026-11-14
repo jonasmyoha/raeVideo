@@ -58,7 +58,15 @@ enum FrameLayout {
   planar420
   planar422
   planar444
+  # Y, then CbCr interleaved at half width and full height (VideoToolbox's
+  # 10-bit 4:2:2, ProRes)
+  biplanar422
 }
+
+# The frames a decoder hands out: 8-bit always (what the 8-bit display pass,
+# YuvPicture, and the frame cache take), or the source's own depth (10-bit for
+# HEVC Main10 and ProRes 422, as 16-bit samples: video/LinearPicture)
+enum FrameDepth { eightBit, source }
 
 type VideoFrame {
   # the backend's frame (a CVPixelBuffer from VideoToolbox); 0 for none
@@ -71,6 +79,8 @@ type VideoFrame {
   width: Int
   height: Int
   layout: FrameLayout
+  # 8, or 10: then each sample is 16 bits with the code in the top 10
+  bitDepth: Int
   # VideoToolbox's pixel format as its four characters ("420v", "420f"); 0
   # for a registered backend's frame
   pixelFormat: Int
@@ -105,6 +115,7 @@ func noVideoFrame() ret VideoFrame {
     width: 0
     height: 0
     layout: FrameLayout.unsupported
+    bitDepth: 8
     pixelFormat: 0
     fullRange: false
     matrix: YuvMatrix.unknown
@@ -137,7 +148,30 @@ func configBytes(track: view Mp4Track) ret List(UInt8) {
   ret config
 }
 
-func openVideoToolbox(track: view Mp4Track, tags: view ColorTags) ret Int {
+# What VideoToolbox is asked to hand out for this track (native/rae_video.h):
+# 0 8-bit 4:2:0; with the source's depth, 1 10-bit 4:2:0 for an HEVC stream
+# of more than 8 bits (its hvcC says), 2 10-bit 4:2:2 for ProRes 422 (Proxy,
+# LT, 422, HQ: 10-bit 4:2:2 by definition). ProRes 4444 stays 8-bit for now.
+func videoToolboxOutputFor(track: view Mp4Track, depth: view FrameDepth) ret Int {
+  if depth is FrameDepth.eightBit {
+    ret 0
+  }
+  if track.codec is "hvc1" or track.codec is "hev1" {
+    if track.codecConfig.length() > 17 {
+      let lumaBits: Int = 8 + ((track.codecConfig.copyAtDefault(index: 17) as Int) bitand 7)
+      if lumaBits > 8 {
+        ret 1
+      }
+    }
+    ret 0
+  }
+  if track.codec is "apco" or track.codec is "apcs" or track.codec is "apcn" or track.codec is "apch" {
+    ret 2
+  }
+  ret 0
+}
+
+func openVideoToolbox(track: view Mp4Track, tags: view ColorTags, output: view Int) ret Int {
   let kind: String = configKindOf(codec: track.codec)
   let config: List(UInt8) = configBytes(track: track)
   var kindCode: Int = 0
@@ -157,6 +191,7 @@ func openVideoToolbox(track: view Mp4Track, tags: view ColorTags) ret Int {
         fullRange: fullRange
       )
     }
+    rae_video_vt_set_output(output: output)
     ret rae_video_vt_open(
       codec: fourCharacterCode(text: track.codec)
       width: track.width
@@ -192,6 +227,22 @@ func openVideoDecoder(
   tags: view ColorTags
   table: view List(VideoBackendChoice)
 ) ret VideoDecoder {
+  ret openVideoDecoderWithDepth(
+    track: track
+    tags: tags
+    table: table
+    depth: FrameDepth.eightBit
+  )
+}
+
+# The same, its frames at `depth` (VideoToolbox; a registered backend gives
+# what it gives)
+func openVideoDecoderWithDepth(
+  track: view Mp4Track
+  tags: view ColorTags
+  table: view List(VideoBackendChoice)
+  depth: view FrameDepth
+) ret VideoDecoder {
   var decoder: VideoDecoder = {
     backend: VideoBackend.none
     backendNumber: 0
@@ -206,7 +257,11 @@ func openVideoDecoder(
     if decoder.handle is 0 {
       var handle: Int = 0
       if backend.kind is VideoBackend.videoToolbox {
-        handle = openVideoToolbox(track: track, tags: tags)
+        handle = openVideoToolbox(
+          track: track
+          tags: tags
+          output: videoToolboxOutputFor(track: track, depth: depth)
+        )
       } else if backend.kind is VideoBackend.registered {
         handle = openRegistered(track: track, backend: backend)
       }
@@ -359,7 +414,20 @@ func frameOfVideoToolbox(handle: view Int, packet: view MediaPacket) ret VideoFr
     frame.primaries = primariesOfCode(code: rae_video_frame_primaries(frame: handle))
     frame.transfer = transferOfCode(code: rae_video_frame_transfer(frame: handle))
   }
-  frame.fullRange = frame.pixelFormat is fourCharacterCode(text: "420f")
+  let format: Int = frame.pixelFormat
+  frame.fullRange = format is fourCharacterCode(text: "420f") or format is fourCharacterCode(
+    text: "xf20"
+  ) or format is fourCharacterCode(text: "xf22")
+  if format is fourCharacterCode(text: "x420") or format is fourCharacterCode(text: "xf20") {
+    frame.bitDepth = 10
+  } else if format is fourCharacterCode(text: "x422") or format is fourCharacterCode(text: "xf22") {
+    frame.layout = FrameLayout.biplanar422
+    frame.bitDepth = 10
+  } else if format is not fourCharacterCode(text: "420v") and format is not fourCharacterCode(
+    text: "420f"
+  ) {
+    frame.layout = FrameLayout.unsupported
+  }
   ret frame
 }
 
@@ -471,7 +539,7 @@ func releaseFrame(frame: mod VideoFrame) {
 
 # How many planes a layout has
 func planeCountOf(layout: view FrameLayout) ret Int {
-  if layout is FrameLayout.nv12 {
+  if layout is FrameLayout.nv12 or layout is FrameLayout.biplanar422 {
     ret 2
   }
   if layout is FrameLayout.unsupported {
@@ -507,12 +575,17 @@ func chromaHeightDivisor(this: view VideoFrame) ret Int {
   ret chromaHeightDivisorOf(layout: this.layout)
 }
 
-# The bytes per pixel of a plane: 2 for NV12's interleaved CbCr, else 1
+# The bytes per pixel of a plane: two samples for an interleaved CbCr plane,
+# each 2 bytes when the frame is deeper than 8 bits
 func planePixelBytes(this: view VideoFrame, plane: view Int) ret Int {
-  if this.layout is FrameLayout.nv12 and plane is 1 {
-    ret 2
+  var samples: Int = 1
+  if plane is 1 and (this.layout is FrameLayout.nv12 or this.layout is FrameLayout.biplanar422) {
+    samples = 2
   }
-  ret 1
+  if this.bitDepth > 8 {
+    ret samples * 2
+  }
+  ret samples
 }
 
 func planeWidth(this: view VideoFrame, plane: view Int) ret Int {

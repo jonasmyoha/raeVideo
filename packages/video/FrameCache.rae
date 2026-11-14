@@ -316,7 +316,7 @@ func storeFrame(
   pinnedSource: view Int
   pinnedFrame: view Int
 ) ret Bool {
-  if frame.handle is 0 or frame.layout is FrameLayout.unsupported {
+  if frame.handle is 0 or frame.layout is FrameLayout.unsupported or frame.layout is FrameLayout.biplanar422 or frame.bitDepth is not 8 {
     ret false
   }
   if this.contains(sourceNumber: sourceNumber, frameIndex: frameIndex) {

@@ -1,0 +1,350 @@
+# video/LinearPicture — a decoded frame on the GPU as linear RGB in its source's
+# gamut (docs/design.md §7, §8.1): the input side of the color pipeline, what
+# grading and compositing start from. Where video/YuvPicture gives display R'G'B'
+# in 8 bits, this keeps what the file has:
+#
+# - 10-bit frames (from a FrameStream opened with FrameDepth.source: HEVC Main10,
+#   ProRes 422) as 16-bit integer textures (r16uint Y, rg16uint CbCr: the core
+#   WebGPU formats; r16unorm needs a device feature), read as exact codes;
+# - chroma upsampled bilinearly from where its samples are, not the nearest one;
+# - the transfer to linear by the frame's tag (BT.709 / BT.2020, PQ, HLG, sRGB),
+#   into an rgba16float texture (linearCommon.wgsl says the units).
+#
+#     var stream: FrameStream = openFrameStreamWithDepth(path:, table:, depth: FrameDepth.source)
+#     var frame: VideoFrame = stream.takeFrame(frameIndex: 0)
+#     if var linear: LinearPicture = createLinearPicture(resources:, width: frame.width,
+#     height: frame.height, layout: frame.layout, bitDepth: frame.bitDepth) {
+#       if linear.uploadFrame(resources:, frame:) { linear.recordConversion(recording:, resources:)
+#       }
+#     }
+#
+# The gamut stays the source's (BT.709 or BT.2020 primaries, frame.primaries
+# says which): the step to a working space (ACEScg) and the output transform
+# are lib/color's (docs/design.md §8.2), and these curves move there with it.
+import Math
+open gpu/GpuCompute
+open gpu/GpuIds
+open gpu/GpuLifetime
+open gpu/GpuResources
+open video/VideoDecoder
+open video/YuvPicture
+open webgpu/WebgpuEnums
+
+type LinearPicture {
+  width: Int
+  height: Int
+  layout: FrameLayout
+  bitDepth: Int
+  planes: List(TextureId)
+  planeViews: List(TextureViewId)
+  # rgba16float, linear light in the source's gamut
+  picture: TextureId
+  pictureView: TextureViewId
+  parameters: BufferId
+  bounds: ComputeBounds
+  pipeline: PipelineId
+  bindGroup: BindGroupId
+}
+
+# The shader for a layout and depth; the first answer is false when there is
+# none (three planes deeper than 8 bits are not read yet)
+func linearShader(layout: view FrameLayout, bitDepth: view Int) ret Shader {
+  if layout is FrameLayout.nv12 or layout is FrameLayout.biplanar422 {
+    if bitDepth > 8 {
+      ret shader(
+        files: ["lib/gpu/computeBounds.wgsl", "linearCommon.wgsl", "linearTwoPlanes16.wgsl"]
+      )
+    }
+    ret shader(files: ["lib/gpu/computeBounds.wgsl", "linearCommon.wgsl", "linearTwoPlanes8.wgsl"])
+  }
+  ret shader(files: ["lib/gpu/computeBounds.wgsl", "linearCommon.wgsl", "linearThreePlanes8.wgsl"])
+}
+
+func supportsLinear(layout: view FrameLayout, bitDepth: view Int) ret Bool {
+  if layout is FrameLayout.unsupported {
+    ret false
+  }
+  if bitDepth > 8 {
+    ret layout is FrameLayout.nv12 or layout is FrameLayout.biplanar422
+  }
+  ret layout is not FrameLayout.biplanar422
+}
+
+# The transfer code linearCommon.wgsl takes; an untagged frame is taken as
+# BT.709 (as its matrix is guessed, docs/design.md §7)
+func transferCode(transfer: view TransferFunction) ret Int {
+  if transfer is TransferFunction.pq {
+    ret 2
+  }
+  if transfer is TransferFunction.hlg {
+    ret 3
+  }
+  if transfer is TransferFunction.srgb {
+    ret 4
+  }
+  if transfer is TransferFunction.linear {
+    ret 5
+  }
+  ret 1
+}
+
+# The LinearParameters uniform of linearCommon.wgsl (64 bytes)
+func linearParameterBytes(this: view LinearPicture, frame: view VideoFrame) ret List(UInt8) {
+  var bytes: List(UInt8) = List.create(UInt8, cap: 64)
+  var lumaOffset: Float = 16.0
+  var lumaRange: Float = 219.0
+  var chromaOffset: Float = 128.0
+  var chromaRange: Float = 224.0
+  if this.bitDepth > 8 {
+    lumaOffset = 64.0
+    lumaRange = 876.0
+    chromaOffset = 512.0
+    chromaRange = 896.0
+  }
+  if frame.fullRange {
+    lumaOffset = 0.0
+    lumaRange = 255.0
+    chromaRange = 255.0
+    if this.bitDepth > 8 {
+      lumaRange = 1023.0
+      chromaRange = 1023.0
+    }
+  }
+  addFloat(bytes: bytes, value: lumaOffset)
+  addFloat(bytes: bytes, value: lumaRange)
+  addFloat(bytes: bytes, value: chromaOffset)
+  addFloat(bytes: bytes, value: chromaRange)
+  let coefficients: YuvCoefficients = matrixCoefficients(matrix: effectiveMatrix(frame: frame))
+  addFloat(bytes: bytes, value: coefficients.crToRed)
+  addFloat(bytes: bytes, value: coefficients.cbToGreen)
+  addFloat(bytes: bytes, value: coefficients.crToGreen)
+  addFloat(bytes: bytes, value: coefficients.cbToBlue)
+  addWord(bytes: bytes, word: this.width)
+  addWord(bytes: bytes, word: this.height)
+  addWord(bytes: bytes, word: chromaWidthDivisorOf(layout: this.layout))
+  addWord(bytes: bytes, word: chromaHeightDivisorOf(layout: this.layout))
+  addWord(bytes: bytes, word: frame.planeWidth(plane: 1))
+  addWord(bytes: bytes, word: frame.planeHeight(plane: 1))
+  addWord(bytes: bytes, word: transferCode(transfer: frame.transfer))
+  addWord(bytes: bytes, word: 16 - this.bitDepth)
+  ret bytes
+}
+
+# The textures, the parameters and the pass for frames of this size, layout and
+# depth; none when they cannot be read yet or the GPU refuses
+func createLinearPicture(
+  resources: mod GpuResources
+  width: view Int
+  height: view Int
+  layout: view FrameLayout
+  bitDepth: view Int
+) ret opt LinearPicture {
+  if not supportsLinear(layout: layout, bitDepth: bitDepth) {
+    ret none
+  }
+  let conversion: Shader = linearShader(layout: layout, bitDepth: bitDepth)
+  let chromaWidth: Int = (width + chromaWidthDivisorOf(layout: layout) - 1) / chromaWidthDivisorOf(
+    layout: layout
+  )
+  let chromaHeight: Int = (height + chromaHeightDivisorOf(layout: layout) - 1) / chromaHeightDivisorOf(
+    layout: layout
+  )
+  let twoPlanes: Bool = layout is FrameLayout.nv12 or layout is FrameLayout.biplanar422
+  var planes: List(TextureId) = {}
+  var views: List(TextureViewId) = {}
+  loop var plane: Int = 0, plane < planeCountOf(layout: layout), ++plane {
+    var planeWidth: Int = width
+    var planeHeight: Int = height
+    var format: Int32 = WGPUTextureFormat_R8Unorm
+    if bitDepth > 8 {
+      format = WGPUTextureFormat_R16Uint
+    }
+    if plane > 0 {
+      planeWidth = chromaWidth
+      planeHeight = chromaHeight
+      if twoPlanes {
+        format = WGPUTextureFormat_RG8Unorm
+        if bitDepth > 8 {
+          format = WGPUTextureFormat_RG16Uint
+        }
+      }
+    }
+    if let texture: TextureId = createPlaneTexture(
+      resources: resources
+      width: planeWidth
+      height: planeHeight
+      format: format
+    ) {
+      planes.add(value: texture)
+      if let planeView: TextureViewId = createTextureView(resources: resources, texture: texture) {
+        views.add(value: planeView)
+      } else {
+        ret none
+      }
+    } else {
+      ret none
+    }
+  }
+  if let picture: TextureId = createTexture(
+    resources: resources
+    width: width
+    height: height
+    format: WGPUTextureFormat_RGBA16Float
+    usage: WGPUTextureUsage_StorageBinding + WGPUTextureUsage_TextureBinding + WGPUTextureUsage_CopySrc
+  ) {
+    if let pictureView: TextureViewId = createTextureView(resources: resources, texture: picture) {
+      if let parameters: BufferId = createBuffer(
+        resources: resources
+        size: 64
+        usage: WGPUBufferUsage_Uniform + WGPUBufferUsage_CopyDst
+      ) {
+        if let bounds: ComputeBounds = createComputeBounds(
+          resources: resources
+          workgroupSize: conversionWorkgroupSize
+        ) {
+          if let pipeline: PipelineId = createBoundedComputePipeline(
+            resources: resources
+            wgsl: conversion.text
+            entryPoint: "main"
+            bounds: bounds
+          ) {
+            var buffers: List(BufferId) = {}
+            buffers.add(value: parameters)
+            var bound: List(TextureViewId) = {}
+            loop let planeView: TextureViewId in views {
+              bound.add(value: planeView)
+            }
+            bound.add(value: pictureView)
+            let noSamplers: List(SamplerId) = {}
+            if let bindGroup: BindGroupId = createBoundedBindGroup(
+              resources: resources
+              pipeline: pipeline
+              bounds: bounds
+              buffers: buffers
+              textureViews: bound
+              samplers: noSamplers
+            ) {
+              ret LinearPicture {
+                width: width
+                height: height
+                layout: layout
+                bitDepth: bitDepth
+                planes: planes
+                planeViews: views
+                picture: picture
+                pictureView: pictureView
+                parameters: parameters
+                bounds: bounds
+                pipeline: pipeline
+                bindGroup: bindGroup
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  ret none
+}
+
+# Uploads the frame's planes and its parameters (range, matrix, transfer from
+# its tags). False when it is not of this picture's size, layout and depth.
+func uploadFrame(
+  this: mod LinearPicture
+  resources: mod GpuResources
+  frame: view VideoFrame
+) ret Bool {
+  if frame.handle is 0 or frame.width is not this.width or frame.height is not this.height {
+    ret false
+  }
+  if frame.layout is not this.layout or frame.bitDepth is not this.bitDepth {
+    ret false
+  }
+  if not frame.lockPlanes() {
+    ret false
+  }
+  var written: Bool = true
+  loop var plane: Int = 0, plane < this.planes.length(), ++plane {
+    if let texture: TextureId = this.planes.copyAt(index: plane) {
+      written = written and writePlane(
+        resources: resources
+        texture: texture
+        frame: frame
+        plane: plane
+      )
+    }
+  }
+  frame.unlockPlanes()
+  ret written and writeBuffer(
+    resources: resources
+    id: this.parameters
+    offset: 0
+    bytes: this.linearParameterBytes(frame: frame)
+  )
+}
+
+# Records the conversion into the caller's recording
+func recordConversion(
+  this: view LinearPicture
+  recording: mod Recording
+  resources: view GpuResources
+) ret Bool {
+  ret recordBoundedCompute(
+    recording: recording
+    resources: resources
+    pipeline: this.pipeline
+    bindGroup: this.bindGroup
+    bounds: this.bounds
+    elementCount: this.width * this.height
+  )
+}
+
+# Converts now and waits: for tests and measurements
+func convertNow(this: view LinearPicture, resources: mod GpuResources) ret Bool {
+  if var recording: Recording = beginRecording(resources: resources) {
+    if not this.recordConversion(recording: recording, resources: resources) {
+      ret false
+    }
+    if let submission: SubmissionId = submit(resources: resources, recording: recording) {
+      ret awaitSubmission(resources: resources, id: submission)
+    }
+  }
+  ret false
+}
+
+# The picture's half floats, read back (8 bytes a pixel, R G B A): for tests
+func readLinear(this: view LinearPicture, resources: mod GpuResources) ret List(UInt8) {
+  ret readTextureBytes(
+    resources: resources
+    texture: this.picture
+    width: this.width
+    height: this.height
+    texelBytes: 8
+  )
+}
+
+# A half float's value (IEEE 754 binary16), for reading the picture back
+func halfToFloat(bits: view Int) ret Float64 {
+  let sign: Int = (bits shr 15) bitand 1
+  let exponent: Int = (bits shr 10) bitand 31
+  let mantissa: Int = bits bitand 1023
+  var value: Float64 = 0.0
+  if exponent is 0 {
+    value = (mantissa as Float64) / 1024.0 / 16384.0
+  } else if exponent is 31 {
+    value = 65504.0
+  } else {
+    var scale: Float64 = 1.0
+    loop var i: Int = 15, i < exponent, ++i {
+      scale = scale * 2.0
+    }
+    loop var i: Int = exponent, i < 15, ++i {
+      scale = scale / 2.0
+    }
+    value = ((mantissa as Float64) / 1024.0 + 1.0) * scale
+  }
+  if sign is 1 {
+    ret -value
+  }
+  ret value
+}

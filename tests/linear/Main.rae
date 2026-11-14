@@ -1,0 +1,547 @@
+# 10-bit frames and linear output (video/LinearPicture; docs/design.md §7, §8.1).
+#
+# The 10-bit test files (tests/media/make.sh) hold, in frame 0, the 75% bars and
+# a ramp of one 10-bit luma code per column: 0 to 1023 in the HEVC Main10 file
+# (full range), 64 to 940 in the ProRes 422 HQ file (ProRes is limited range:
+# 877 codes is all it has).
+#
+# 1. Opened with FrameDepth.source, each decodes to 10-bit frames (16-bit
+#    samples), and every code of the ramp comes out, each in its own column:
+#    no banding (an 8-bit path would give at most 256).
+# 2. Through the GPU's linear pass the ramp keeps every one of those values
+#    (distinct half floats, rising).
+# 3. The linear output of the bars, and of the pixels at the bars' edges (where
+#    the bilinear chroma shows), matches a reference computed here from the
+#    decoded codes, within 1e-3: the BT.709 curve, and PQ, HLG and sRGB applied to
+#    the same frame (relative for PQ, whose values reach 100). And the bars are
+#    within their codes' rounding of the drawn 75% values' linear light (3e-3
+#    for the 10-bit files, whose codes are exact: their rounding to whole codes
+#    alone is up to about 2e-3; 3e-2 for the lossy 8-bit one).
+# 4. An 8-bit file (H.264) goes through the same pass; and the HEVC ramp decoded
+#    at 8 bits, as the display path does, is banded: at most 256 codes.
+import Math
+open gpu/GpuIds
+open gpu/GpuResources
+open video/FrameStream
+open video/LinearPicture
+open video/VideoBackends
+open video/VideoDecoder
+open video/YuvPicture
+open webgpu/Context
+
+# A decoded frame's planes on the CPU, for the reference
+type Planes {
+  width: Int
+  height: Int
+  bitDepth: Int
+  layout: FrameLayout
+  luma: List(UInt8)
+  chroma: List(UInt8)
+  chromaWidth: Int
+  chromaHeight: Int
+  fullRange: Bool
+}
+
+func planesOf(frame: view VideoFrame) ret Planes {
+  ret Planes {
+    width: frame.width
+    height: frame.height
+    bitDepth: frame.bitDepth
+    layout: frame.layout
+    luma: frame.copyPlane(plane: 0)
+    chroma: frame.copyPlane(plane: 1)
+    chromaWidth: frame.planeWidth(plane: 1)
+    chromaHeight: frame.planeHeight(plane: 1)
+    fullRange: frame.fullRange
+  }
+}
+
+# The code of sample `index` of a plane's bytes
+func codeAt(bytes: view List(UInt8), index: view Int, bitDepth: view Int) ret Int {
+  if bitDepth > 8 {
+    let low: Int = bytes.copyAtDefault(index: index * 2) as Int
+    let high: Int = bytes.copyAtDefault(index: index * 2 + 1) as Int
+    ret (low + high * 256) shr (16 - bitDepth)
+  }
+  ret bytes.copyAtDefault(index: index) as Int
+}
+
+func lumaCode(planes: view Planes, x: view Int, y: view Int) ret Int {
+  ret codeAt(bytes: planes.luma, index: y * planes.width + x, bitDepth: planes.bitDepth)
+}
+
+# Cb (which 0) or Cr (1) at chroma sample (x, y)
+func chromaCode(
+  planes: view Planes
+  x: view Int
+  y: view Int
+  which: view Int
+) ret Float {
+  ret codeAt(
+    bytes: planes.chroma
+    index: (y * planes.chromaWidth + x) * 2 + which
+    bitDepth: planes.bitDepth
+  ) as Float
+}
+
+func clampFloat(value: view Float, low: view Float, high: view Float) ret Float {
+  if value < low {
+    ret low
+  }
+  if value > high {
+    ret high
+  }
+  ret value
+}
+
+# Bilinear chroma at luma pixel (x, y): linearCommon.wgsl's siting
+func chromaAt(
+  planes: view Planes
+  x: view Int
+  y: view Int
+  which: view Int
+) ret Float {
+  var divisorY: Float = 1.0
+  if planes.layout is FrameLayout.nv12 {
+    divisorY = 2.0
+  }
+  let lastX: Float = (planes.chromaWidth - 1) as Float
+  let lastY: Float = (planes.chromaHeight - 1) as Float
+  let fx: Float = clampFloat(value: (x as Float) / 2.0, low: 0.0, high: lastX)
+  let fy: Float = clampFloat(value: ((y as Float) + 0.5) / divisorY - 0.5, low: 0.0, high: lastY)
+  let x0: Int = fx as Int
+  let y0: Int = fy as Int
+  let x1: Int = min(a: x0 + 1, b: planes.chromaWidth - 1)
+  let y1: Int = min(a: y0 + 1, b: planes.chromaHeight - 1)
+  let wx: Float = fx - (x0 as Float)
+  let wy: Float = fy - (y0 as Float)
+  let top: Float = chromaCode(
+    planes: planes
+    x: x0
+    y: y0
+    which: which
+  ) * (1.0 - wx) + chromaCode(
+    planes: planes
+    x: x1
+    y: y0
+    which: which
+  ) * wx
+  let bottom: Float = chromaCode(
+    planes: planes
+    x: x0
+    y: y1
+    which: which
+  ) * (1.0 - wx) + chromaCode(
+    planes: planes
+    x: x1
+    y: y1
+    which: which
+  ) * wx
+  ret top * (1.0 - wy) + bottom * wy
+}
+
+func bt709ToLinear(value: view Float) ret Float {
+  if value < 0.081 {
+    ret value / 4.5
+  }
+  ret pow(base: (value + 0.099) / 1.099, exp: 1.0 / 0.45)
+}
+
+func pqToLinear(value: view Float) ret Float {
+  let powered: Float = pow(base: value, exp: 1.0 / 78.84375)
+  let ratio: Float = max(a: powered - 0.8359375, b: 0.0) / (18.8515625 - 18.6875 * powered)
+  ret 10000.0 * pow(base: ratio, exp: 1.0 / 0.1593017578125) / 100.0
+}
+
+func hlgToLinear(value: view Float) ret Float {
+  if value <= 0.5 {
+    ret value * value / 3.0
+  }
+  ret (exp(x: (value - 0.55991073) / 0.17883277) + 0.28466892) / 12.0
+}
+
+func srgbToLinear(value: view Float) ret Float {
+  if value <= 0.04045 {
+    ret value / 12.92
+  }
+  ret pow(base: (value + 0.055) / 1.055, exp: 2.4)
+}
+
+func toLinear(value: view Float, transfer: view TransferFunction) ret Float {
+  if transfer is TransferFunction.pq {
+    ret pqToLinear(value: value)
+  }
+  if transfer is TransferFunction.hlg {
+    ret hlgToLinear(value: value)
+  }
+  if transfer is TransferFunction.srgb {
+    ret srgbToLinear(value: value)
+  }
+  ret bt709ToLinear(value: value)
+}
+
+# The reference linear R, G, B at (x, y): BT.709 matrix, the planes' range
+func referenceAt(
+  planes: view Planes
+  x: view Int
+  y: view Int
+  transfer: view TransferFunction
+) ret List(Float) {
+  var lumaOffset: Float = 16.0
+  var lumaRange: Float = 219.0
+  var chromaOffset: Float = 128.0
+  var chromaRange: Float = 224.0
+  if planes.bitDepth > 8 {
+    lumaOffset = 64.0
+    lumaRange = 876.0
+    chromaOffset = 512.0
+    chromaRange = 896.0
+  }
+  if planes.fullRange {
+    lumaOffset = 0.0
+    lumaRange = 255.0
+    chromaRange = 255.0
+    if planes.bitDepth > 8 {
+      lumaRange = 1023.0
+      chromaRange = 1023.0
+    }
+  }
+  let luma: Float = ((lumaCode(planes: planes, x: x, y: y) as Float) - lumaOffset) / lumaRange
+  let cb: Float = (chromaAt(
+    planes: planes
+    x: x
+    y: y
+    which: 0
+  ) - chromaOffset) / chromaRange
+  let cr: Float = (chromaAt(
+    planes: planes
+    x: x
+    y: y
+    which: 1
+  ) - chromaOffset) / chromaRange
+  let red: Float = clampFloat(value: luma + 1.5748 * cr, low: 0.0, high: 1.0)
+  let green: Float = clampFloat(
+    value: luma - 0.18732427 * cb - 0.46812427 * cr
+    low: 0.0
+    high: 1.0
+  )
+  let blue: Float = clampFloat(value: luma + 1.8556 * cb, low: 0.0, high: 1.0)
+  ret List(Float) {
+    toLinear(value: red, transfer: transfer)
+    toLinear(value: green, transfer: transfer)
+    toLinear(value: blue, transfer: transfer)
+  }
+}
+
+func halfAt(pixels: view List(UInt8), index: view Int) ret Int {
+  ret (pixels.copyAtDefault(index: index * 2) as Int) + (pixels.copyAtDefault(index: index * 2 + 1) as Int) * 256
+}
+
+func gpuAt(
+  pixels: view List(UInt8)
+  width: view Int
+  x: view Int
+  y: view Int
+  channel: view Int
+) ret Float {
+  ret halfToFloat(bits: halfAt(pixels: pixels, index: (y * width + x) * 4 + channel)) as Float
+}
+
+# The pixels checked: each bar's center, and three pixels on each side of
+# every edge between bars
+func checkedColumns(width: view Int) ret List(Int) {
+  var columns: List(Int) = {}
+  loop var bar: Int = 0, bar < 7, ++bar {
+    columns.add(value: (2 * bar + 1) * width / 14)
+    if bar > 0 {
+      let edge: Int = bar * width / 7
+      loop var offset: Int = -3, offset <= 3, ++offset {
+        columns.add(value: edge + offset)
+      }
+    }
+  }
+  ret columns
+}
+
+# The largest difference between the GPU's and the reference's linear values,
+# over the checked pixels of the bars (relative above 1, as PQ needs)
+func largestDifference(
+  planes: view Planes
+  pixels: view List(UInt8)
+  transfer: view TransferFunction
+) ret Float {
+  var largest: Float = 0.0
+  let rows: List(Int) = List(Int) { planes.height / 4, planes.height / 4 + 1 }
+  loop let y: Int in rows {
+    loop let x: Int in checkedColumns(width: planes.width) {
+      let reference: List(Float) = referenceAt(
+        planes: planes
+        x: x
+        y: y
+        transfer: transfer
+      )
+      loop var channel: Int = 0, channel < 3, ++channel {
+        let expected: Float = reference.copyAtDefault(index: channel)
+        var difference: Float = abs(value: gpuAt(
+          pixels: pixels
+          width: planes.width
+          x: x
+          y: y
+          channel: channel
+        ) - expected)
+        if expected > 1.0 {
+          difference = difference / expected
+        }
+        largest = max(a: largest, b: difference)
+      }
+    }
+  }
+  ret largest
+}
+
+# The bars' centers against the drawn 75% values' linear light (BT.709)
+func idealDifference(planes: view Planes, pixels: view List(UInt8)) ret Float {
+  let high: Float = bt709ToLinear(value: 191.0 / 255.0)
+  let red: List(Int) = List(Int) {
+    1
+    1
+    0
+    0
+    1
+    1
+    0
+  }
+  let green: List(Int) = List(Int) {
+    1
+    1
+    1
+    1
+    0
+    0
+    0
+  }
+  let blue: List(Int) = List(Int) {
+    1
+    0
+    1
+    0
+    1
+    0
+    1
+  }
+  var largest: Float = 0.0
+  let y: Int = planes.height / 4
+  loop var bar: Int = 0, bar < 7, ++bar {
+    let x: Int = (2 * bar + 1) * planes.width / 14
+    var ideal: List(Float) = {}
+    ideal.add(value: (red.copyAtDefault(index: bar) as Float) * high)
+    ideal.add(value: (green.copyAtDefault(index: bar) as Float) * high)
+    ideal.add(value: (blue.copyAtDefault(index: bar) as Float) * high)
+    loop var channel: Int = 0, channel < 3, ++channel {
+      largest = max(
+        a: largest
+        b: abs(value: gpuAt(
+          pixels: pixels
+          width: planes.width
+          x: x
+          y: y
+          channel: channel
+        ) - ideal.copyAtDefault(index: channel))
+      )
+    }
+  }
+  ret largest
+}
+
+func layoutName(layout: view FrameLayout) ret String {
+  if layout is FrameLayout.nv12 {
+    ret "two planes 4:2:0"
+  }
+  if layout is FrameLayout.biplanar422 {
+    ret "two planes 4:2:2"
+  }
+  ret "another layout"
+}
+
+func checkFile(
+  resources: mod GpuResources
+  name: view String
+  rampCodes: view Int
+  rampFirst: view Int
+) ret Bool {
+  var stream: FrameStream = openFrameStreamWithDepth(
+    path: "tests/media/{name}"
+    table: defaultVideoBackends()
+    depth: FrameDepth.source
+  )
+  var frame: VideoFrame = stream.takeFrame(frameIndex: 0)
+  if frame.handle is 0 {
+    log("FAIL: {name}: no frame ({stream.error} {stream.decoder.error})")
+    ret false
+  }
+  var range: String = "limited"
+  if frame.fullRange {
+    range = "full"
+  }
+  log("{name}: {frame.bitDepth}-bit, {layoutName(layout: frame.layout)}, {range} range")
+  let planes: Planes = planesOf(frame: frame)
+  var ok: Bool = true
+  if rampCodes > 0 {
+    # the ramp, as decoded: one code per column from x = 128
+    let y: Int = planes.height * 5 / 8
+    var distinct: Int = 0
+    var exact: Bool = true
+    loop var i: Int = 0, i < rampCodes, ++i {
+      let code: Int = lumaCode(planes: planes, x: 128 + i, y: y)
+      if code is not rampFirst + i {
+        exact = false
+      }
+      if i is 0 or code is not lumaCode(planes: planes, x: 127 + i, y: y) {
+        distinct = distinct + 1
+      }
+    }
+    log(
+      "  the ramp decodes to {distinct} distinct codes of {rampCodes}, each its column's: {exact}"
+    )
+    ok = ok and exact and distinct is rampCodes
+  }
+  if var linear: LinearPicture = createLinearPicture(
+    resources: resources
+    width: frame.width
+    height: frame.height
+    layout: frame.layout
+    bitDepth: frame.bitDepth
+  ) {
+    let transfers: List(TransferFunction) = List(TransferFunction) {
+      TransferFunction.bt709
+      TransferFunction.pq
+      TransferFunction.hlg
+      TransferFunction.srgb
+    }
+    var names: List(String) = List(String) { "BT.709", "PQ", "HLG", "sRGB" }
+    loop var t: Int = 0, t < transfers.length(), ++t {
+      frame.transfer = transfers.copyAtDefault(index: t)
+      if not (linear.uploadFrame(resources: resources, frame: frame) and linear.convertNow(
+        resources: resources
+      )) {
+        log("FAIL: {name}: the linear pass failed")
+        ret false
+      }
+      let pixels: List(UInt8) = linear.readLinear(resources: resources)
+      let difference: Float = largestDifference(
+        planes: planes
+        pixels: pixels
+        transfer: frame.transfer
+      )
+      if t is 0 {
+        if rampCodes > 0 {
+          let y: Int = planes.height * 5 / 8
+          var rising: Int = 1
+          loop var i: Int = 1, i < rampCodes, ++i {
+            if halfAt(pixels: pixels, index: (y * planes.width + 128 + i) * 4) > halfAt(
+              pixels: pixels
+              index: (y * planes.width + 127 + i) * 4
+            ) {
+              rising = rising + 1
+            }
+          }
+          log(
+            "  through the linear pass the ramp keeps {rising} distinct rising values of {rampCodes}"
+          )
+          ok = ok and rising is rampCodes
+        }
+        let ideal: Float = idealDifference(planes: planes, pixels: pixels)
+        # the drawn values went through whole codes: 10-bit rounding alone is up to
+        # about 2e-3 in linear light here, a lossy 8-bit file's more
+        var tolerance: Float = 0.003
+        var bound: String = "3e-3"
+        if planes.bitDepth is 8 {
+          tolerance = 0.03
+          bound = "3e-2"
+        }
+        log("  the bars' linear light is within {bound} of the drawn 75% bars: {ideal < tolerance}")
+        ok = ok and ideal < tolerance
+      }
+      log(
+        "  {names.copyAtDefault(index: t)}: the bars and their edges match the reference within 1e-3: {difference < 0.001}"
+      )
+      ok = ok and difference < 0.001
+    }
+  } else {
+    log("FAIL: {name}: no linear picture")
+    ok = false
+  }
+  releaseFrame(frame: frame)
+  stream.close()
+  ret ok
+}
+
+# The HEVC ramp opened at 8 bits (the display path's depth): its 1,024 codes
+# fall into at most 256, which is the banding the 10-bit path avoids
+func eightBitRamp() ret Int {
+  var stream: FrameStream = openFrameStream(
+    path: "tests/media/ramp10Hevc.mp4"
+    table: defaultVideoBackends()
+  )
+  var frame: VideoFrame = stream.takeFrame(frameIndex: 0)
+  let planes: Planes = planesOf(frame: frame)
+  let y: Int = planes.height * 5 / 8
+  var distinct: Int = 0
+  loop var i: Int = 0, i < 1024, ++i {
+    if i is 0 or lumaCode(planes: planes, x: 128 + i, y: y) is not lumaCode(
+      planes: planes
+      x: 127 + i
+      y: y
+    ) {
+      distinct = distinct + 1
+    }
+  }
+  releaseFrame(frame: frame)
+  stream.close()
+  ret distinct
+}
+
+func main() ret Int {
+  var ready: Int = 0
+  unsafe {
+    ready = webgpuBootstrap()
+  }
+  if ready is not 1 {
+    log("SKIP: no GPU")
+    ret 0
+  }
+  var issuer: IdIssuer = IdIssuer.create()
+  if var resources: GpuResources = GpuResources.create(issuer: issuer, capacity: 128) {
+    var ok: Bool = true
+    ok = checkFile(
+      resources: resources
+      name: "ramp10Hevc.mp4"
+      rampCodes: 1024
+      rampFirst: 0
+    ) and ok
+    ok = checkFile(
+      resources: resources
+      name: "ramp10Prores.mov"
+      rampCodes: 877
+      rampFirst: 64
+    ) and ok
+    ok = checkFile(
+      resources: resources
+      name: "counter709.mp4"
+      rampCodes: 0
+      rampFirst: 0
+    ) and ok
+    let banded: Int = eightBitRamp()
+    log(
+      "the HEVC ramp decoded at 8 bits instead keeps {banded} distinct codes of 1024: banded {banded <= 256}"
+    )
+    ok = ok and banded <= 256
+    if not ok {
+      log("FAIL")
+      ret 1
+    }
+    log("done")
+    ret 0
+  }
+  ret 1
+}

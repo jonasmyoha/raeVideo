@@ -5,7 +5,8 @@
 //   swift tools/makeTestMedia.swift <out> <codec> <width> <height> <frames>
 //     <timescale> <frameDuration> <matrix> <range> [audio]
 //
-//   codec:  h264 | hevc | prores, or raw422: the frames as raw planar 4:2:2
+//   codec:  h264 | hevc | prores, or hevc10 / prores422hq: 10-bit (below),
+//           or raw422: the frames as raw planar 4:2:2
 //           Y'CbCr (Y, then Cb and Cr at half width), for an encoder this
 //           platform does not have (tests/media/make.sh: DNxHR)
 //   matrix: 709 | 601     range: limited | full
@@ -23,12 +24,20 @@
 //      significant bit first: white (RGB 255) for 1, black for 0;
 //   4. rows [7h/8, h): the counter as five seven-segment digits, white on black.
 //
+// hevc10 (HEVC Main10, 4:2:0) and prores422hq (ProRes 422 HQ, 4:2:2) are
+// 10-bit: their frames are written as 10-bit Y'CbCr ('x420' / 'x422', or the
+// full-range 'xf20' / 'xf22'), and band 2 is a ramp instead of the square: from
+// x = 128, each column one 10-bit luma code more: 0 to 1023 over 1,024 columns
+// in a full-range file, 64 to 940 (877 codes, all a limited-range file has) in
+// a limited-range one; neutral chroma, the rest of the band mid-gray. The width should be at least 1,152.
+//
 // The YUV is computed here, not by the encoder: R'G'B' to Y'CbCr with the
 // stated matrix (BT.709 or BT.601) and range (limited 16-235 / 16-240, or full
 // 0-255), 4:2:0 chroma as the mean of each 2x2 block. The file is tagged with
 // the same matrix and range, and BT.709 primaries and transfer. So a reader
 // that honors the tags gets the bars' RGB back within the codec's error.
 import AVFoundation
+import VideoToolbox
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -141,6 +150,84 @@ func pixel(_ x: Int, _ y: Int, _ n: Int) -> (Double, Double, Double) {
   return (0, 0, 0)
 }
 
+let tenBit = codecName == "hevc10" || codecName == "prores422hq"
+let chroma422 = codecName == "prores422hq"
+
+// R'G'B' (0...255) as 10-bit Y'CbCr codes, limited or full range
+func ycbcr10(_ r: Double, _ g: Double, _ b: Double) -> (Double, Double, Double) {
+  let rn = r / 255.0
+  let gn = g / 255.0
+  let bn = b / 255.0
+  let luma = kr * rn + kg * gn + kb * bn
+  let cb = (bn - luma) / (2.0 * (1.0 - kb))
+  let cr = (rn - luma) / (2.0 * (1.0 - kr))
+  if fullRange {
+    return (1023.0 * luma, 512.0 + 1023.0 * cb, 512.0 + 1023.0 * cr)
+  }
+  return (64.0 + 876.0 * luma, 512.0 + 896.0 * cb, 512.0 + 896.0 * cr)
+}
+
+// A 10-bit frame's codes at (x, y): band 2 is the ramp, the rest as pixel()
+func codes10(_ x: Int, _ y: Int, _ n: Int) -> (Double, Double, Double) {
+  if y >= height / 2 && y < height * 3 / 4 {
+    if x >= 128 && x < 128 + 1024 {
+      // full range: 0 to 1023; limited (ProRes stores no other): 64 to 940,
+      // then 940 to the end
+      let code = fullRange ? Double(x - 128) : min(940.0, 64.0 + Double(x - 128))
+      return (code, 512.0, 512.0)
+    }
+    return ycbcr10(128, 128, 128)
+  }
+  let (r, g, b) = pixel(x, y, n)
+  return ycbcr10(r, g, b)
+}
+
+func code16(_ value: Double) -> UInt16 {
+  return UInt16(max(0, min(1023, value.rounded()))) << 6
+}
+
+func makePixelBuffer10(_ n: Int, _ pool: CVPixelBufferPool) -> CVPixelBuffer {
+  var made: CVPixelBuffer?
+  CVPixelBufferPoolCreatePixelBuffer(nil, pool, &made)
+  let buffer = made!
+  CVPixelBufferLockBaseAddress(buffer, [])
+  let lumaBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 0)!.assumingMemoryBound(to: UInt16.self)
+  let lumaStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0) / 2
+  let chromaBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 1)!.assumingMemoryBound(to: UInt16.self)
+  let chromaStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1) / 2
+  let rowsPerChroma = chroma422 ? 1 : 2
+  for cy in 0..<(height / rowsPerChroma) {
+    for cx in 0..<(width / 2) {
+      var cbSum = 0.0
+      var crSum = 0.0
+      for dy in 0..<rowsPerChroma {
+        for dx in 0..<2 {
+          let x = cx * 2 + dx
+          let y = cy * rowsPerChroma + dy
+          let (luma, cb, cr) = codes10(x, y, n)
+          lumaBase[y * lumaStride + x] = code16(luma)
+          cbSum += cb
+          crSum += cr
+        }
+      }
+      let samples = Double(2 * rowsPerChroma)
+      chromaBase[cy * chromaStride + cx * 2] = code16(cbSum / samples)
+      chromaBase[cy * chromaStride + cx * 2 + 1] = code16(crSum / samples)
+    }
+  }
+  CVPixelBufferUnlockBaseAddress(buffer, [])
+  let matrix =
+    matrixName == "601" ? kCVImageBufferYCbCrMatrix_ITU_R_601_4 : kCVImageBufferYCbCrMatrix_ITU_R_709_2
+  CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate)
+  CVBufferSetAttachment(
+    buffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2,
+    .shouldPropagate)
+  CVBufferSetAttachment(
+    buffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2,
+    .shouldPropagate)
+  return buffer
+}
+
 func makePixelBuffer(_ n: Int, _ pool: CVPixelBufferPool) -> CVPixelBuffer {
   var made: CVPixelBuffer?
   CVPixelBufferPoolCreatePixelBuffer(nil, pool, &made)
@@ -221,8 +308,9 @@ let writer = try! AVAssetWriter(outputURL: url, fileType: fileType)
 
 let codec: AVVideoCodecType
 switch codecName {
-case "hevc": codec = .hevc
+case "hevc", "hevc10": codec = .hevc
 case "prores": codec = .proRes422Proxy
+case "prores422hq": codec = .proRes422HQ
 default: codec = .h264
 }
 var videoSettings: [String: Any] = [
@@ -236,6 +324,16 @@ var videoSettings: [String: Any] = [
       ? AVVideoYCbCrMatrix_ITU_R_601_4 : AVVideoYCbCrMatrix_ITU_R_709_2,
   ],
 ]
+if codecName == "hevc10" {
+  // Main10, every frame a keyframe, a high bit rate: the ramp's single codes
+  // are what the test reads
+  videoSettings[AVVideoCompressionPropertiesKey] = [
+    AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main10_AutoLevel as String,
+    AVVideoQualityKey: 1.0,
+    AVVideoMaxKeyFrameIntervalKey: 1,
+    AVVideoAllowFrameReorderingKey: false,
+  ]
+}
 if codecName == "h264" || codecName == "hevc" {
   var compression: [String: Any] = [
     AVVideoAverageBitRateKey: max(400_000, width * height * 8),
@@ -248,9 +346,20 @@ if codecName == "h264" || codecName == "hevc" {
 let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
 videoInput.expectsMediaDataInRealTime = false
 videoInput.mediaTimeScale = timescale
-let pixelFormat =
+var pixelFormat =
   fullRange
   ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+if tenBit {
+  if chroma422 {
+    pixelFormat =
+      fullRange
+      ? kCVPixelFormatType_422YpCbCr10BiPlanarFullRange : kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange
+  } else {
+    pixelFormat =
+      fullRange
+      ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+  }
+}
 let adaptor = AVAssetWriterInputPixelBufferAdaptor(
   assetWriterInput: videoInput,
   sourcePixelBufferAttributes: [
@@ -332,7 +441,10 @@ group.enter()
 var frameIndex = 0
 videoInput.requestMediaDataWhenReady(on: DispatchQueue(label: "video")) {
   while videoInput.isReadyForMoreMediaData && frameIndex < frameCount {
-    let buffer = makePixelBuffer(frameIndex, adaptor.pixelBufferPool!)
+    let buffer =
+      tenBit
+      ? makePixelBuffer10(frameIndex, adaptor.pixelBufferPool!)
+      : makePixelBuffer(frameIndex, adaptor.pixelBufferPool!)
     let time = CMTime(value: Int64(frameIndex) * frameDuration, timescale: timescale)
     if !adaptor.append(buffer, withPresentationTime: time) {
       FileHandle.standardError.write("video append failed: \(String(describing: writer.error))\n".data(using: .utf8)!)

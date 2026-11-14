@@ -10,10 +10,11 @@ The design is [docs/design.md](docs/design.md); what lives here,
 
 ## Packages
 
-- `packages/video` (0.4.0): MP4 and MOV reading (`MediaReader`), decoding
+- `packages/video` (0.5.0): MP4 and MOV reading (`MediaReader`), decoding
   through VideoToolbox on Apple (H.264, HEVC, ProRes: `VideoDecoder`,
   `FrameStream`) or a registered backend, a frame on the GPU as RGBA
-  (`YuvPicture`), the frame pipeline (`FramePipeline`: decode-ahead on worker
+  (`YuvPicture`), 10-bit frames as linear light in rgba16float
+  (`LinearPicture`), the frame pipeline (`FramePipeline`: decode-ahead on worker
   threads for several files, a GPU frame cache with a budget, scrubbing),
   thumbnails made on a worker thread (`Thumbnails`), and a simple player on
   Rae's audio clock (`VideoPlayer`). It

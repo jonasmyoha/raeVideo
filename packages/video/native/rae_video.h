@@ -31,6 +31,11 @@ void rae_video_file_close(int64_t file);
 int64_t rae_video_vt_available(void);
 int64_t rae_video_vt_open(int64_t codec, int64_t width, int64_t height, uint8_t* config,
                           int64_t config_size, int64_t config_kind);
+/* The frames the next decoder opened on this thread hands out: 0 8-bit 4:2:0
+ * (the default, as above), 1 10-bit 4:2:0 ('x420' / 'xf20'), 2 10-bit 4:2:2
+ * ('x422' / 'xf22'): two planes of 16-bit samples, the code in the top 10
+ * bits. Which one a stream gets is Rae's (video/VideoDecoder). */
+void rae_video_vt_set_output(int64_t output);
 /* The container's color tags (ITU-T H.273 code points: primaries, transfer,
  * matrix; full_range 0 or 1) for the next decoder opened on this thread, so
  * its frames carry them; -1 for a tag the container does not give. Without

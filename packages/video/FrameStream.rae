@@ -41,6 +41,16 @@ type FrameStream {
 }
 
 func openFrameStream(path: view String, table: view List(VideoBackendChoice)) ret FrameStream {
+  ret openFrameStreamWithDepth(path: path, table: table, depth: FrameDepth.eightBit)
+}
+
+# The same, its frames at `depth` (FrameDepth.source: 10-bit frames from a
+# 10-bit HEVC or ProRes 422 file, for video/LinearPicture)
+func openFrameStreamWithDepth(
+  path: view String
+  table: view List(VideoBackendChoice)
+  depth: view FrameDepth
+) ret FrameStream {
   var reader: MediaReader = openMediaReader(path: path)
   let trackIndex: Int = reader.videoTrackIndex()
   var error: String = "{reader.error}"
@@ -48,10 +58,11 @@ func openFrameStream(path: view String, table: view List(VideoBackendChoice)) re
     error = "{path} has no video track"
   }
   let track: Mp4Track = reader.track(trackIndex: trackIndex)
-  var decoder: VideoDecoder = openVideoDecoder(
+  var decoder: VideoDecoder = openVideoDecoderWithDepth(
     track: track
     tags: reader.colorTagsOfTrack(trackIndex: trackIndex)
     table: table
+    depth: depth
   )
   if error.length() is 0 and decoder.handle is 0 {
     error = "{decoder.error}"
