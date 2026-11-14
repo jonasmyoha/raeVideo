@@ -161,6 +161,62 @@ func rae_video_backend_frame_copy_plane(
   rows: Int
 ) unsafe extern("rae_video_backend_frame_copy_plane") ret Int
 
+func rae_video_vte_open(
+  codec: Int
+  width: Int
+  height: Int
+  timescale: Int
+  bitRate: Int
+  qualityPercent: Int
+  keyframeInterval: Int
+) unsafe extern("rae_video_vte_open") ret Int
+
+func rae_video_vte_encode(
+  encoder: Int
+  bgra: Buffer(UInt8)
+  bytesPerRow: Int
+  time: Int
+) unsafe extern("rae_video_vte_encode") ret Int
+
+func rae_video_vte_finish(encoder: Int) unsafe extern("rae_video_vte_finish") ret Int
+
+func rae_video_vte_packet_count(encoder: Int) unsafe extern("rae_video_vte_packet_count") ret Int
+
+func rae_video_vte_packet_info(
+  encoder: Int
+  out: Buffer(Int)
+) unsafe extern("rae_video_vte_packet_info") ret Int
+
+func rae_video_vte_take_packet(
+  encoder: Int
+  into: Buffer(UInt8)
+  capacity: Int
+) unsafe extern("rae_video_vte_take_packet") ret Int
+
+func rae_video_vte_failures(encoder: Int) unsafe extern("rae_video_vte_failures") ret Int
+
+func rae_video_vte_config_size(
+  encoder: Int
+  out: Buffer(Int)
+) unsafe extern("rae_video_vte_config_size") ret Int
+
+func rae_video_vte_copy_config(
+  encoder: Int
+  into: Buffer(UInt8)
+  capacity: Int
+) unsafe extern("rae_video_vte_copy_config") ret Int
+
+func rae_video_vte_close(encoder: Int) unsafe extern("rae_video_vte_close")
+
+func rae_video_file_create(pathZ: Buffer(UInt8)) unsafe extern("rae_video_file_create") ret Int
+
+func rae_video_file_write_at(
+  file: Int
+  bytes: Buffer(UInt8)
+  count: Int
+  offset: Int
+) unsafe extern("rae_video_file_write_at") ret Int
+
 # A text's bytes with a zero after them, for a C path
 func textBytesZ(text: view String) ret List(UInt8) {
   var bytes: List(UInt8) = List.create(UInt8, cap: text.length() + 1)

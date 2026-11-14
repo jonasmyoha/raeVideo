@@ -75,6 +75,35 @@ int64_t rae_video_frame_primaries(int64_t frame);
 int64_t rae_video_frame_transfer(int64_t frame);
 void rae_video_frame_release(int64_t frame);
 
+/* ---- VideoToolbox encoding (native/rae_video_encoder.c) ------------------
+ * An encoder for `codec` ('avc1', 'hvc1', 'apco', 'apcs', 'apcn', 'apch',
+ * 'ap4h') at width x height, times in 1/timescale; bit_rate (0: the codec's
+ * own), quality 1-100 (0: not set), keyframe_interval (0: the codec's own).
+ * No frame reordering (no B-frames). Frames go in as 32-bit BGRA rows; the
+ * session's color tags are BT.709. A handle, or 0. */
+int64_t rae_video_vte_open(int64_t codec, int64_t width, int64_t height, int64_t timescale,
+                           int64_t bit_rate, int64_t quality_percent, int64_t keyframe_interval);
+/* One frame, shown at `time` (0, or a negative error) */
+int64_t rae_video_vte_encode(int64_t encoder, uint8_t* bgra, int64_t bytes_per_row, int64_t time);
+/* Waits until every frame given has come out */
+int64_t rae_video_vte_finish(int64_t encoder);
+/* The encoded packets waiting: how many; the oldest one's size, time, decode
+ * time and keyframe flag into out[0..3]; its bytes copied out and dropped */
+int64_t rae_video_vte_packet_count(int64_t encoder);
+int64_t rae_video_vte_packet_info(int64_t encoder, int64_t* out);
+int64_t rae_video_vte_take_packet(int64_t encoder, uint8_t* into, int64_t capacity);
+int64_t rae_video_vte_failures(int64_t encoder);
+/* The codec configuration (avcC / hvcC payload): its size, its kind in out[0] */
+int64_t rae_video_vte_config_size(int64_t encoder, int64_t* out);
+int64_t rae_video_vte_copy_config(int64_t encoder, uint8_t* into, int64_t capacity);
+void rae_video_vte_close(int64_t encoder);
+
+/* ---- files for writing ------------------------------------------------------ */
+/* Creates (or empties) a file for writing: its descriptor, or a negative errno */
+int64_t rae_video_file_create(uint8_t* path_z);
+/* Writes `count` bytes at `offset`: the count, or a negative errno */
+int64_t rae_video_file_write_at(int64_t file, uint8_t* bytes, int64_t count, int64_t offset);
+
 /* ---- registered backends (another package's decoder) ----------------------
  * A package with its own decoder (packages/ffmpeg) hands its calls over as a
  * pointer to this struct, from Rae (video/VideoBackends.registerBackend), so

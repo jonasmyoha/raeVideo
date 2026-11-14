@@ -1,0 +1,388 @@
+# video/VideoEncoder — frames in, encoded packets out (docs/design.md §5 V2,
+# §6.4): H.264, HEVC and ProRes (422 Proxy, LT, 422, HQ, 4444) through
+# VideoToolbox, fed from a picture on the GPU.
+#
+#     var encoder: VideoEncoder = openVideoEncoder(settings: settings)
+#     encoder.encodeTexture(resources:, texture: picture.picture, time: frameIndex * 1001)
+#     ... loop: let packets: List(EncodedPacket) = encoder.takePackets() -> a MediaWriter ...
+#     encoder.finish()      # then takePackets() for the last ones
+#     encoder.close(resources:)
+#
+# A frame goes from an RGBA texture (rgba8unorm, R'G'B' as YuvPicture gives it)
+# to the encoder by a readback: a compute pass (rgbaToBgra.wgsl) packs it as
+# 32-bit BGRA into a buffer, the buffer is read back, and the C glue copies it
+# into an IOSurface-backed pixel buffer of the session's pool. VideoToolbox
+# converts to the codec's Y'CbCr with BT.709 tags. Handing it the texture's own
+# memory (an IOSurface-backed texture, no readback) needs a way to import one
+# that webgpu.h does not have yet (docs/design.md §12 V3).
+#
+# Frames are encoded in order, without reordering (no B-frames): each packet's
+# decode time is its time. The packets come out on VideoToolbox's thread and
+# wait in the glue until takePackets.
+import Math
+open gpu/GpuCompute
+open gpu/GpuIds
+open gpu/GpuLifetime
+open gpu/GpuRenderTransfer
+open gpu/GpuResources
+open video/VideoGlue
+open video/YuvPicture
+open webgpu/ReadRequest
+open webgpu/WebgpuEnums
+
+enum VideoCodec {
+  h264
+  hevc
+  prores422Proxy
+  prores422Lt
+  prores422
+  prores422Hq
+  prores4444
+}
+
+type EncoderSettings {
+  codec: VideoCodec
+  width: Int
+  height: Int
+  # times are in 1 / timescale (30000 for 29.97 fps, with frames 1001 apart)
+  timescale: Int
+  # bits per second (0: the codec's own); quality 1-100 (0: not set)
+  bitRate: Int
+  quality: Int
+  # the most frames between keyframes (0: the codec's own)
+  keyframeInterval: Int
+}
+
+type EncodedPacket {
+  bytes: List(UInt8)
+  time: Int
+  decodeTime: Int
+  keyframe: Bool
+}
+
+type VideoEncoder {
+  settings: EncoderSettings
+  handle: Int
+  # the GPU side: the packed frame, its readback, the packing pass
+  packed: BufferId
+  readback: BufferId
+  sizes: BufferId
+  bounds: ComputeBounds
+  pipeline: PipelineId
+  # the bind group for the texture last given (rebuilt for another)
+  bindGroup: BindGroupId
+  boundTexture: Int
+  framesGiven: Int
+  error: String
+}
+
+# The sample entry's four characters a codec is written with
+func codecFourCharacters(codec: view VideoCodec) ret String {
+  if codec is VideoCodec.hevc {
+    ret "hvc1"
+  }
+  if codec is VideoCodec.prores422Proxy {
+    ret "apco"
+  }
+  if codec is VideoCodec.prores422Lt {
+    ret "apcs"
+  }
+  if codec is VideoCodec.prores422 {
+    ret "apcn"
+  }
+  if codec is VideoCodec.prores422Hq {
+    ret "apch"
+  }
+  if codec is VideoCodec.prores4444 {
+    ret "ap4h"
+  }
+  ret "avc1"
+}
+
+func packedBytes(settings: view EncoderSettings) ret Int {
+  ret settings.width * settings.height * 4
+}
+
+func openVideoEncoder(
+  resources: mod GpuResources
+  settings: view EncoderSettings
+) ret VideoEncoder {
+  let packing: Shader = shader(files: ["lib/gpu/computeBounds.wgsl", "rgbaToBgra.wgsl"])
+  var encoder: VideoEncoder = {
+    settings: settings
+    handle: 0
+    packed: noBufferId()
+    readback: noBufferId()
+    sizes: noBufferId()
+    bounds: noComputeBounds(workgroupSize: conversionWorkgroupSize)
+    pipeline: noPipelineId()
+    bindGroup: noBindGroupId()
+    boundTexture: -1
+    framesGiven: 0
+    error: ""
+  }
+  unsafe {
+    encoder.handle = rae_video_vte_open(
+      codec: fourCharacterCode(text: codecFourCharacters(codec: settings.codec))
+      width: settings.width
+      height: settings.height
+      timescale: settings.timescale
+      bitRate: settings.bitRate
+      qualityPercent: settings.quality
+      keyframeInterval: settings.keyframeInterval
+    )
+  }
+  if encoder.handle is 0 {
+    encoder.error = "VideoToolbox has no {codecFourCharacters(codec: settings.codec)} encoder for {settings.width}x{settings.height}"
+    ret encoder
+  }
+  let size: Int = packedBytes(settings: settings)
+  var made: Bool = false
+  if let packed: BufferId = createBuffer(
+    resources: resources
+    size: size
+    usage: WGPUBufferUsage_Storage + WGPUBufferUsage_CopySrc
+  ) {
+    if let readback: BufferId = createBuffer(
+      resources: resources
+      size: size
+      usage: WGPUBufferUsage_MapRead + WGPUBufferUsage_CopyDst
+    ) {
+      if let sizes: BufferId = createBuffer(
+        resources: resources
+        size: 16
+        usage: WGPUBufferUsage_Uniform + WGPUBufferUsage_CopyDst
+      ) {
+        var words: List(UInt8) = List.create(UInt8, cap: 16)
+        addWord(bytes: words, word: settings.width)
+        addWord(bytes: words, word: settings.height)
+        addWord(bytes: words, word: 0)
+        addWord(bytes: words, word: 0)
+        if let bounds: ComputeBounds = createComputeBounds(
+          resources: resources
+          workgroupSize: conversionWorkgroupSize
+        ) {
+          if let pipeline: PipelineId = createBoundedComputePipeline(
+            resources: resources
+            wgsl: packing.text
+            entryPoint: "main"
+            bounds: bounds
+          ) {
+            encoder.packed = packed
+            encoder.readback = readback
+            encoder.sizes = sizes
+            encoder.bounds = bounds
+            encoder.pipeline = pipeline
+            made = writeBuffer(
+              resources: resources
+              id: sizes
+              offset: 0
+              bytes: words
+            )
+          }
+        }
+      }
+    }
+  }
+  if not made {
+    encoder.error = "the GPU refused the encoder's buffers"
+  }
+  ret encoder
+}
+
+# Packs the texture (rgba8unorm, the encoder's size) on the GPU, reads it back
+# and gives it to the encoder as the frame shown at `time`. Waits for the GPU
+# (an export runs offline).
+func encodeTexture(
+  this: mod VideoEncoder
+  resources: mod GpuResources
+  texture: view TextureId
+  time: view Int
+) ret Bool {
+  if this.handle is 0 or this.error.length() > 0 {
+    ret false
+  }
+  if this.boundTexture is not texture.slot {
+    if this.boundTexture >= 0 {
+      let gone: Bool = retireBindGroup(resources: resources, id: this.bindGroup)
+    }
+    this.boundTexture = -1
+    if let textureView: TextureViewId = createTextureView(resources: resources, texture: texture) {
+      var buffers: List(BufferId) = {}
+      buffers.add(value: this.sizes)
+      buffers.add(value: this.packed)
+      var views: List(TextureViewId) = {}
+      views.add(value: textureView)
+      let noSamplers: List(SamplerId) = {}
+      if let bindGroup: BindGroupId = createBoundedBindGroup(
+        resources: resources
+        pipeline: this.pipeline
+        bounds: this.bounds
+        buffers: buffers
+        textureViews: views
+        samplers: noSamplers
+      ) {
+        this.bindGroup = bindGroup
+        this.boundTexture = texture.slot
+      }
+    }
+    if this.boundTexture < 0 {
+      this.error = "the texture could not be bound"
+      ret false
+    }
+  }
+  let size: Int = packedBytes(settings: this.settings)
+  var done: Bool = false
+  if var recording: Recording = beginRecording(resources: resources) {
+    let packed: Bool = recordBoundedCompute(
+      recording: recording
+      resources: resources
+      pipeline: this.pipeline
+      bindGroup: this.bindGroup
+      bounds: this.bounds
+      elementCount: this.settings.width * this.settings.height
+    )
+    let copied: Bool = recordCopyBuffer(
+      recording: recording
+      resources: resources
+      source: this.packed
+      sourceOffset: 0
+      destination: this.readback
+      destinationOffset: 0
+      size: size
+    )
+    if let submission: SubmissionId = submit(resources: resources, recording: recording) {
+      done = packed and copied and awaitSubmission(resources: resources, id: submission)
+    }
+  }
+  if not done {
+    this.error = "packing frame {this.framesGiven} failed"
+    ret false
+  }
+  var pixels: List(UInt8) = List.create(UInt8, cap: size)
+  pixels.addDefaults(count: size)
+  var read: Bool = false
+  if let request: ReadRequest = readBuffer(
+    resources: resources
+    id: this.readback
+    offset: 0
+    size: size
+  ) {
+    var status: Int = 0
+    var spins: Int = 0
+    loop status is 0 and spins < 100000000 {
+      status = request.poll()
+      spins = spins + 1
+    }
+    read = status is 1 and request.copyToBytes(destination: pixels)
+  }
+  if not read {
+    this.error = "reading frame {this.framesGiven} back failed"
+    ret false
+  }
+  var result: Int = 0
+  unsafe {
+    result = rae_video_vte_encode(
+      encoder: this.handle
+      bgra: pixels.data
+      bytesPerRow: this.settings.width * 4
+      time: time
+    )
+  }
+  if result is not 0 {
+    this.error = "VideoToolbox refused frame {this.framesGiven} ({result})"
+    ret false
+  }
+  this.framesGiven = this.framesGiven + 1
+  ret true
+}
+
+# The packets encoded so far, oldest first
+func takePackets(this: mod VideoEncoder) ret List(EncodedPacket) {
+  var packets: List(EncodedPacket) = {}
+  if this.handle is 0 {
+    ret packets
+  }
+  var info: List(Int) = List.create(Int, cap: 4)
+  info.addDefaults(count: 4)
+  var waiting: Int = 0
+  unsafe {
+    waiting = rae_video_vte_packet_count(encoder: this.handle)
+  }
+  loop var i: Int = 0, i < waiting, ++i {
+    var size: Int = -1
+    unsafe {
+      if rae_video_vte_packet_info(encoder: this.handle, out: info.data) is 0 {
+        size = info.copyAtDefault(index: 0)
+      }
+    }
+    if size < 0 {
+      ret packets
+    }
+    var bytes: List(UInt8) = List.create(UInt8, cap: max(a: 1, b: size))
+    bytes.addDefaults(count: size)
+    var copied: Int = -1
+    unsafe {
+      copied = rae_video_vte_take_packet(encoder: this.handle, into: bytes.data, capacity: size)
+    }
+    if copied is size {
+      packets.add(
+        value: EncodedPacket {
+          bytes: own bytes
+          time: info.copyAtDefault(index: 1)
+          decodeTime: info.copyAtDefault(index: 2)
+          keyframe: info.copyAtDefault(index: 3) is 1
+        }
+      )
+    }
+  }
+  ret packets
+}
+
+# Waits until every frame given has come out (then takePackets)
+func finish(this: mod VideoEncoder) ret Bool {
+  if this.handle is 0 {
+    ret false
+  }
+  unsafe {
+    ret rae_video_vte_finish(encoder: this.handle) is 0 and rae_video_vte_failures(
+      encoder: this.handle
+    ) is 0
+  }
+}
+
+# The codec configuration the sample entry needs (avcC / hvcC payload; empty
+# for ProRes), known once a packet has come out
+func codecConfig(this: view VideoEncoder) ret List(UInt8) {
+  var info: List(Int) = List.create(Int, cap: 1)
+  info.addDefaults(count: 1)
+  var size: Int = 0
+  unsafe {
+    size = rae_video_vte_config_size(encoder: this.handle, out: info.data)
+  }
+  var bytes: List(UInt8) = List.create(UInt8, cap: max(a: 1, b: size))
+  if size > 0 {
+    bytes.addDefaults(count: size)
+    unsafe {
+      let copied: Int = rae_video_vte_copy_config(
+        encoder: this.handle
+        into: bytes.data
+        capacity: size
+      )
+    }
+  }
+  ret bytes
+}
+
+func close(this: mod VideoEncoder, resources: mod GpuResources) {
+  if this.handle is not 0 {
+    unsafe {
+      rae_video_vte_close(encoder: this.handle)
+    }
+    this.handle = 0
+  }
+  if this.boundTexture >= 0 {
+    let gone: Bool = retireBindGroup(resources: resources, id: this.bindGroup)
+    this.boundTexture = -1
+  }
+}

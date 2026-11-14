@@ -1,0 +1,342 @@
+# video/VideoEncoder and video/MediaWriter: a round trip (docs/design.md §6.4,
+# §10 "Export round trip"). Frames of tests/media/counter709.mp4 are decoded,
+# put on the GPU as RGBA (video/YuvPicture), encoded through VideoToolbox from
+# that texture, and written; each file is then read back with this package's
+# own reader and decoder:
+#
+# - every frame's burned-in counter, in order: none lost, none repeated;
+# - a MOV's 16-bit PCM sound (a pattern made here, interleaved with the video
+#   by time) byte for byte;
+# - an MP4's AAC sound (the source's packets, copied) packet for packet, with
+#   its edit.
+#
+# The files stay in build/writer for tools/checkWrittenFiles.sh (ffprobe, and
+# AVFoundation, which QuickTime Player is built on).
+import Math
+open Sys
+open gpu/GpuIds
+open gpu/GpuResources
+open media/Mp4
+open video/FrameStream
+open video/MediaReader
+open video/MediaWriter
+open video/Mp4Writer
+open video/VideoBackends
+open video/VideoDecoder
+open video/VideoEncoder
+open video/YuvPicture
+open webgpu/Context
+
+const sourcePath: String = "tests/media/counter709.mp4"
+
+const pcmChannels: Int = 2
+
+const pcmRate: Int = 48000
+
+func counterOf(frame: view VideoFrame) ret Int {
+  let luma: List(UInt8) = frame.copyPlane(plane: 0)
+  let row: Int = frame.height * 3 / 4 + frame.height / 16
+  var value: Int = 0
+  loop var bit: Int = 0, bit < 16, ++bit {
+    let x: Int = bit * frame.width / 16 + frame.width / 32
+    value = value * 2
+    if (luma.copyAtDefault(index: row * frame.width + x) as Int) > 128 {
+      value = value + 1
+    }
+  }
+  ret value
+}
+
+# The PCM pattern's sample i (frames x channels, interleaved), as bytes
+func pcmByte(index: view Int) ret UInt8 {
+  ret ((index * 7919 + index / 3) % 251) as UInt8
+}
+
+func pcmBlock(firstFrame: view Int, frames: view Int) ret List(UInt8) {
+  var bytes: List(UInt8) = List.create(UInt8, cap: frames * pcmChannels * 2)
+  let first: Int = firstFrame * pcmChannels * 2
+  loop var i: Int = 0, i < frames * pcmChannels * 2, ++i {
+    bytes.add(value: pcmByte(index: first + i))
+  }
+  ret bytes
+}
+
+type Case {
+  name: String
+  codec: VideoCodec
+  container: ContainerKind
+  frames: Int
+  # sound: 0 none, 1 PCM, 2 the source's AAC
+  sound: Int
+}
+
+func writeCase(resources: mod GpuResources, test: view Case) ret Bool {
+  let path: String = "build/writer/{test.name}"
+  var stream: FrameStream = openFrameStream(path: sourcePath, table: defaultVideoBackends())
+  let settings: EncoderSettings = {
+    codec: test.codec
+    width: 320
+    height: 180
+    timescale: 30000
+    bitRate: 2000000
+    quality: 0
+    keyframeInterval: 15
+  }
+  var encoder: VideoEncoder = openVideoEncoder(resources: resources, settings: settings)
+  if encoder.error.length() > 0 {
+    log("FAIL: {test.name}: {encoder.error}")
+    ret false
+  }
+  var writer: MediaWriter = openMediaWriter(path: path, container: test.container)
+  let video: Int = writer.addVideoTrack(
+    codec: codecFourCharacters(codec: test.codec)
+    width: 320
+    height: 180
+    timescale: 30000
+  )
+  var sound: Int = -1
+  var source: MediaReader = openMediaReader(path: sourcePath)
+  let audioTrack: Int = source.audioTrackIndex()
+  if test.sound is 1 {
+    sound = writer.addPcmTrack(channels: pcmChannels, sampleRate: pcmRate)
+  } else if test.sound is 2 {
+    let track: Mp4Track = source.track(trackIndex: audioTrack)
+    sound = writer.addAacTrack(
+      channels: track.channels
+      sampleRate: track.sampleRate
+      audioSpecificConfig: track.codecConfig
+    )
+    writer.setEditStart(trackIndex: sound, start: track.presentationStart)
+  }
+  if var picture: YuvPicture = createYuvPicture(
+    resources: resources
+    width: 320
+    height: 180
+    layout: FrameLayout.nv12
+  ) {
+    var aacSample: Int = 0
+    loop var frameIndex: Int = 0, frameIndex < test.frames, ++frameIndex {
+      var frame: VideoFrame = stream.takeFrame(frameIndex: frameIndex)
+      let shown: Bool = picture.uploadFrame(resources: resources, frame: frame) and picture.convertNow(
+        resources: resources
+      )
+      releaseFrame(frame: frame)
+      if not shown or not encoder.encodeTexture(
+        resources: resources
+        texture: picture.picture
+        time: frameIndex * 1001
+      ) {
+        log("FAIL: {test.name}: frame {frameIndex}: {encoder.error}")
+        ret false
+      }
+      loop let packet: view EncodedPacket in encoder.takePackets() {
+        let wrote: Bool = writer.writePacket(
+          trackIndex: video
+          bytes: packet.bytes
+          time: packet.time
+          decodeTime: packet.decodeTime
+          duration: 1001
+          keyframe: packet.keyframe
+        )
+      }
+      # the sound of this frame's time: 1601.6 frames at 48 kHz
+      let soundEnd: Int = (frameIndex + 1) * 1001 * pcmRate / 30000
+      if test.sound is 1 {
+        let soundStart: Int = frameIndex * 1001 * pcmRate / 30000
+        let wrote: Bool = writer.writePcm(
+          trackIndex: sound
+          samples: pcmBlock(firstFrame: soundStart, frames: soundEnd - soundStart)
+          frames: soundEnd - soundStart
+        )
+      } else if test.sound is 2 {
+        loop aacSample < source.sampleCount(trackIndex: audioTrack) and source.presentationTimeOf(
+          trackIndex: audioTrack
+          sampleIndex: aacSample
+        ).value < soundEnd {
+          let packet: MediaPacket = source.readPacket(
+            trackIndex: audioTrack
+            sampleIndex: aacSample
+          )
+          let wrote: Bool = writer.writePacket(
+            trackIndex: sound
+            bytes: packet.bytes
+            time: packet.decodeTime.value + source.track(trackIndex: audioTrack).presentationStart
+            decodeTime: packet.decodeTime.value + source.track(trackIndex: audioTrack).presentationStart
+            duration: packet.duration.value
+            keyframe: true
+          )
+          aacSample = aacSample + 1
+        }
+      }
+    }
+    if not encoder.finish() {
+      log("FAIL: {test.name}: the encoder failed")
+      ret false
+    }
+    loop let packet: view EncodedPacket in encoder.takePackets() {
+      let wrote: Bool = writer.writePacket(
+        trackIndex: video
+        bytes: packet.bytes
+        time: packet.time
+        decodeTime: packet.decodeTime
+        duration: 1001
+        keyframe: packet.keyframe
+      )
+    }
+  }
+  writer.setTrackConfig(trackIndex: video, config: encoder.codecConfig())
+  let written: Bool = writer.finish()
+  encoder.close(resources: resources)
+  stream.close()
+  source.close()
+  if not written {
+    log("FAIL: {test.name}: {writer.error}")
+  }
+  ret written
+}
+
+# Reads the file back: its frames' counters, and its sound
+func checkCase(test: view Case) ret Bool {
+  let path: String = "build/writer/{test.name}"
+  var stream: FrameStream = openFrameStream(path: path, table: defaultVideoBackends())
+  if stream.error.length() > 0 {
+    log("FAIL: {test.name}: {stream.error}")
+    ret false
+  }
+  var inOrder: Int = 0
+  loop var i: Int = 0, i < stream.frameCount(), ++i {
+    var frame: VideoFrame = stream.takeFrame(frameIndex: i)
+    if frame.handle is not 0 and counterOf(frame: frame) is i and frame.presentationTime.value is i * 1001 {
+      inOrder = inOrder + 1
+    }
+    releaseFrame(frame: frame)
+  }
+  stream.close()
+  var line: String = "{test.name}: {stream.frameCount()} frames of {test.frames} read back, counters 0..{test.frames - 1} in order: {inOrder is test.frames and stream.frameCount() is test.frames}"
+  var ok: Bool = inOrder is test.frames and stream.frameCount() is test.frames
+  var reader: MediaReader = openMediaReader(path: path)
+  let sound: Int = reader.audioTrackIndex()
+  if test.sound is 1 {
+    let soundFrames: Int = test.frames * 1001 * pcmRate / 30000
+    var same: Bool = reader.sampleCount(trackIndex: sound) is soundFrames
+    var index: Int = 0
+    loop var sample: Int = 0, sample < reader.sampleCount(trackIndex: sound) and same, ++sample {
+      let packet: MediaPacket = reader.readPacket(trackIndex: sound, sampleIndex: sample)
+      loop let byte: UInt8 in packet.bytes {
+        if byte is not pcmByte(index: index) {
+          same = false
+        }
+        index = index + 1
+      }
+    }
+    line = "{line}; PCM sound {soundFrames} frames, byte for byte: {same}"
+    ok = ok and same
+  } else if test.sound is 2 {
+    var original: MediaReader = openMediaReader(path: sourcePath)
+    let originalTrack: Int = original.audioTrackIndex()
+    let count: Int = reader.sampleCount(trackIndex: sound)
+    var same: Bool = count > 0 and reader.track(trackIndex: sound).presentationStart is original.track(
+      trackIndex: originalTrack
+    ).presentationStart
+    loop var sample: Int = 0, sample < count and same, ++sample {
+      let written: MediaPacket = reader.readPacket(trackIndex: sound, sampleIndex: sample)
+      let source: MediaPacket = original.readPacket(trackIndex: originalTrack, sampleIndex: sample)
+      if written.bytes.length() is not source.bytes.length() or written.decodeTime.value is not source.decodeTime.value {
+        same = false
+      }
+      loop var i: Int = 0, i < written.bytes.length() and same, ++i {
+        if written.bytes.copyAtDefault(index: i) is not source.bytes.copyAtDefault(index: i) {
+          same = false
+        }
+      }
+    }
+    line = "{line}; AAC sound {count} packets, as the source's, with its edit: {same}"
+    ok = ok and same
+    original.close()
+  }
+  reader.close()
+  log(line)
+  ret ok
+}
+
+func main() ret Int {
+  var ready: Int = 0
+  unsafe {
+    ready = webgpuBootstrap()
+  }
+  if ready is not 1 {
+    log("SKIP: no GPU")
+    ret 0
+  }
+  let made: Bool = makeDir(path: "build")
+  let madeWriter: Bool = makeDir(path: "build/writer")
+  let cases: List(Case) = List(Case) {
+    {
+      name: "h264Aac.mp4"
+      codec: VideoCodec.h264
+      container: ContainerKind.mp4
+      frames: 60
+      sound: 2
+    }
+    {
+      name: "hevcPcm.mov"
+      codec: VideoCodec.hevc
+      container: ContainerKind.mov
+      frames: 60
+      sound: 1
+    }
+    {
+      name: "h264.mov"
+      codec: VideoCodec.h264
+      container: ContainerKind.mov
+      frames: 30
+      sound: 0
+    }
+    {
+      name: "proresProxy.mov"
+      codec: VideoCodec.prores422Proxy
+      container: ContainerKind.mov
+      frames: 30
+      sound: 1
+    }
+    {
+      name: "prores422.mov"
+      codec: VideoCodec.prores422
+      container: ContainerKind.mov
+      frames: 30
+      sound: 0
+    }
+    {
+      name: "proresHq.mov"
+      codec: VideoCodec.prores422Hq
+      container: ContainerKind.mov
+      frames: 30
+      sound: 0
+    }
+    {
+      name: "prores4444.mov"
+      codec: VideoCodec.prores4444
+      container: ContainerKind.mov
+      frames: 30
+      sound: 0
+    }
+  }
+  var issuer: IdIssuer = IdIssuer.create()
+  if var resources: GpuResources = GpuResources.create(issuer: issuer, capacity: 256) {
+    var ok: Bool = true
+    loop let test: view Case in cases {
+      if writeCase(resources: resources, test: test) {
+        ok = checkCase(test: test) and ok
+      } else {
+        ok = false
+      }
+    }
+    if not ok {
+      log("FAIL")
+      ret 1
+    }
+    log("done")
+    ret 0
+  }
+  ret 1
+}

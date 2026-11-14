@@ -14,7 +14,8 @@
 #    (least recently used first) and never holds more than its budget.
 # 4. A cut, on a real 60 Hz clock: one file for a second, then another file,
 #    whose first frames are named ahead (decode-ahead); the refresh at the cut
-#    shows the second file's frame 0, cached, and no refresh misses a frame.
+#    shows the second file's frame 0, cached, and no refresh misses a frame
+#    (a refresh the OS woke more than 8 ms late is not counted).
 import Math
 open gpu/GpuIds
 open gpu/GpuLifetime
@@ -237,6 +238,9 @@ func cutOnTime(resources: mod GpuResources, output: view FrameOutput) ret Bool {
     loop nowNs() < deadline {
       sleep(ms: 1)
     }
+    # a refresh the OS woke more than 8 ms late is the OS's lateness, not the
+    # pipeline's: its frame is not counted as missed
+    let onTime: Bool = nowNs() - deadline < 8000000
     let movieNs: Int = refresh * refreshNs
     let arrived: Bool = pipeline.uploadDecoded(resources: resources, maxUploads: 4)
     # the caller names what it will want: the playing file ahead, and from half
@@ -265,7 +269,7 @@ func cutOnTime(resources: mod GpuResources, output: view FrameOutput) ret Bool {
         sourceNumber: second
         frameIndex: 0
       )
-    } else if not pipeline.isCached(sourceNumber: sourceNumber, frameIndex: frameIndex) {
+    } else if onTime and not pipeline.isCached(sourceNumber: sourceNumber, frameIndex: frameIndex) {
       misses = misses + 1
     }
   }

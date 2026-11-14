@@ -1,0 +1,8 @@
+h264Aac.mp4: 60 frames of 60 read back, counters 0..59 in order: true; AAC sound 96 packets, as the source's, with its edit: true
+hevcPcm.mov: 60 frames of 60 read back, counters 0..59 in order: true; PCM sound 96096 frames, byte for byte: true
+h264.mov: 30 frames of 30 read back, counters 0..29 in order: true
+proresProxy.mov: 30 frames of 30 read back, counters 0..29 in order: true; PCM sound 48048 frames, byte for byte: true
+prores422.mov: 30 frames of 30 read back, counters 0..29 in order: true
+proresHq.mov: 30 frames of 30 read back, counters 0..29 in order: true
+prores4444.mov: 30 frames of 30 read back, counters 0..29 in order: true
+done

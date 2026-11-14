@@ -1,0 +1,436 @@
+# video/MediaWriter — a MOV or MP4 file written (docs/design.md §5 V2, §6.4):
+# video tracks (H.264, HEVC, ProRes from video/VideoEncoder) and sound tracks
+# (AAC packets; 16-bit PCM in MOV), the packets of all tracks interleaved by
+# time in the file.
+#
+#     var writer: MediaWriter = openMediaWriter(path: "out.mov", container: ContainerKind.mov)
+#     let video: Int = writer.addVideoTrack(codec: "avc1", width: 1920, height: 1080, timescale:
+#     30000)
+#     let sound: Int = writer.addPcmTrack(channels: 2, sampleRate: 48000)
+#     writer.writePacket(trackIndex: video, bytes: packet.bytes, time:, decodeTime:, duration:
+#     1001, keyframe:)
+#     writer.writePcm(trackIndex: sound, samples: block, frames: 1024)
+#     writer.setTrackConfig(trackIndex: video, config: encoder.codecConfig())
+#     let written: Bool = writer.finish()
+#
+# Layout: ftyp, then one mdat the samples are written into as they come (its
+# 64-bit size patched at the end), then the moov (video/Mp4Writer) with every
+# track's tables, so nothing is held in memory but what waits to be
+# interleaved: a packet is written once every track has one waiting, the one
+# that decodes first (in seconds) going first; `finish` writes the rest in the
+# same order. One write is one chunk.
+import Math
+open video/Mp4Writer
+open video/VideoGlue
+
+# The movie's own time unit (mvhd, tkhd durations, edits): milliseconds
+const movieTimescale: Int = 1000
+
+type WaitingPacket {
+  bytes: List(UInt8)
+  # track units
+  time: Int
+  decodeTime: Int
+  duration: Int
+  keyframe: Bool
+  # samples in it (1 for a packet; the frames of a PCM block)
+  samples: Int
+}
+
+type WriterTrack {
+  sound: Bool
+  # the sample entry's four characters
+  codec: String
+  width: Int
+  height: Int
+  channels: Int
+  sampleRate: Int
+  timescale: Int
+  # avcC / hvcC payload, or AAC's AudioSpecificConfig
+  config: List(UInt8)
+  configKind: String
+  table: SampleTable
+  waiting: List(WaitingPacket)
+  # the edit: the media shown from `editStart`, -1 for none
+  editStart: Int
+}
+
+type MediaWriter {
+  container: ContainerKind
+  file: Int
+  # where the next sample goes, and where the mdat's 64-bit size is
+  offset: Int
+  mdatStart: Int
+  tracks: List(WriterTrack)
+  error: String
+}
+
+func writeBytes(this: mod MediaWriter, bytes: view List(UInt8)) ret Bool {
+  if this.file < 0 or bytes.length() is 0 {
+    ret this.file >= 0
+  }
+  var wrote: Int = 0
+  unsafe {
+    wrote = rae_video_file_write_at(
+      file: this.file
+      bytes: bytes.data
+      count: bytes.length()
+      offset: this.offset
+    )
+  }
+  if wrote is not bytes.length() {
+    this.error = "writing {bytes.length()} bytes at {this.offset} failed ({wrote})"
+    ret false
+  }
+  this.offset = this.offset + wrote
+  ret true
+}
+
+# Creates the file and writes its head (ftyp, the mdat's header)
+func openMediaWriter(path: view String, container: view ContainerKind) ret MediaWriter {
+  let pathZ: List(UInt8) = textBytesZ(text: path)
+  var file: Int = -1
+  unsafe {
+    file = rae_video_file_create(pathZ: pathZ.data)
+  }
+  var writer: MediaWriter = {
+    container: container
+    file: file
+    offset: 0
+    mdatStart: 0
+    tracks: {}
+    error: ""
+  }
+  if file < 0 {
+    writer.error = "cannot create {path} ({file})"
+    ret writer
+  }
+  let started: Bool = writer.writeBytes(bytes: ftypBox(container: container))
+  writer.mdatStart = writer.offset
+  var mdatHead: List(UInt8) = {}
+  putU32(bytes: mdatHead, value: 1)
+  putText(bytes: mdatHead, text: "mdat")
+  putU64(bytes: mdatHead, value: 0)
+  let headed: Bool = writer.writeBytes(bytes: mdatHead)
+  ret writer
+}
+
+func newTrack(sound: view Bool, codec: view String, timescale: view Int) ret WriterTrack {
+  ret WriterTrack {
+    sound: sound
+    codec: "{codec}"
+    width: 0
+    height: 0
+    channels: 0
+    sampleRate: 0
+    timescale: timescale
+    config: {}
+    configKind: ""
+    table: createSampleTable()
+    waiting: {}
+    editStart: -1
+  }
+}
+
+# A video track ("avc1", "hvc1", or ProRes's "apco" ... "ap4h"): its index
+func addVideoTrack(
+  this: mod MediaWriter
+  codec: view String
+  width: view Int
+  height: view Int
+  timescale: view Int
+) ret Int {
+  var track: WriterTrack = newTrack(sound: false, codec: codec, timescale: timescale)
+  track.width = width
+  track.height = height
+  if codec is "avc1" {
+    track.configKind = "avcC"
+  } else if codec is "hvc1" {
+    track.configKind = "hvcC"
+  }
+  this.tracks.add(value: own track)
+  ret this.tracks.length() - 1
+}
+
+# An AAC track (its AudioSpecificConfig), in units of its sample rate
+func addAacTrack(
+  this: mod MediaWriter
+  channels: view Int
+  sampleRate: view Int
+  audioSpecificConfig: view List(UInt8)
+) ret Int {
+  var track: WriterTrack = newTrack(sound: true, codec: "mp4a", timescale: sampleRate)
+  track.channels = channels
+  track.sampleRate = sampleRate
+  track.config = audioSpecificConfig
+  this.tracks.add(value: own track)
+  ret this.tracks.length() - 1
+}
+
+# A 16-bit little-endian PCM track (MOV's sowt; MOV only): each sample one
+# frame of all channels
+func addPcmTrack(this: mod MediaWriter, channels: view Int, sampleRate: view Int) ret Int {
+  var track: WriterTrack = newTrack(sound: true, codec: "sowt", timescale: sampleRate)
+  track.channels = channels
+  track.sampleRate = sampleRate
+  track.table.constantSize = 2 * channels
+  if this.container is ContainerKind.mp4 {
+    this.error = "16-bit PCM (sowt) is a MOV track; write AAC in an MP4"
+  }
+  this.tracks.add(value: own track)
+  ret this.tracks.length() - 1
+}
+
+# The codec configuration, when it is known only after the first packet (an
+# encoder's avcC / hvcC)
+func setTrackConfig(this: mod MediaWriter, trackIndex: view Int, config: view List(UInt8)) {
+  if let track: mod WriterTrack = this.tracks.modAt(index: trackIndex) {
+    track.config = config
+  }
+}
+
+# The track shows its media from `start` (track units): an AAC track's
+# priming frames left out
+func setEditStart(this: mod MediaWriter, trackIndex: view Int, start: view Int) {
+  if let track: mod WriterTrack = this.tracks.modAt(index: trackIndex) {
+    track.editStart = start
+  }
+}
+
+# Writes a waiting packet's bytes as one chunk and enters it in its table
+func writeChunk(this: mod MediaWriter, trackIndex: view Int, packet: view WaitingPacket) ret Bool {
+  let at: Int = this.offset
+  if not this.writeBytes(bytes: packet.bytes) {
+    ret false
+  }
+  if let track: mod WriterTrack = this.tracks.modAt(index: trackIndex) {
+    track.table.chunkOffsets.add(value: at)
+    track.table.chunkSamples.add(value: packet.samples)
+    if track.table.constantSize > 0 {
+      loop var i: Int = 0, i < packet.samples, ++i {
+        track.table.durations.add(value: 1)
+        track.table.compositionOffsets.add(value: 0)
+      }
+      track.table.sampleCount = track.table.sampleCount + packet.samples
+    } else {
+      track.table.sizes.add(value: packet.bytes.length())
+      track.table.durations.add(value: packet.duration)
+      track.table.compositionOffsets.add(value: packet.time - packet.decodeTime)
+      track.table.sampleCount = track.table.sampleCount + 1
+      if packet.keyframe {
+        track.table.syncSamples.add(value: track.table.sampleCount)
+      } else {
+        track.table.allSync = false
+      }
+    }
+  }
+  ret true
+}
+
+# The track whose first waiting packet decodes first (in seconds), -1 when
+# none waits; with `everyTrack`, only when every track has one waiting
+func nextTrack(this: view MediaWriter, everyTrack: view Bool) ret Int {
+  var found: Int = -1
+  var foundTime: Int = 0
+  var foundScale: Int = 1
+  loop var i: Int = 0, i < this.tracks.length(), ++i {
+    if let track: view WriterTrack = this.tracks.viewAt(index: i) {
+      if let packet: view WaitingPacket = track.waiting.viewAt(index: 0) {
+        # a / s < b / t, compared without dividing
+        if found < 0 or packet.decodeTime * foundScale < foundTime * track.timescale {
+          found = i
+          foundTime = packet.decodeTime
+          foundScale = track.timescale
+        }
+      } else if everyTrack {
+        ret -1
+      }
+    }
+  }
+  ret found
+}
+
+# Writes waiting packets in time order while every track has one waiting (all
+# of them with `everything`)
+func flushWaiting(this: mod MediaWriter, everything: view Bool) ret Bool {
+  loop true {
+    let trackIndex: Int = this.nextTrack(everyTrack: not everything)
+    if trackIndex < 0 {
+      ret true
+    }
+    var packet: WaitingPacket = {
+      bytes: {}
+      time: 0
+      decodeTime: 0
+      duration: 0
+      keyframe: false
+      samples: 0
+    }
+    if let track: mod WriterTrack = this.tracks.modAt(index: trackIndex) {
+      if let first: WaitingPacket = track.waiting.copyAt(index: 0) {
+        packet = first
+      }
+      track.waiting.remove(index: 0)
+    }
+    if not this.writeChunk(trackIndex: trackIndex, packet: packet) {
+      ret false
+    }
+  }
+  ret true
+}
+
+# A packet of a video or AAC track (times in the track's units)
+func writePacket(
+  this: mod MediaWriter
+  trackIndex: view Int
+  bytes: view List(UInt8)
+  time: view Int
+  decodeTime: view Int
+  duration: view Int
+  keyframe: view Bool
+) ret Bool {
+  if let track: mod WriterTrack = this.tracks.modAt(index: trackIndex) {
+    track.waiting.add(value: WaitingPacket {
+      bytes: bytes
+      time: time
+      decodeTime: decodeTime
+      duration: duration
+      keyframe: keyframe
+      samples: 1
+    })
+  }
+  ret this.flushWaiting(everything: false)
+}
+
+# A block of a PCM track: `frames` frames of 16-bit little-endian samples,
+# channels interleaved, following the block before
+func writePcm(
+  this: mod MediaWriter
+  trackIndex: view Int
+  samples: view List(UInt8)
+  frames: view Int
+) ret Bool {
+  if let track: mod WriterTrack = this.tracks.modAt(index: trackIndex) {
+    var start: Int = track.table.sampleCount
+    loop let packet: view WaitingPacket in track.waiting {
+      start = start + packet.samples
+    }
+    track.waiting.add(value: WaitingPacket {
+      bytes: samples
+      time: start
+      decodeTime: start
+      duration: frames
+      keyframe: true
+      samples: frames
+    })
+  }
+  ret this.flushWaiting(everything: false)
+}
+
+# A track's length in its own units
+func trackDuration(track: view WriterTrack) ret Int {
+  var total: Int = 0
+  loop let duration: Int in track.table.durations {
+    total = total + duration
+  }
+  ret total
+}
+
+# Writes what waits, patches the mdat's size, writes the moov and closes the
+# file. False when any of it failed (`error` says what).
+func finish(this: mod MediaWriter) ret Bool {
+  if this.file < 0 {
+    ret false
+  }
+  var ok: Bool = this.error.length() is 0 and this.flushWaiting(everything: true)
+  let mdatSize: Int = this.offset - this.mdatStart
+  var moov: List(UInt8) = {}
+  var movieDuration: Int = 0
+  loop var i: Int = 0, i < this.tracks.length(), ++i {
+    if let track: view WriterTrack = this.tracks.viewAt(index: i) {
+      let duration: Int = trackDuration(track: track)
+      var shown: Int = duration
+      if track.editStart > 0 {
+        shown = max(a: 0, b: duration - track.editStart)
+      }
+      let inMovie: Int = (shown * movieTimescale + track.timescale - 1) / max(
+        a: 1
+        b: track.timescale
+      )
+      movieDuration = max(a: movieDuration, b: inMovie)
+    }
+  }
+  loop var i: Int = 0, i < this.tracks.length(), ++i {
+    if let track: view WriterTrack = this.tracks.viewAt(index: i) {
+      let duration: Int = trackDuration(track: track)
+      var shown: Int = duration
+      if track.editStart > 0 {
+        shown = max(a: 0, b: duration - track.editStart)
+      }
+      var entry: List(UInt8) = {}
+      if track.sound {
+        entry = soundSampleEntry(
+          codec: track.codec
+          channels: track.channels
+          sampleRate: track.sampleRate
+          config: track.config
+        )
+      } else {
+        entry = visualSampleEntry(
+          container: this.container
+          codec: track.codec
+          width: track.width
+          height: track.height
+          config: track.config
+          configKind: track.configKind
+        )
+      }
+      putBytes(
+        bytes: moov
+        more: trakBox(
+          container: this.container
+          header: TrackHeader {
+            trackId: i + 1
+            sound: track.sound
+            width: track.width
+            height: track.height
+            timescale: track.timescale
+            duration: duration
+            movieDuration: (shown * movieTimescale + track.timescale - 1) / max(
+              a: 1
+              b: track.timescale
+            )
+            editStart: track.editStart
+          }
+          sampleEntry: entry
+          table: track.table
+        )
+      )
+    }
+  }
+  var movie: List(UInt8) = {}
+  putBytes(
+    bytes: movie
+    more: mvhdBox(
+      timescale: movieTimescale
+      duration: movieDuration
+      nextTrackId: this.tracks.length() + 1
+    )
+  )
+  putBytes(bytes: movie, more: moov)
+  ok = ok and this.writeBytes(bytes: box(kind: "moov", body: movie))
+  # the mdat's 64-bit size, after its 8-byte header
+  var size: List(UInt8) = {}
+  putU64(bytes: size, value: mdatSize)
+  unsafe {
+    ok = ok and rae_video_file_write_at(
+      file: this.file
+      bytes: size.data
+      count: 8
+      offset: this.mdatStart + 8
+    ) is 8
+    rae_video_file_close(file: this.file)
+  }
+  this.file = -1
+  ret ok
+}

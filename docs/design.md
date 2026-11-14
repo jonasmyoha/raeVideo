@@ -551,7 +551,14 @@ Depends on the audio steps for its clock (audio 1/6 to 4/6).
    `mediaeditor`).
 4. **Export.** VideoToolbox encode (H.264, HEVC, ProRes) and the MP4/MOV writer
    behind `VideoEncoder` / `MediaWriter` in `packages/video` (the box writing in
-   Rae's `lib/media`); the offline loop with audio and the round-trip tests
+   Rae's `lib/media`); **landed 2026-11-15** (video 0.6.0): `VideoEncoder`
+   (H.264, HEVC, ProRes 422 Proxy / LT / 422 / HQ / 4444, fed from an RGBA
+   texture by a GPU pass and a readback, BT.709 tags), `MediaWriter` (MOV and
+   MP4: AAC packets, 16-bit PCM in MOV, interleaved by time), the boxes in
+   `packages/video/Mp4Writer.rae` until they move to `lib/media`; the round trip
+   in `tests/writer`, ffprobe / ffmpeg / AVFoundation in
+   `tools/checkWrittenFiles.sh`. Not yet: an AAC encoder, the FFmpeg package's
+   encoders, input without the readback (QUEUE.md); the offline loop with audio and the round-trip tests
    where the timeline is, in `mediaeditor`.
 5. **The FFmpeg package** (`packages/ffmpeg`, `ffmpeg/v0.1.0`, **landed
    2026-11-14**, §4), dav1d, libvpx, the WebM reader.
