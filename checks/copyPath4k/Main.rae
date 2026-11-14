@@ -1,0 +1,184 @@
+# The 4K copy path, measured (docs/design.md §7, §12 V3): not a test (it needs
+# the 4K files, `sh tests/media/make.sh 4k`, and real time), a measurement to
+# run by hand and write down in docs/measurements.md.
+#
+#   ./rae run checks/copyPath4k/Main.rae
+#
+# 1. Each frame of build/media/counter4k.mp4 (H.264) and counter4kHevc.mp4
+#    (HEVC), 3840x2160 at 29.97 fps, 300 frames: the time to decode it
+#    (VideoToolbox), to upload its planes (the queue's copy from the locked
+#    frame) and to convert it (the compute pass, waited for). Mean, 95th
+#    percentile and largest, in ms.
+# 2. The same files played by video/VideoPlayer against the real clock: the
+#    audio engine is offline but rendered to keep up with the wall clock, the
+#    display refreshes at 60 Hz, and each new frame is uploaded and converted
+#    at once. The work per refresh, the refreshes whose work took longer than
+#    the refresh (16.7 ms), and the frames the player had to skip.
+import Math
+open Time
+open audio/Audio
+open gpu/GpuIds
+open gpu/GpuResources
+open media/MediaTime
+open media/Mp4
+open video/FrameStream
+open video/VideoBackends
+open video/VideoDecoder
+open video/VideoGlue
+open video/VideoPlayer
+open video/YuvPicture
+open webgpu/Context
+
+const refreshNs: Int = 16666667
+
+func milliseconds(nanoseconds: view Int) ret Float {
+  ret (nanoseconds as Float) / 1000000.0
+}
+
+# "mean / p95 / largest" of a list of ns, in ms
+func summary(times: view List(Int)) ret String {
+  let count: Int = times.length()
+  if count is 0 {
+    ret "none"
+  }
+  var sorted: List(Int) = List.create(Int, cap: count)
+  var total: Int = 0
+  loop let time: Int in times {
+    total = total + time
+    var at: Int = sorted.length()
+    loop at > 0 and sorted.copyAtDefault(index: at - 1) > time {
+      at = at - 1
+    }
+    sorted.insert(index: at, value: time)
+  }
+  let mean: Float = milliseconds(nanoseconds: total / count)
+  let p95: Float = milliseconds(nanoseconds: sorted.copyAtDefault(index: count * 95 / 100))
+  let largest: Float = milliseconds(nanoseconds: sorted.copyAtDefault(index: count - 1))
+  ret "mean {mean} ms, p95 {p95} ms, largest {largest} ms"
+}
+
+func measureFrames(resources: mod GpuResources, path: view String) ret Bool {
+  var stream: FrameStream = openFrameStream(path: path, table: defaultVideoBackends())
+  if stream.error.length() > 0 {
+    log("{path}: {stream.error} (make it with: sh tests/media/make.sh 4k)")
+    ret false
+  }
+  var decodeTimes: List(Int) = {}
+  var uploadTimes: List(Int) = {}
+  var convertTimes: List(Int) = {}
+  var totalTimes: List(Int) = {}
+  let track: Mp4Track = stream.reader.track(trackIndex: stream.trackIndex)
+  if var picture: YuvPicture = createYuvPicture(
+    resources: resources
+    width: track.width
+    height: track.height
+  ) {
+    loop var i: Int = 0, i < stream.frameCount(), ++i {
+      let started: Int = nowNs()
+      var frame: VideoFrame = stream.takeFrame(frameIndex: i)
+      let decoded: Int = nowNs()
+      if frame.handle is 0 {
+        log("{path}: no frame {i}")
+        ret false
+      }
+      if true {
+        if not picture.uploadFrame(resources: resources, frame: frame) {
+          log("{path}: upload {i} failed")
+          ret false
+        }
+        let uploaded: Int = nowNs()
+        if not picture.convertNow(resources: resources) {
+          log("{path}: conversion {i} failed")
+          ret false
+        }
+        let converted: Int = nowNs()
+        decodeTimes.add(value: decoded - started)
+        uploadTimes.add(value: uploaded - decoded)
+        convertTimes.add(value: converted - uploaded)
+        totalTimes.add(value: converted - started)
+      }
+      releaseFrame(frame: frame)
+    }
+  }
+  log("{path}: {stream.frameCount()} frames of 3840x2160")
+  log("  decode:  {summary(times: decodeTimes)}")
+  log("  upload:  {summary(times: uploadTimes)}")
+  log("  convert: {summary(times: convertTimes)}")
+  log("  total:   {summary(times: totalTimes)}")
+  stream.close()
+  ret true
+}
+
+func playInRealTime(resources: mod GpuResources, path: view String) ret Bool {
+  var audio: AudioEngine = audioStartOffline(sampleRate: 48000, channels: 2, blockFrames: 256)
+  var player: VideoPlayer = openVideoPlayer(path: path, table: defaultVideoBackends())
+  if player.error.length() > 0 {
+    log("{path}: {player.error}")
+    ret false
+  }
+  let track: Mp4Track = player.frames.reader.track(trackIndex: player.frames.trackIndex)
+  var workTimes: List(Int) = {}
+  var lateRefreshes: Int = 0
+  if var picture: YuvPicture = createYuvPicture(
+    resources: resources
+    width: track.width
+    height: track.height
+  ) {
+    let started: Int = nowNs()
+    player.startPlaying(audio: audio, hostNs: started)
+    var refresh: Int = 0
+    loop not player.ended and refresh < 60 * 15 {
+      refresh = refresh + 1
+      waitUntil(deadlineNs: started + refresh * refreshNs)
+      let now: Int = nowNs()
+      # the offline engine keeps up with the wall clock
+      let wanted: Int = (now - started) / 1000 * 48 / 1000
+      if wanted > audio.renderedFrames {
+        let sound: List(Float) = audio.renderOffline(frames: wanted - audio.renderedFrames)
+      }
+      let workStart: Int = nowNs()
+      if player.refresh(audio: audio, hostNs: now) {
+        let shown: Bool = picture.uploadFrame(resources: resources, frame: player.current) and picture.convertNow(
+          resources: resources
+        )
+      }
+      let work: Int = nowNs() - workStart
+      workTimes.add(value: work)
+      if work > refreshNs {
+        lateRefreshes = lateRefreshes + 1
+      }
+    }
+    log(
+      "{path} played at 60 Hz against the clock: {refresh} refreshes, {player.shownFrames} frames shown, {player.droppedFrames} skipped"
+    )
+    log("  work per refresh: {summary(times: workTimes)}; longer than the refresh: {lateRefreshes}")
+  }
+  player.close(audio: audio)
+  let stopped: Int = stopAudio(this: audio)
+  ret true
+}
+
+func main() ret Int {
+  var ready: Int = 0
+  unsafe {
+    ready = webgpuBootstrap()
+  }
+  if ready is not 1 {
+    log("no GPU")
+    ret 1
+  }
+  var issuer: IdIssuer = IdIssuer.create()
+  if var resources: GpuResources = GpuResources.create(issuer: issuer, capacity: 64) {
+    let files: List(String) = { "build/media/counter4k.mp4", "build/media/counter4kHevc.mp4" }
+    loop let path: String in files {
+      if not measureFrames(resources: resources, path: path) {
+        ret 1
+      }
+      if not playInRealTime(resources: resources, path: path) {
+        ret 1
+      }
+    }
+    ret 0
+  }
+  ret 1
+}

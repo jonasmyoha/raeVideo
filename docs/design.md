@@ -506,7 +506,13 @@ copyrighted clip (`AGENTS.md` here).
 Depends on the audio steps for its clock (audio 1/6 to 4/6).
 
 1. **Media API and playback on Apple** (`packages/video`, the first release
-   `video/v0.1.0`). `MediaReader` over Rae's MP4/MOV demuxer, VideoToolbox
+   `video/v0.1.0`). **Landed 2026-11-14:** `MediaReader`, `VideoBackends`,
+   `VideoDecoder` (VideoToolbox), `FrameStream`, `YuvPicture` (the copy path and
+   `yuvToRgb.wgsl`), `VideoPlayer`; tests in `tests/` (demux against ffprobe,
+   the frame counter, the bars through the GPU, the player against the audio
+   clock), the 4K measurement in [measurements.md](measurements.md). Not yet:
+   10-bit frames (decoded to 8-bit NV12 for now), filtered chroma upsampling,
+   the transfer to linear (step 2). `MediaReader` over Rae's MP4/MOV demuxer, VideoToolbox
    decode (H.264, HEVC, ProRes), the copy path to textures, the YUV to RGB
    shader with tags, rational time, a simple player synced to the audio engine;
    demux and decode tests. Measure the copy path at 4K (decides §12 V3).
@@ -552,7 +558,13 @@ Depends on the audio steps for its clock (audio 1/6 to 4/6).
   its own package here (V1).
 - **V3 — zero-copy frames.** If the copy path is too slow on iPhone, the WebGPU
   implementation needs an external-texture import (Dawn has it, wgpu-native does
-  not in `webgpu.h`). Decide after the step-1 measurement.
+  not in `webgpu.h`). **Measured 2026-11-14 on an M1 Max
+  ([measurements.md](measurements.md)):** the copy path costs about 2 ms per 4K
+  frame (both planes) and the conversion about 2.5 ms, and 4K at 29.97 fps plays
+  with no frame dropped on one thread. So on Apple Silicon Macs the copy path is
+  enough for playback; the peaks come from the decode and the waiting, which the
+  frame pipeline (V3 decode-ahead) addresses. Still open for the iPhone, 10-bit
+  and 60 fps 4K, and many-layer editing.
 - **V4 — HDR surfaces** in our WebGPU build (float surface, extended range,
   color space) on macOS and iOS.
 - **V5 — `color-management-plan.md`** (Rae's). Its backend phases (a Metal
