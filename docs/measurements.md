@@ -69,3 +69,42 @@ Decision for §12 V3: on Apple Silicon Macs the copy path is enough, and the
 zero-copy import (IOSurface into WebGPU) is not needed for playback; it stays
 open for the iPhone, for 10-bit and 60 fps 4K, and for editing with many
 layers, to be measured when those land.
+
+## The frame pipeline at 4K and 59.94 fps — 2026-11-15
+
+What it measures: `checks/pipeline4k/Main.rae`, run by hand after
+`sh tests/media/make.sh 4k` (which now also makes `build/media/counter4k60.mp4`:
+3840x2160, 600 frames at 60000/1001, H.264 High level 5.1).
+
+    ./rae run checks/pipeline4k/Main.rae                                    # 59.94 fps
+    ./rae run checks/pipeline4k/Main.rae -- build/media/counter4k.mp4      # 29.97 fps
+
+`VideoPlayer.refreshFromPipeline` plays the file from a `FramePipeline` against
+the real clock: the audio engine offline, rendered to keep up with the wall
+clock; a refresh every 16.67 ms (60 Hz); the first frame shown paused, then
+play; the file's worker thread decodes 16 frames ahead; the main thread uploads
+at most 2 arrived frames per refresh and records the shown frame's conversion
+into the refresh's recording, submitted and never waited for; a 1 GB cache.
+There is no window, so this is the pipeline without a display's presentation
+(examples/simplePlayer's README has what a window adds). Apple M1 Max, macOS 27.0.
+
+| file | frames shown | skipped | late refreshes | main thread work per refresh (mean / p95 / largest) | cache most |
+|---|---|---|---|---|---|
+| 59.94 fps, run 1 | 600 of 600 | 0 | 0 | 2.10 / 2.46 / 5.88 ms | 1020 of 1024 MB |
+| 59.94 fps, run 2 | 600 of 600 | 0 | 0 | 2.18 / 2.56 / 6.64 ms | 1020 of 1024 MB |
+| 59.94 fps, run 3 | 600 of 600 | 0 | 0 | 2.08 / 2.40 / 6.22 ms | 1020 of 1024 MB |
+| 29.97 fps H.264 | 300 of 300 | 0 | 0 | 1.14 / 2.33 / 6.97 ms | 1020 of 1024 MB |
+| 29.97 fps HEVC | 300 of 300 | 0 | 0 | 1.10 / 2.13 / 6.72 ms | 1020 of 1024 MB |
+
+In every run the worker kept at least 15 frames decoded ahead of the frame
+shown. Compared with the synchronous player of the first measurement (decode,
+upload and a waited conversion on the calling thread: p95 10.5 to 13.5 ms a
+frame at 29.97 fps), the main thread now does only the upload and the recording:
+p95 about 2.5 ms.
+
+What it took besides the threads: at 60 Hz and 59.94 fps the refreshes and the
+frames' starts line up for minutes, and a refresh woken 0.1 ms late skipped a
+frame (the next one repeating it). `VideoPlayer.frameToShow` now calls a refresh
+landing within 2 ms after a frame's start, two frames after the one shown,
+jitter, and shows the frame in between: one frame per refresh, at most 2 ms
+behind the clock. Before it, 1 or 2 frames of 600 were skipped in some runs.

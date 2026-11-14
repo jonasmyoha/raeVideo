@@ -256,3 +256,18 @@ func decodeStartOf(this: view FrameStream, frameIndex: view Int) ret Int {
 func keyframeIndexOf(this: view FrameStream, frameIndex: view Int) ret Int {
   ret this.frameOfSample.copyAtDefault(index: this.decodeStartOf(frameIndex: frameIndex))
 }
+
+# The picture's size as the track states it
+func frameWidth(this: view FrameStream) ret Int {
+  if let track: view Mp4Track = this.reader.movie.tracks.viewAt(index: this.trackIndex) {
+    ret track.width
+  }
+  ret 0
+}
+
+func frameHeight(this: view FrameStream) ret Int {
+  if let track: view Mp4Track = this.reader.movie.tracks.viewAt(index: this.trackIndex) {
+    ret track.height
+  }
+  ret 0
+}

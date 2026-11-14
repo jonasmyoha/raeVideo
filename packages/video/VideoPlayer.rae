@@ -31,6 +31,7 @@ open audio/AudioMixer
 open audio/AudioSchedule
 open audio/AudioStreams
 open media/MediaTime
+open video/FramePipeline
 open video/FrameStream
 open video/MediaReader
 open video/VideoBackends
@@ -55,6 +56,9 @@ type VideoPlayer {
   # frames shown, and frames a refresh came too late for
   shownFrames: Int
   droppedFrames: Int
+  # with a frame pipeline: refreshes whose frame was not decoded yet (the one
+  # before stayed)
+  lateRefreshes: Int
   # play reached the end and stopped there
   ended: Bool
   error: String
@@ -76,6 +80,7 @@ func openVideoPlayer(path: view String, table: view List(VideoBackendChoice)) re
     current: noVideoFrame()
     shownFrames: 0
     droppedFrames: 0
+    lateRefreshes: 0
     ended: false
     error: "{frames.error}"
   }
@@ -201,6 +206,30 @@ func seekToFrame(
   this.seekTo(audio: audio, hostNs: hostNs, time: this.frames.frameTime(frameIndex: frameIndex))
 }
 
+# How far past a frame's start a refresh may land and still be called timing
+# jitter (2 ms, in seconds' thousandths)
+const jitterMilliseconds: Int = 2
+
+# The frame to show at `hostNs` while playing: the one the clock is at, except
+# that a refresh landing within 2 ms after a frame's start, two frames after
+# the one shown, shows the frame in between. When the display's refreshes and
+# the frames' starts line up (60 Hz and 59.94 fps do for minutes), a refresh a
+# little late would otherwise skip a frame and the next one repeat it; this
+# keeps one frame per refresh, at most 2 ms behind the clock.
+func frameToShow(this: view VideoPlayer, audio: view AudioEngine, hostNs: view Int) ret Int {
+  let wanted: Int = this.frameIndexNow(audio: audio, hostNs: hostNs)
+  if this.playing and this.shownFrame >= 0 and wanted is this.shownFrame + 2 {
+    let position: Int = this.positionAt(sample: this.clockSample(audio: audio, hostNs: hostNs))
+    let frameStart: Int = this.frames.frameTime(frameIndex: wanted).toSamples(
+      sampleRate: this.sampleRate
+    )
+    if position - frameStart < this.sampleRate * jitterMilliseconds / 1000 {
+      ret this.shownFrame + 1
+    }
+  }
+  ret wanted
+}
+
 # The index of the frame to show at `hostNs`
 func frameIndexNow(this: view VideoPlayer, audio: view AudioEngine, hostNs: view Int) ret Int {
   ret this.frames.frameIndexAt(time: this.timeAt(audio: audio, hostNs: hostNs))
@@ -209,17 +238,57 @@ func frameIndexNow(this: view VideoPlayer, audio: view AudioEngine, hostNs: view
 # Once per display refresh, with its presentation host time: makes `current`
 # the frame to show then. True when it changed. Reaching the end stops play
 # on the last frame.
-func refresh(this: mod VideoPlayer, audio: mod AudioEngine, hostNs: view Int) ret Bool {
-  if this.error.length() > 0 {
-    ret false
-  }
+# Reaching the end stops play there
+func stopAtEnd(this: mod VideoPlayer, audio: mod AudioEngine, hostNs: view Int) {
   if this.playing and this.positionAt(sample: this.clockSample(audio: audio, hostNs: hostNs)) >= this.endPosition() {
     this.stopSound(audio: audio, atSample: this.startSample(audio: audio, hostNs: hostNs))
     this.anchorPosition = this.endPosition()
     this.playing = false
     this.ended = true
   }
-  let wanted: Int = this.frameIndexNow(audio: audio, hostNs: hostNs)
+}
+
+# Like refresh, with the frames from a frame pipeline (video/FramePipeline)
+# that has the file as source `sourceNumber`: the frame the clock is at becomes
+# `shownFrame` when it is cached (the caller shows it: recordShow), and the
+# `lookahead` frames after it are asked for, decoded ahead on the source's
+# worker. A frame not decoded yet leaves the one before (`lateRefreshes`).
+# `current` is not used. True when the frame to show changed.
+func refreshFromPipeline(
+  this: mod VideoPlayer
+  pipeline: mod FramePipeline
+  sourceNumber: view Int
+  audio: mod AudioEngine
+  hostNs: view Int
+  lookahead: view Int
+) ret Bool {
+  if this.error.length() > 0 {
+    ret false
+  }
+  this.stopAtEnd(audio: audio, hostNs: hostNs)
+  let wanted: Int = this.frameToShow(audio: audio, hostNs: hostNs)
+  pipeline.prefetch(sourceNumber: sourceNumber, first: wanted, last: wanted + lookahead)
+  if wanted is this.shownFrame {
+    ret false
+  }
+  if not pipeline.isCached(sourceNumber: sourceNumber, frameIndex: wanted) {
+    this.lateRefreshes = this.lateRefreshes + 1
+    ret false
+  }
+  if this.playing and this.shownFrame >= 0 and wanted > this.shownFrame + 1 {
+    this.droppedFrames = this.droppedFrames + wanted - this.shownFrame - 1
+  }
+  this.shownFrame = wanted
+  this.shownFrames = this.shownFrames + 1
+  ret true
+}
+
+func refresh(this: mod VideoPlayer, audio: mod AudioEngine, hostNs: view Int) ret Bool {
+  if this.error.length() > 0 {
+    ret false
+  }
+  this.stopAtEnd(audio: audio, hostNs: hostNs)
+  let wanted: Int = this.frameToShow(audio: audio, hostNs: hostNs)
   if wanted is this.shownFrame and this.current.handle is not 0 {
     ret false
   }

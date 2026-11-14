@@ -48,7 +48,7 @@ func waitCached(
   frameIndex: view Int
 ) ret Bool {
   loop var tries: Int = 0, tries < 5000, ++tries {
-    let arrived: Bool = pipeline.update(resources: resources, maxUploads: 8)
+    let arrived: Bool = pipeline.uploadDecoded(resources: resources, maxUploads: 8)
     if pipeline.isCached(sourceNumber: sourceNumber, frameIndex: frameIndex) {
       ret true
     }
@@ -238,7 +238,7 @@ func cutOnTime(resources: mod GpuResources, output: view FrameOutput) ret Bool {
       sleep(ms: 1)
     }
     let movieNs: Int = refresh * refreshNs
-    let arrived: Bool = pipeline.update(resources: resources, maxUploads: 4)
+    let arrived: Bool = pipeline.uploadDecoded(resources: resources, maxUploads: 4)
     # the caller names what it will want: the playing file ahead, and from half
     # a second before the cut, the next file's first frames
     var sourceNumber: Int = first

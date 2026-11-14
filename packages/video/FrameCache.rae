@@ -307,7 +307,7 @@ func slotFor(
 # Puts a decoded frame on the GPU (its planes copied from the decoder's
 # memory by the queue) as frame `frameIndex` of source `sourceNumber`. The
 # caller still releases the frame. False when it could not be kept.
-func store(
+func storeFrame(
   this: mod FrameCache
   resources: mod GpuResources
   sourceNumber: view Int

@@ -536,7 +536,10 @@ Depends on the audio steps for its clock (audio 1/6 to 4/6).
    output; `packages/video`'s player then outputs through it. CDL, the grade
    controls and the scopes are `mediaeditor`'s.
 3. **The editor core** (frame cache and frame-accurate seek, scrub and reverse
-   in `packages/video`'s frame pipeline; the timeline ECS, proxies and the
+   in `packages/video`'s frame pipeline, **landed 2026-11-15** as
+   `FramePipeline`: decode-ahead on a worker thread per file, a GPU frame cache
+   with a budget, scrub, the conversion recorded into the caller's recording;
+   4K at 59.94 fps plays with no frame skipped, [measurements.md](measurements.md); the timeline ECS, proxies and the
    simple composite of layers, opacity, cross dissolve and titles in
    `mediaeditor`).
 4. **Export.** VideoToolbox encode (H.264, HEVC, ProRes) and the MP4/MOV writer
@@ -580,7 +583,9 @@ Depends on the audio steps for its clock (audio 1/6 to 4/6).
   frame (both planes) and the conversion about 2.5 ms, and 4K at 29.97 fps plays
   with no frame dropped on one thread. So on Apple Silicon Macs the copy path is
   enough for playback; the peaks come from the decode and the waiting, which the
-  frame pipeline (V3 decode-ahead) addresses. Still open for the iPhone, 10-bit
+  frame pipeline (V3 decode-ahead) addresses: with it, 4K at 59.94 fps plays
+  with no frame skipped and the main thread's work is about 2.5 ms a refresh
+  (measured 2026-11-15). Still open for the iPhone, 10-bit
   and 60 fps 4K, and many-layer editing.
 - **V4 — HDR surfaces** in our WebGPU build (float surface, extended range,
   color space) on macOS and iOS.

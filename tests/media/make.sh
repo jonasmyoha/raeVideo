@@ -5,7 +5,8 @@
 # LFS); the 4K one is made on demand into build/media (not committed).
 #
 #   sh tests/media/make.sh        # the small files, here
-#   sh tests/media/make.sh 4k     # build/media/counter4k.mp4 (and its HEVC twin)
+#   sh tests/media/make.sh 4k     # build/media/counter4k.mp4 (and its HEVC twin, and
+#                                 # counter4k60.mp4: 3840x2160 at 59.94 fps, 600 frames)
 #
 # The files, and what each one checks:
 #   counter709.mp4      H.264 High with B-frames, 320x180, 90 frames at 30000/1001
@@ -31,6 +32,7 @@ if [ "${1:-}" = 4k ]; then
   mkdir -p "$root/build/media"
   "$tool" "$root/build/media/counter4k.mp4" h264 3840 2160 300 30000 1001 709 limited tone
   "$tool" "$root/build/media/counter4kHevc.mp4" hevc 3840 2160 300 30000 1001 709 limited tone
+  "$tool" "$root/build/media/counter4k60.mp4" h264 3840 2160 600 60000 1001 709 limited tone
   exit 0
 fi
 here="$root/tests/media"

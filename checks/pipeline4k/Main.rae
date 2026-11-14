@@ -1,0 +1,182 @@
+# The frame pipeline at 4K, measured (docs/design.md §5 V3; docs/measurements.md):
+# not a test (it needs the 4K files, `sh tests/media/make.sh 4k`, and real
+# time), a measurement to run by hand.
+#
+#   ./rae run checks/pipeline4k/Main.rae                          # the 59.94 fps file
+#   ./rae run checks/pipeline4k/Main.rae -- build/media/counter4k.mp4
+#
+# video/VideoPlayer plays the file from a video/FramePipeline against the real
+# clock (its first frame shown paused, then play): the audio engine is offline but rendered to keep
+# up with the wall
+# clock, a refresh comes every 16.67 ms (60 Hz), the file's worker decodes 16
+# frames ahead, the main thread uploads at most 2 arrived frames per refresh
+# and records the shown frame's conversion into the refresh's recording,
+# submitted and never waited for (no window: what is measured is the
+# pipeline, not a display's presentation). It reports the main thread's work
+# per refresh, the frames shown, skipped (never shown) and late (a refresh
+# whose frame was not decoded yet), and the cache's most against its budget.
+open Atomic
+open audio/Audio
+open gpu/GpuIds
+open gpu/GpuLifetime
+open gpu/GpuResources
+open Sys
+open Time
+open video/FrameCache
+open video/FramePipeline
+open video/VideoBackends
+open video/VideoPlayer
+open video/YuvPicture
+open webgpu/Context
+
+const refreshNs: Int = 16666667
+
+const budgetBytes: Int = 1024 * 1024 * 1024
+
+func milliseconds(nanoseconds: view Int) ret Float {
+  ret (nanoseconds as Float) / 1000000.0
+}
+
+func summary(times: view List(Int)) ret String {
+  let count: Int = times.length()
+  if count is 0 {
+    ret "none"
+  }
+  var sorted: List(Int) = List.create(Int, cap: count)
+  var total: Int = 0
+  loop let time: Int in times {
+    total = total + time
+    var at: Int = sorted.length()
+    loop at > 0 and sorted.copyAtDefault(index: at - 1) > time {
+      at = at - 1
+    }
+    sorted.insert(index: at, value: time)
+  }
+  ret "mean {milliseconds(nanoseconds: total / count)} ms, p95 {milliseconds(
+    nanoseconds: sorted.copyAtDefault(index: count * 95 / 100)
+  )} ms, largest {milliseconds(nanoseconds: sorted.copyAtDefault(index: count - 1))} ms"
+}
+
+func main() ret Int {
+  var path: String = "build/media/counter4k60.mp4"
+  if argCount() > 0 {
+    path = argAt(index: 0)
+  }
+  var ready: Int = 0
+  unsafe {
+    ready = webgpuBootstrap()
+  }
+  if ready is not 1 {
+    log("no GPU")
+    ret 1
+  }
+  var issuer: IdIssuer = IdIssuer.create()
+  if var resources: GpuResources = GpuResources.create(issuer: issuer, capacity: 1024) {
+    var audio: AudioEngine = audioStartOffline(sampleRate: 48000, channels: 2, blockFrames: 256)
+    var player: VideoPlayer = openVideoPlayer(path: path, table: defaultVideoBackends())
+    var pipeline: FramePipeline = createFramePipeline(budgetBytes: budgetBytes)
+    let source: Int = pipeline.addSource(path: path, table: defaultVideoBackends())
+    if player.error.length() > 0 or source is 0 {
+      log(
+        "{path}: {player.error} {pipeline.sourceError(sourceNumber: source)} (make it with: sh tests/media/make.sh 4k)"
+      )
+      ret 1
+    }
+    let width: Int = player.frames.frameWidth()
+    let height: Int = player.frames.frameHeight()
+    if let output: FrameOutput = createFrameOutput(
+      resources: resources
+      width: width
+      height: height
+    ) {
+      # the first frames decoded before play starts, as a player shows its first
+      # frame paused
+      pipeline.prefetch(sourceNumber: source, first: 0, last: 16)
+      loop var tries: Int = 0, tries < 3000 and not pipeline.isCached(
+        sourceNumber: source
+        frameIndex: 0
+      ), ++tries {
+        let arrived: Bool = pipeline.uploadDecoded(resources: resources, maxUploads: 2)
+        sleep(ms: 1)
+      }
+      var inFlight: List(SubmissionId) = {}
+      var workTimes: List(Int) = {}
+      var aheadLeast: Int = 1000
+      # frame 0 shown paused, then play
+      let first: Bool = player.refreshFromPipeline(
+        pipeline: pipeline
+        sourceNumber: source
+        audio: audio
+        hostNs: nowNs()
+        lookahead: 16
+      )
+      let started: Int = nowNs()
+      player.startPlaying(audio: audio, hostNs: started)
+      var refresh: Int = 0
+      loop not player.ended and refresh < 60 * 30 {
+        refresh = refresh + 1
+        waitUntil(deadlineNs: started + refresh * refreshNs)
+        let now: Int = nowNs()
+        let wanted: Int = (now - started) / 1000 * 48 / 1000
+        if wanted > audio.renderedFrames {
+          let sound: List(Float) = audio.renderOffline(frames: wanted - audio.renderedFrames)
+        }
+        let workStart: Int = nowNs()
+        let arrived: Bool = pipeline.uploadDecoded(resources: resources, maxUploads: 2)
+        let changed: Bool = player.refreshFromPipeline(
+          pipeline: pipeline
+          sourceNumber: source
+          audio: audio
+          hostNs: now
+          lookahead: 16
+        )
+        if changed {
+          if var recording: Recording = beginRecording(resources: resources) {
+            let shown: Bool = pipeline.recordShow(
+              resources: resources
+              recording: recording
+              output: output
+              sourceNumber: source
+              frameIndex: player.shownFrame
+            )
+            if let submission: SubmissionId = submit(resources: resources, recording: recording) {
+              inFlight.add(value: submission)
+            }
+          }
+        }
+        pollSubmissions(inFlight: inFlight, resources: resources)
+        workTimes.add(value: nowNs() - workStart)
+        # how many frames after the shown one are cached: the decode-ahead's slack
+        var ahead: Int = 0
+        loop ahead < 16 and pipeline.isCached(
+          sourceNumber: source
+          frameIndex: player.shownFrame + ahead + 1
+        ) {
+          ahead = ahead + 1
+        }
+        if refresh > 30 and player.shownFrame + 17 < player.frames.frameCount() {
+          aheadLeast = min(a: aheadLeast, b: ahead)
+        }
+      }
+      log(
+        "{path}: {width}x{height}, {player.frames.frameCount()} frames, played at a 60 Hz refresh against the clock"
+      )
+      log(
+        "  frames shown {player.shownFrames}, skipped {player.droppedFrames}, late refreshes {player.lateRefreshes}"
+      )
+      log("  main thread work per refresh: {summary(times: workTimes)}")
+      log("  decoded ahead of the frame shown, at least: {aheadLeast} frames")
+      log(
+        "  cache: most {pipeline.cache.mostBytes / 1048576} MB of a {budgetBytes / 1048576} MB budget, {pipeline.cache.uploaded} frames uploaded, {pipeline.cache.evicted} given up, {pipeline.cache.refused} refused"
+      )
+      loop let submission: SubmissionId in inFlight {
+        let done: Bool = awaitSubmission(resources: resources, id: submission)
+      }
+    }
+    player.close(audio: audio)
+    pipeline.close(resources: resources)
+    let stopped: Int = stopAudio(this: audio)
+    ret 0
+  }
+  ret 1
+}

@@ -8,7 +8,7 @@
 #     let next: Int = pipeline.addSource(path: "b.mov", table: defaultVideoBackends())
 #     var output: FrameOutput = ...createFrameOutput(resources:, width:, height:)...
 #     # each refresh, on the main thread:
-#     pipeline.update(resources: resources, maxUploads: 4)        # what the workers decoded
+#     pipeline.uploadDecoded(resources: resources, maxUploads: 4)        # what the workers decoded
 #     pipeline.prefetch(sourceNumber: clip, first: frame, last: frame + 12)
 #     pipeline.prefetch(sourceNumber: next, first: 0, last: 3)     # the next cut, ahead
 #     if pipeline.recordShow(resources:, recording:, output:, sourceNumber: clip, frameIndex:
@@ -18,7 +18,7 @@
 #     pipeline.close(resources: resources)
 #
 # What runs where: each file's worker (video/DecodeWorker) decodes the frames it
-# is asked for and sends them; the main thread, in `update`, puts them on the
+# is asked for and sends them; the main thread, in `uploadDecoded`, puts them on the
 # GPU (video/FrameCache: the copy from the decoder's memory, a few per refresh)
 # and releases them. Asking for a frame that is cached or already asked for
 # does nothing, so a caller can name every frame it will want each refresh.
@@ -289,7 +289,11 @@ func nearestCached(this: view FramePipeline, sourceNumber: view Int, frameIndex:
 # Once per refresh, on the main thread: up to `maxUploads` decoded frames put
 # on the GPU (the rest wait for the next refresh), each released. True when
 # any arrived.
-func update(this: mod FramePipeline, resources: mod GpuResources, maxUploads: view Int) ret Bool {
+func uploadDecoded(
+  this: mod FramePipeline
+  resources: mod GpuResources
+  maxUploads: view Int
+) ret Bool {
   var arrived: Int = 0
   loop arrived < maxUploads and this.results.pending() > 0 {
     var decoded: DecodedFrame = this.results.receive()
@@ -299,7 +303,7 @@ func update(this: mod FramePipeline, resources: mod GpuResources, maxUploads: vi
         source.asked.set(index: decoded.frameIndex, value: false)
       }
       if not source.closed {
-        let stored: Bool = this.cache.store(
+        let stored: Bool = this.cache.storeFrame(
           resources: resources
           sourceNumber: decoded.sourceNumber
           frameIndex: decoded.frameIndex

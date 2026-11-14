@@ -10,10 +10,12 @@ The design is [docs/design.md](docs/design.md); what lives here,
 
 ## Packages
 
-- `packages/video` (0.2.0): MP4 and MOV reading (`MediaReader`), decoding
+- `packages/video` (0.3.0): MP4 and MOV reading (`MediaReader`), decoding
   through VideoToolbox on Apple (H.264, HEVC, ProRes: `VideoDecoder`,
   `FrameStream`) or a registered backend, a frame on the GPU as RGBA
-  (`YuvPicture`), and a simple player on Rae's audio clock (`VideoPlayer`). It
+  (`YuvPicture`), the frame pipeline (`FramePipeline`: decode-ahead on worker
+  threads for several files, a GPU frame cache with a budget, scrubbing), and a
+  simple player on Rae's audio clock (`VideoPlayer`). It
   depends on Rae's `audio` package 0.15.1.
 - `packages/ffmpeg` (0.1.0): FFmpeg 9.0.2, built LGPL-only from its pinned
   tarball the first time a program uses the package, loaded at run time, as
