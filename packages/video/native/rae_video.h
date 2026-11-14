@@ -98,6 +98,48 @@ int64_t rae_video_vte_config_size(int64_t encoder, int64_t* out);
 int64_t rae_video_vte_copy_config(int64_t encoder, uint8_t* into, int64_t capacity);
 void rae_video_vte_close(int64_t encoder);
 
+/* ---- registered encoders (another package's: packages/ffmpeg) -------------
+ * Like the registered decoders below: a package hands over its encoder's
+ * calls as a pointer to this struct (video/VideoBackends.registerEncoder).
+ * `open` takes the encoder's name and a profile ("dnxhd" with "dnxhr_lb",
+ * "ffv1" with ""); a frame goes in as 8-bit planar Y'CbCr, the planes packed
+ * one after another (Y width x height, then Cb, then Cr, each row as wide as
+ * the plane), laid out as `input_layout` says (2 4:2:0, 3 4:2:2, the frame
+ * layout codes of rae_video.h). Packets and the codec configuration come out
+ * as from rae_video_vte_*. */
+#define RAE_VIDEO_ENCODER_CALLS_VERSION 1
+typedef struct RaeVideoEncoderCalls {
+  int64_t version;
+  int64_t (*open)(uint8_t* encoder_z, uint8_t* profile_z, int64_t width, int64_t height,
+                  int64_t timescale, int64_t bit_rate, int64_t keyframe_interval);
+  int64_t (*input_layout)(int64_t encoder);
+  int64_t (*encode)(int64_t encoder, uint8_t* planes, int64_t time);
+  int64_t (*finish)(int64_t encoder);
+  int64_t (*packet_count)(int64_t encoder);
+  int64_t (*packet_info)(int64_t encoder, int64_t* out);
+  int64_t (*take_packet)(int64_t encoder, uint8_t* into, int64_t capacity);
+  int64_t (*config_size)(int64_t encoder, int64_t* out);
+  int64_t (*copy_config)(int64_t encoder, uint8_t* into, int64_t capacity);
+  void (*close)(int64_t encoder);
+} RaeVideoEncoderCalls;
+
+int64_t rae_video_encoder_register(void* calls);
+int64_t rae_video_registered_encoder_open(int64_t backend, uint8_t* encoder_z, uint8_t* profile_z,
+                                          int64_t width, int64_t height, int64_t timescale,
+                                          int64_t bit_rate, int64_t keyframe_interval);
+int64_t rae_video_registered_encoder_input_layout(int64_t backend, int64_t encoder);
+int64_t rae_video_registered_encoder_encode(int64_t backend, int64_t encoder, uint8_t* planes,
+                                            int64_t time);
+int64_t rae_video_registered_encoder_finish(int64_t backend, int64_t encoder);
+int64_t rae_video_registered_encoder_packet_count(int64_t backend, int64_t encoder);
+int64_t rae_video_registered_encoder_packet_info(int64_t backend, int64_t encoder, int64_t* out);
+int64_t rae_video_registered_encoder_take_packet(int64_t backend, int64_t encoder, uint8_t* into,
+                                                 int64_t capacity);
+int64_t rae_video_registered_encoder_config_size(int64_t backend, int64_t encoder, int64_t* out);
+int64_t rae_video_registered_encoder_copy_config(int64_t backend, int64_t encoder, uint8_t* into,
+                                                 int64_t capacity);
+void rae_video_registered_encoder_close(int64_t backend, int64_t encoder);
+
 /* ---- files for writing ------------------------------------------------------ */
 /* Creates (or empties) a file for writing: its descriptor, or a negative errno */
 int64_t rae_video_file_create(uint8_t* path_z);

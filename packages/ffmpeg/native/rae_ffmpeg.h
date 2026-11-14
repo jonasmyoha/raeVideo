@@ -15,6 +15,10 @@ int64_t rae_ffmpeg_available(void);
 /* The calls to give to video's rae_video_backend_register, or NULL when FFmpeg
  * is not available */
 void* rae_ffmpeg_backend_calls(void);
+/* The encoder calls to give to video's rae_video_encoder_register (a
+ * RaeVideoEncoderCalls: "dnxhd" with a DNxHR profile, "ffv1"), or NULL when
+ * FFmpeg is not available */
+void* rae_ffmpeg_encoder_calls(void);
 /* A text about the loaded FFmpeg into `into` (at most `capacity` bytes, no
  * zero added): 1 its configure line, 2 its license, 3 its version, 4 why it
  * did not load. Its length. */

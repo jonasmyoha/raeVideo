@@ -1,18 +1,23 @@
 # video/VideoEncoder — frames in, encoded packets out (docs/design.md §5 V2,
 # §6.4): H.264, HEVC and ProRes (422 Proxy, LT, 422, HQ, 4444) through
-# VideoToolbox, fed from a picture on the GPU.
+# VideoToolbox, and what a registered encoder adds (packages/ffmpeg: DNxHR LB
+# and HQ, FFV1), fed from a picture on the GPU. Which backend encodes which
+# codec is a Rae table (EncoderBackend), as for decoding (video/VideoBackends).
 #
-#     var encoder: VideoEncoder = openVideoEncoder(settings: settings)
+#     var encoder: VideoEncoder = openVideoEncoder(resources:, settings:, table:
+#     defaultEncoderBackends())
 #     encoder.encodeTexture(resources:, texture: picture.picture, time: frameIndex * 1001)
 #     ... loop: let packets: List(EncodedPacket) = encoder.takePackets() -> a MediaWriter ...
 #     encoder.finish()      # then takePackets() for the last ones
 #     encoder.close(resources:)
 #
 # A frame goes from an RGBA texture (rgba8unorm, R'G'B' as YuvPicture gives it)
-# to the encoder by a readback: a compute pass (rgbaToBgra.wgsl) packs it as
-# 32-bit BGRA into a buffer, the buffer is read back, and the C glue copies it
-# into an IOSurface-backed pixel buffer of the session's pool. VideoToolbox
-# converts to the codec's Y'CbCr with BT.709 tags. Handing it the texture's own
+# to the encoder by a readback. For VideoToolbox a compute pass
+# (rgbaToBgra.wgsl) packs it as 32-bit BGRA, the C glue copies it into an
+# IOSurface-backed pixel buffer of the session's pool, and VideoToolbox converts
+# to the codec's Y'CbCr with BT.709 tags. For a registered encoder the pass
+# (rgbaToPlanar.wgsl) converts it to the 8-bit planar Y'CbCr it takes (BT.709,
+# limited range; 4:2:2 for DNxHR, 4:2:0 for FFV1). Handing it the texture's own
 # memory (an IOSurface-backed texture, no readback) needs a way to import one
 # that webgpu.h does not have yet (docs/design.md §12 V3).
 #
@@ -25,6 +30,8 @@ open gpu/GpuIds
 open gpu/GpuLifetime
 open gpu/GpuRenderTransfer
 open gpu/GpuResources
+open video/VideoBackends
+open video/VideoDecoder
 open video/VideoGlue
 open video/YuvPicture
 open webgpu/ReadRequest
@@ -38,6 +45,10 @@ enum VideoCodec {
   prores422
   prores422Hq
   prores4444
+  # a registered encoder's (packages/ffmpeg)
+  dnxhrLb
+  dnxhrHq
+  ffv1
 }
 
 type EncoderSettings {
@@ -60,10 +71,27 @@ type EncodedPacket {
   keyframe: Bool
 }
 
+# Which backend encodes a codec: VideoToolbox, or a registered encoder (its
+# number, the encoder's name and profile it is opened with)
+type EncoderBackend {
+  codec: VideoCodec
+  kind: VideoBackend
+  number: Int
+  encoderName: String
+  profile: String
+}
+
 type VideoEncoder {
   settings: EncoderSettings
+  kind: VideoBackend
+  number: Int
   handle: Int
-  # the GPU side: the packed frame, its readback, the packing pass
+  # what the GPU pass makes: BGRA (VideoToolbox) or 8-bit planar Y'CbCr in
+  # this layout (a registered encoder)
+  planar: Bool
+  inputLayout: FrameLayout
+  inputBytes: Int
+  # the GPU side: the converted frame, its readback, the pass
   packed: BufferId
   readback: BufferId
   sizes: BufferId
@@ -96,21 +124,81 @@ func codecFourCharacters(codec: view VideoCodec) ret String {
   if codec is VideoCodec.prores4444 {
     ret "ap4h"
   }
+  if codec is VideoCodec.dnxhrLb or codec is VideoCodec.dnxhrHq {
+    ret "AVdh"
+  }
+  if codec is VideoCodec.ffv1 {
+    ret "FFV1"
+  }
   ret "avc1"
 }
 
-func packedBytes(settings: view EncoderSettings) ret Int {
-  ret settings.width * settings.height * 4
+# The codecs VideoToolbox encodes
+func videoToolboxEncoderCodecs() ret List(VideoCodec) {
+  ret List(VideoCodec) {
+    VideoCodec.h264
+    VideoCodec.hevc
+    VideoCodec.prores422Proxy
+    VideoCodec.prores422Lt
+    VideoCodec.prores422
+    VideoCodec.prores422Hq
+    VideoCodec.prores4444
+  }
 }
 
-func openVideoEncoder(
-  resources: mod GpuResources
-  settings: view EncoderSettings
-) ret VideoEncoder {
-  let packing: Shader = shader(files: ["lib/gpu/computeBounds.wgsl", "rgbaToBgra.wgsl"])
-  var encoder: VideoEncoder = {
+func defaultEncoderBackends() ret List(EncoderBackend) {
+  var table: List(EncoderBackend) = {}
+  if Target.isApple {
+    loop let codec: VideoCodec in videoToolboxEncoderCodecs() {
+      table.add(value: EncoderBackend {
+        codec: codec
+        kind: VideoBackend.videoToolbox
+        number: 0
+        encoderName: ""
+        profile: ""
+      })
+    }
+  }
+  ret table
+}
+
+# Gives an encoder's C calls (a RaeVideoEncoderCalls, native/rae_video.h) to
+# this package's C: its number, or 0 when they do not fit
+func registerEncoder(calls: view Ptr) ret Int {
+  unsafe {
+    ret rae_video_encoder_register(calls: calls)
+  }
+}
+
+# Puts a registered encoder in the table for `codec`, ahead of any other
+func addEncoderBackend(
+  this: mod List(EncoderBackend)
+  codec: view VideoCodec
+  number: view Int
+  encoderName: view String
+  profile: view String
+) {
+  this.insert(
+    index: 0
+    value: EncoderBackend {
+      codec: codec
+      kind: VideoBackend.registered
+      number: number
+      encoderName: "{encoderName}"
+      profile: "{profile}"
+    }
+  )
+}
+
+func noVideoEncoder(settings: view EncoderSettings) ret VideoEncoder {
+  ret VideoEncoder {
     settings: settings
+    kind: VideoBackend.none
+    number: 0
     handle: 0
+    planar: false
+    inputLayout: FrameLayout.unsupported
+    inputBytes: 0
     packed: noBufferId()
     readback: noBufferId()
     sizes: noBufferId()
@@ -119,24 +207,98 @@ func openVideoEncoder(
     bindGroup: noBindGroupId()
     boundTexture: -1
     framesGiven: 0
-    error: ""
+    error: "no encoder for {codecFourCharacters(codec: settings.codec)} here"
   }
-  unsafe {
-    encoder.handle = rae_video_vte_open(
-      codec: fourCharacterCode(text: codecFourCharacters(codec: settings.codec))
-      width: settings.width
-      height: settings.height
-      timescale: settings.timescale
-      bitRate: settings.bitRate
-      qualityPercent: settings.quality
-      keyframeInterval: settings.keyframeInterval
-    )
+}
+
+# Opens the backend for the codec: true when one opened
+func openBackend(this: mod VideoEncoder, table: view List(EncoderBackend)) ret Bool {
+  let settings: EncoderSettings = this.settings
+  loop let backend: view EncoderBackend in table {
+    if this.handle is 0 and backend.codec is settings.codec {
+      unsafe {
+        if backend.kind is VideoBackend.videoToolbox {
+          this.handle = rae_video_vte_open(
+            codec: fourCharacterCode(text: codecFourCharacters(codec: settings.codec))
+            width: settings.width
+            height: settings.height
+            timescale: settings.timescale
+            bitRate: settings.bitRate
+            qualityPercent: settings.quality
+            keyframeInterval: settings.keyframeInterval
+          )
+        } else {
+          let nameZ: List(UInt8) = textBytesZ(text: backend.encoderName)
+          let profileZ: List(UInt8) = textBytesZ(text: backend.profile)
+          this.handle = rae_video_registered_encoder_open(
+            backend: backend.number
+            encoderZ: nameZ.data
+            profileZ: profileZ.data
+            width: settings.width
+            height: settings.height
+            timescale: settings.timescale
+            bitRate: settings.bitRate
+            keyframeInterval: settings.keyframeInterval
+          )
+        }
+      }
+      if this.handle is not 0 {
+        this.kind = backend.kind
+        this.number = backend.number
+      }
+    }
   }
-  if encoder.handle is 0 {
-    encoder.error = "VideoToolbox has no {codecFourCharacters(codec: settings.codec)} encoder for {settings.width}x{settings.height}"
+  ret this.handle is not 0
+}
+
+func openVideoEncoder(
+  resources: mod GpuResources
+  settings: view EncoderSettings
+  table: view List(EncoderBackend)
+) ret VideoEncoder {
+  var encoder: VideoEncoder = noVideoEncoder(settings: settings)
+  if not encoder.openBackend(table: table) {
     ret encoder
   }
-  let size: Int = packedBytes(settings: settings)
+  encoder.error = ""
+  var sizeWords: List(UInt8) = List.create(UInt8, cap: 32)
+  var conversion: Shader = shader(files: ["lib/gpu/computeBounds.wgsl", "rgbaToBgra.wgsl"])
+  var size: Int = settings.width * settings.height * 4
+  if encoder.kind is VideoBackend.registered {
+    var layoutCode: Int = 0
+    unsafe {
+      layoutCode = rae_video_registered_encoder_input_layout(
+        backend: encoder.number
+        encoder: encoder.handle
+      )
+    }
+    encoder.planar = true
+    encoder.inputLayout = layoutOfCode(code: layoutCode)
+    if encoder.inputLayout is not FrameLayout.planar420 and encoder.inputLayout is not FrameLayout.planar422 {
+      encoder.error = "the encoder takes a layout this package cannot make ({layoutCode})"
+      ret encoder
+    }
+    let chromaWidth: Int = (settings.width + 1) / 2
+    let rows: Int = chromaHeightDivisorOf(layout: encoder.inputLayout)
+    let chromaHeight: Int = (settings.height + rows - 1) / rows
+    encoder.inputBytes = settings.width * settings.height + 2 * chromaWidth * chromaHeight
+    size = (encoder.inputBytes + 3) / 4 * 4
+    addWord(bytes: sizeWords, word: settings.width)
+    addWord(bytes: sizeWords, word: settings.height)
+    addWord(bytes: sizeWords, word: chromaWidth)
+    addWord(bytes: sizeWords, word: chromaHeight)
+    addWord(bytes: sizeWords, word: rows)
+    addWord(bytes: sizeWords, word: 0)
+    addWord(bytes: sizeWords, word: 0)
+    addWord(bytes: sizeWords, word: 0)
+    conversion = shader(files: ["lib/gpu/computeBounds.wgsl", "rgbaToPlanar.wgsl"])
+  } else {
+    encoder.inputBytes = size
+    addWord(bytes: sizeWords, word: settings.width)
+    addWord(bytes: sizeWords, word: settings.height)
+    addWord(bytes: sizeWords, word: 0)
+    addWord(bytes: sizeWords, word: 0)
+  }
   var made: Bool = false
   if let packed: BufferId = createBuffer(
     resources: resources
@@ -150,21 +312,16 @@ func openVideoEncoder(
     ) {
       if let sizes: BufferId = createBuffer(
         resources: resources
-        size: 16
+        size: sizeWords.length()
         usage: WGPUBufferUsage_Uniform + WGPUBufferUsage_CopyDst
       ) {
-        var words: List(UInt8) = List.create(UInt8, cap: 16)
-        addWord(bytes: words, word: settings.width)
-        addWord(bytes: words, word: settings.height)
-        addWord(bytes: words, word: 0)
-        addWord(bytes: words, word: 0)
         if let bounds: ComputeBounds = createComputeBounds(
           resources: resources
           workgroupSize: conversionWorkgroupSize
         ) {
           if let pipeline: PipelineId = createBoundedComputePipeline(
             resources: resources
-            wgsl: packing.text
+            wgsl: conversion.text
             entryPoint: "main"
             bounds: bounds
           ) {
@@ -177,7 +334,7 @@ func openVideoEncoder(
               resources: resources
               id: sizes
               offset: 0
-              bytes: words
+              bytes: sizeWords
             )
           }
         }
@@ -190,9 +347,18 @@ func openVideoEncoder(
   ret encoder
 }
 
-# Packs the texture (rgba8unorm, the encoder's size) on the GPU, reads it back
-# and gives it to the encoder as the frame shown at `time`. Waits for the GPU
-# (an export runs offline).
+# The number of invocations of the pass: a pixel each (BGRA), a 4-byte word
+# each (planar)
+func passCount(this: view VideoEncoder) ret Int {
+  if this.planar {
+    ret (this.inputBytes + 3) / 4
+  }
+  ret this.settings.width * this.settings.height
+}
+
+# Converts the texture (rgba8unorm, the encoder's size) on the GPU, reads it
+# back and gives it to the encoder as the frame shown at `time`. Waits for the
+# GPU (an export runs offline).
 func encodeTexture(
   this: mod VideoEncoder
   resources: mod GpuResources
@@ -231,16 +397,16 @@ func encodeTexture(
       ret false
     }
   }
-  let size: Int = packedBytes(settings: this.settings)
+  let size: Int = (this.inputBytes + 3) / 4 * 4
   var done: Bool = false
   if var recording: Recording = beginRecording(resources: resources) {
-    let packed: Bool = recordBoundedCompute(
+    let converted: Bool = recordBoundedCompute(
       recording: recording
       resources: resources
       pipeline: this.pipeline
       bindGroup: this.bindGroup
       bounds: this.bounds
-      elementCount: this.settings.width * this.settings.height
+      elementCount: this.passCount()
     )
     let copied: Bool = recordCopyBuffer(
       recording: recording
@@ -252,11 +418,11 @@ func encodeTexture(
       size: size
     )
     if let submission: SubmissionId = submit(resources: resources, recording: recording) {
-      done = packed and copied and awaitSubmission(resources: resources, id: submission)
+      done = converted and copied and awaitSubmission(resources: resources, id: submission)
     }
   }
   if not done {
-    this.error = "packing frame {this.framesGiven} failed"
+    this.error = "converting frame {this.framesGiven} failed"
     ret false
   }
   var pixels: List(UInt8) = List.create(UInt8, cap: size)
@@ -282,19 +448,64 @@ func encodeTexture(
   }
   var result: Int = 0
   unsafe {
-    result = rae_video_vte_encode(
-      encoder: this.handle
-      bgra: pixels.data
-      bytesPerRow: this.settings.width * 4
-      time: time
-    )
+    if this.kind is VideoBackend.videoToolbox {
+      result = rae_video_vte_encode(
+        encoder: this.handle
+        bgra: pixels.data
+        bytesPerRow: this.settings.width * 4
+        time: time
+      )
+    } else {
+      result = rae_video_registered_encoder_encode(
+        backend: this.number
+        encoder: this.handle
+        planes: pixels.data
+        time: time
+      )
+    }
   }
   if result is not 0 {
-    this.error = "VideoToolbox refused frame {this.framesGiven} ({result})"
+    this.error = "the encoder refused frame {this.framesGiven} ({result})"
     ret false
   }
   this.framesGiven = this.framesGiven + 1
   ret true
+}
+
+func waitingPackets(this: view VideoEncoder) ret Int {
+  unsafe {
+    if this.kind is VideoBackend.videoToolbox {
+      ret rae_video_vte_packet_count(encoder: this.handle)
+    }
+    ret rae_video_registered_encoder_packet_count(backend: this.number, encoder: this.handle)
+  }
+}
+
+func packetInfo(this: view VideoEncoder, info: mod List(Int)) ret Bool {
+  unsafe {
+    if this.kind is VideoBackend.videoToolbox {
+      ret rae_video_vte_packet_info(encoder: this.handle, out: info.data) is 0
+    }
+    ret rae_video_registered_encoder_packet_info(
+      backend: this.number
+      encoder: this.handle
+      out: info.data
+    ) is 0
+  }
+}
+
+func takePacketBytes(this: view VideoEncoder, bytes: mod List(UInt8), size: view Int) ret Int {
+  unsafe {
+    if this.kind is VideoBackend.videoToolbox {
+      ret rae_video_vte_take_packet(encoder: this.handle, into: bytes.data, capacity: size)
+    }
+    ret rae_video_registered_encoder_take_packet(
+      backend: this.number
+      encoder: this.handle
+      into: bytes.data
+      capacity: size
+    )
+  }
 }
 
 # The packets encoded so far, oldest first
@@ -305,27 +516,15 @@ func takePackets(this: mod VideoEncoder) ret List(EncodedPacket) {
   }
   var info: List(Int) = List.create(Int, cap: 4)
   info.addDefaults(count: 4)
-  var waiting: Int = 0
-  unsafe {
-    waiting = rae_video_vte_packet_count(encoder: this.handle)
-  }
+  let waiting: Int = this.waitingPackets()
   loop var i: Int = 0, i < waiting, ++i {
-    var size: Int = -1
-    unsafe {
-      if rae_video_vte_packet_info(encoder: this.handle, out: info.data) is 0 {
-        size = info.copyAtDefault(index: 0)
-      }
-    }
-    if size < 0 {
+    if not this.packetInfo(info: info) {
       ret packets
     }
+    let size: Int = info.copyAtDefault(index: 0)
     var bytes: List(UInt8) = List.create(UInt8, cap: max(a: 1, b: size))
     bytes.addDefaults(count: size)
-    var copied: Int = -1
-    unsafe {
-      copied = rae_video_vte_take_packet(encoder: this.handle, into: bytes.data, capacity: size)
-    }
-    if copied is size {
+    if this.takePacketBytes(bytes: bytes, size: size) is size {
       packets.add(
         value: EncodedPacket {
           bytes: own bytes
@@ -345,30 +544,51 @@ func finish(this: mod VideoEncoder) ret Bool {
     ret false
   }
   unsafe {
-    ret rae_video_vte_finish(encoder: this.handle) is 0 and rae_video_vte_failures(
-      encoder: this.handle
-    ) is 0
+    if this.kind is VideoBackend.videoToolbox {
+      ret rae_video_vte_finish(encoder: this.handle) is 0 and rae_video_vte_failures(
+        encoder: this.handle
+      ) is 0
+    }
+    ret rae_video_registered_encoder_finish(backend: this.number, encoder: this.handle) is 0
   }
 }
 
-# The codec configuration the sample entry needs (avcC / hvcC payload; empty
-# for ProRes), known once a packet has come out
+# The codec configuration the sample entry needs (avcC / hvcC payload, FFV1's
+# extradata; empty for ProRes and DNxHR), known once a packet has come out,
+# and the box it goes in (`configKindOf`)
 func codecConfig(this: view VideoEncoder) ret List(UInt8) {
   var info: List(Int) = List.create(Int, cap: 1)
   info.addDefaults(count: 1)
   var size: Int = 0
   unsafe {
-    size = rae_video_vte_config_size(encoder: this.handle, out: info.data)
+    if this.kind is VideoBackend.videoToolbox {
+      size = rae_video_vte_config_size(encoder: this.handle, out: info.data)
+    } else {
+      size = rae_video_registered_encoder_config_size(
+        backend: this.number
+        encoder: this.handle
+        out: info.data
+      )
+    }
   }
   var bytes: List(UInt8) = List.create(UInt8, cap: max(a: 1, b: size))
   if size > 0 {
     bytes.addDefaults(count: size)
     unsafe {
-      let copied: Int = rae_video_vte_copy_config(
-        encoder: this.handle
-        into: bytes.data
-        capacity: size
-      )
+      if this.kind is VideoBackend.videoToolbox {
+        let copied: Int = rae_video_vte_copy_config(
+          encoder: this.handle
+          into: bytes.data
+          capacity: size
+        )
+      } else {
+        let copied: Int = rae_video_registered_encoder_copy_config(
+          backend: this.number
+          encoder: this.handle
+          into: bytes.data
+          capacity: size
+        )
+      }
     }
   }
   ret bytes
@@ -377,7 +597,11 @@ func codecConfig(this: view VideoEncoder) ret List(UInt8) {
 func close(this: mod VideoEncoder, resources: mod GpuResources) {
   if this.handle is not 0 {
     unsafe {
-      rae_video_vte_close(encoder: this.handle)
+      if this.kind is VideoBackend.videoToolbox {
+        rae_video_vte_close(encoder: this.handle)
+      } else {
+        rae_video_registered_encoder_close(backend: this.number, encoder: this.handle)
+      }
     }
     this.handle = 0
   }

@@ -12,3 +12,5 @@ func rae_ffmpeg_text(
   into: Buffer(UInt8)
   capacity: Int
 ) unsafe extern("rae_ffmpeg_text") ret Int
+
+func rae_ffmpeg_encoder_calls() unsafe extern("rae_ffmpeg_encoder_calls") ret Ptr

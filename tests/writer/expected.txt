@@ -5,4 +5,7 @@ proresProxy.mov: 30 frames of 30 read back, counters 0..29 in order: true; PCM s
 prores422.mov: 30 frames of 30 read back, counters 0..29 in order: true
 proresHq.mov: 30 frames of 30 read back, counters 0..29 in order: true
 prores4444.mov: 30 frames of 30 read back, counters 0..29 in order: true
+dnxhrLb.mov: 30 frames of 30 read back, counters 0..29 in order: true; PCM sound 48048 frames, byte for byte: true
+dnxhrHq.mov: 30 frames of 30 read back, counters 0..29 in order: true
+ffv1.mov: 30 frames of 30 read back, counters 0..29 in order: true
 done

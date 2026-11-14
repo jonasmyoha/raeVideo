@@ -163,7 +163,7 @@ func visualSampleEntry(
   putZeros(bytes: body, count: 31 - name.length())
   putU16(bytes: body, value: 24)
   putU16(bytes: body, value: 65535)
-  if configKind.length() > 0 {
+  if configKind.length() > 0 and config.length() > 0 {
     putBytes(bytes: body, more: box(kind: configKind, body: config))
   }
   var colr: List(UInt8) = {}

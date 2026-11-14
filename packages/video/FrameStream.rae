@@ -57,7 +57,9 @@ func openFrameStreamWithDepth(
   if error.length() is 0 and trackIndex < 0 {
     error = "{path} has no video track"
   }
-  let track: Mp4Track = reader.track(trackIndex: trackIndex)
+  var track: Mp4Track = reader.track(trackIndex: trackIndex)
+  # a codec whose configuration is in a glbl box (FFV1) gets it from there
+  track.codecConfig = reader.codecConfigOfTrack(trackIndex: trackIndex)
   var decoder: VideoDecoder = openVideoDecoderWithDepth(
     track: track
     tags: reader.colorTagsOfTrack(trackIndex: trackIndex)

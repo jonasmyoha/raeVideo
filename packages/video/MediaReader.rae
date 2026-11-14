@@ -26,6 +26,9 @@ type MediaReader {
   decodeShifts: List(Int)
   # per track, its color tags (present only for a video track with a colr box)
   colorTags: List(ColorTags)
+  # per track, the payload of its sample entry's glbl box (an FFmpeg codec's
+  # extradata: FFV1's configuration), empty when it has none
+  globalHeaders: List(List(UInt8))
   # "" when the file was read
   error: String
 }
@@ -82,6 +85,7 @@ func failedReader(error: view String) ret MediaReader {
     movie: failedMp4Movie(error: error)
     decodeShifts: {}
     colorTags: {}
+    globalHeaders: {}
     error: "{error}"
   }
 }
@@ -123,6 +127,7 @@ func openMediaReader(path: view String) ret MediaReader {
         movie: movie
         decodeShifts: decodeShiftsOf(movie: movie)
         colorTags: colorTagsOf(moov: moov)
+        globalHeaders: globalHeadersOf(moov: moov)
         error: "{movie.error}"
       }
     }
@@ -214,6 +219,75 @@ func colorTagsOf(moov: view List(UInt8)) ret List(ColorTags) {
     at = at + child.size
   }
   ret tags
+}
+
+# The glbl box among a visual sample entry's children: its payload, or empty
+func globalHeaderOfEntry(bytes: view List(UInt8), entry: view Mp4Box) ret List(UInt8) {
+  var at: Int = mp4Body(box: entry) + 78
+  let end: Int = mp4End(box: entry)
+  loop at + 8 <= end {
+    let child: Mp4Box = mp4BoxAt(bytes: bytes, at: at, end: end)
+    if child.kind is "" or child.size <= 0 {
+      ret List(UInt8) {}
+    }
+    if child.kind is "glbl" {
+      ret mp4Copy(bytes: bytes, from: mp4Body(box: child), end: mp4End(box: child))
+    }
+    at = at + child.size
+  }
+  ret List(UInt8) {}
+}
+
+# Each trak's glbl payload, in media/Mp4's track order (Mp4 does not read glbl)
+func globalHeadersOf(moov: view List(UInt8)) ret List(List(UInt8)) {
+  var headers: List(List(UInt8)) = {}
+  let box: Mp4Box = mp4BoxAt(bytes: moov, at: 0, end: moov.length())
+  if box.kind is not "moov" {
+    ret headers
+  }
+  let end: Int = mp4End(box: box)
+  var at: Int = mp4Body(box: box)
+  loop at < end {
+    let child: Mp4Box = mp4BoxAt(bytes: moov, at: at, end: end)
+    if child.kind is "" or child.size <= 0 {
+      ret headers
+    }
+    if child.kind is "trak" {
+      var found: List(UInt8) = {}
+      let stsd: Mp4Box = mp4FindPath(
+        bytes: moov
+        from: mp4Body(box: child)
+        end: mp4End(box: child)
+        path: "mdia/minf/stbl/stsd"
+      )
+      if stsd.kind is "stsd" {
+        let entry: Mp4Box = mp4BoxAt(
+          bytes: moov
+          at: mp4Body(box: stsd) + 8
+          end: mp4End(box: stsd)
+        )
+        if entry.kind is not "" {
+          found = globalHeaderOfEntry(bytes: moov, entry: entry)
+        }
+      }
+      headers.add(value: own found)
+    }
+    at = at + child.size
+  }
+  ret headers
+}
+
+# The track's codec configuration: media/Mp4's (avcC, hvcC, ...), else its
+# glbl payload
+func codecConfigOfTrack(this: view MediaReader, trackIndex: view Int) ret List(UInt8) {
+  let track: Mp4Track = this.track(trackIndex: trackIndex)
+  if track.codecConfig.length() > 0 {
+    ret track.codecConfig
+  }
+  if let header: List(UInt8) = this.globalHeaders.copyAt(index: trackIndex) {
+    ret header
+  }
+  ret List(UInt8) {}
 }
 
 # The track's color tags (not present when it has none)

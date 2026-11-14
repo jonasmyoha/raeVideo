@@ -4,7 +4,8 @@
 # that texture, and written; each file is then read back with this package's
 # own reader and decoder:
 #
-# - every frame's burned-in counter, in order: none lost, none repeated;
+# - every frame's burned-in counter, in order: none lost, none repeated (the
+#   VideoToolbox codecs, and packages/ffmpeg's DNxHR LB and HQ and FFV1);
 # - a MOV's 16-bit PCM sound (a pattern made here, interleaved with the video
 #   by time) byte for byte;
 # - an MP4's AAC sound (the source's packets, copied) packet for packet, with
@@ -14,6 +15,7 @@
 # AVFoundation, which QuickTime Player is built on).
 import Math
 open Sys
+open ffmpeg/Ffmpeg
 open gpu/GpuIds
 open gpu/GpuResources
 open media/Mp4
@@ -70,7 +72,12 @@ type Case {
   sound: Int
 }
 
-func writeCase(resources: mod GpuResources, test: view Case) ret Bool {
+func writeCase(
+  resources: mod GpuResources
+  test: view Case
+  encoders: view List(EncoderBackend)
+  decoders: view List(VideoBackendChoice)
+) ret Bool {
   let path: String = "build/writer/{test.name}"
   var stream: FrameStream = openFrameStream(path: sourcePath, table: defaultVideoBackends())
   let settings: EncoderSettings = {
@@ -82,7 +89,11 @@ func writeCase(resources: mod GpuResources, test: view Case) ret Bool {
     quality: 0
     keyframeInterval: 15
   }
-  var encoder: VideoEncoder = openVideoEncoder(resources: resources, settings: settings)
+  var encoder: VideoEncoder = openVideoEncoder(
+    resources: resources
+    settings: settings
+    table: encoders
+  )
   if encoder.error.length() > 0 {
     log("FAIL: {test.name}: {encoder.error}")
     ret false
@@ -196,9 +207,9 @@ func writeCase(resources: mod GpuResources, test: view Case) ret Bool {
 }
 
 # Reads the file back: its frames' counters, and its sound
-func checkCase(test: view Case) ret Bool {
+func checkCase(test: view Case, decoders: view List(VideoBackendChoice)) ret Bool {
   let path: String = "build/writer/{test.name}"
-  var stream: FrameStream = openFrameStream(path: path, table: defaultVideoBackends())
+  var stream: FrameStream = openFrameStream(path: path, table: decoders)
   if stream.error.length() > 0 {
     log("FAIL: {test.name}: {stream.error}")
     ret false
@@ -320,13 +331,45 @@ func main() ret Int {
       frames: 30
       sound: 0
     }
+    {
+      name: "dnxhrLb.mov"
+      codec: VideoCodec.dnxhrLb
+      container: ContainerKind.mov
+      frames: 30
+      sound: 1
+    }
+    {
+      name: "dnxhrHq.mov"
+      codec: VideoCodec.dnxhrHq
+      container: ContainerKind.mov
+      frames: 30
+      sound: 0
+    }
+    {
+      name: "ffv1.mov"
+      codec: VideoCodec.ffv1
+      container: ContainerKind.mov
+      frames: 30
+      sound: 0
+    }
   }
   var issuer: IdIssuer = IdIssuer.create()
   if var resources: GpuResources = GpuResources.create(issuer: issuer, capacity: 256) {
+    var encoders: List(EncoderBackend) = defaultEncoderBackends()
+    var decoders: List(VideoBackendChoice) = defaultVideoBackends()
+    if not (addFfmpegEncoders(table: encoders) and addFfmpegBackend(table: decoders)) {
+      log("FAIL: FFmpeg did not load: {ffmpegProblem()}")
+      ret 1
+    }
     var ok: Bool = true
     loop let test: view Case in cases {
-      if writeCase(resources: resources, test: test) {
-        ok = checkCase(test: test) and ok
+      if writeCase(
+        resources: resources
+        test: test
+        encoders: encoders
+        decoders: decoders
+      ) {
+        ok = checkCase(test: test, decoders: decoders) and ok
       } else {
         ok = false
       }

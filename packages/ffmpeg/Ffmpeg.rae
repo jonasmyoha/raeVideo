@@ -1,10 +1,14 @@
-# ffmpeg/Ffmpeg — FFmpeg as one more decoder of the video package (docs/design.md
-# §4): what the platform cannot decode (DNxHD / DNxHR, VP8 and VP9, FFV1; ProRes
-# where there is no VideoToolbox).
+# ffmpeg/Ffmpeg — FFmpeg as one more decoder and encoder of the video package
+# (docs/design.md §4): what the platform cannot decode (DNxHD / DNxHR, VP8 and
+# VP9, FFV1; ProRes where there is no VideoToolbox), and encode (DNxHR LB and
+# HQ, FFV1).
 #
 #     var table: List(VideoBackendChoice) = defaultVideoBackends()
 #     let added: Bool = addFfmpegBackend(table: table)
 #     var stream: FrameStream = openFrameStream(path: "clip.mov", table: table)
+#     var encoders: List(EncoderBackend) = defaultEncoderBackends()
+#     let encoding: Bool = addFfmpegEncoders(table: encoders)
+#     var encoder: VideoEncoder = openVideoEncoder(resources:, settings:, table: encoders)
 #
 # FFmpeg is LGPL: built by this package from one pinned release, LGPL-only and
 # shared (native/build.sh), and loaded at run time, so a program that does not
@@ -13,6 +17,7 @@
 # never offered on iOS (docs/design.md §4).
 open ffmpeg/FfmpegGlue
 open video/VideoBackends
+open video/VideoEncoder
 
 type FfmpegCodec {
   # the sample entry's four characters in MP4 / MOV
@@ -73,6 +78,40 @@ func addFfmpegBackend(table: mod List(VideoBackendChoice)) ret Bool {
       backend: registeredRef(number: number, codecName: entry.decoder)
     )
   }
+  ret true
+}
+
+# Adds FFmpeg's encoders to `table`: DNxHR LB and HQ (FFmpeg's dnxhd encoder,
+# 4:2:2) and FFV1 (lossless, given 4:2:0). False when FFmpeg is not available.
+func addFfmpegEncoders(table: mod List(EncoderBackend)) ret Bool {
+  if not ffmpegAvailable() {
+    ret false
+  }
+  var number: Int = 0
+  unsafe {
+    number = registerEncoder(calls: rae_ffmpeg_encoder_calls())
+  }
+  if number is 0 {
+    ret false
+  }
+  table.addEncoderBackend(
+    codec: VideoCodec.dnxhrLb
+    number: number
+    encoderName: "dnxhd"
+    profile: "dnxhr_lb"
+  )
+  table.addEncoderBackend(
+    codec: VideoCodec.dnxhrHq
+    number: number
+    encoderName: "dnxhd"
+    profile: "dnxhr_hq"
+  )
+  table.addEncoderBackend(
+    codec: VideoCodec.ffv1
+    number: number
+    encoderName: "ffv1"
+    profile: ""
+  )
   ret true
 }
 

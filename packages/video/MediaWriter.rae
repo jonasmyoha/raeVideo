@@ -132,7 +132,8 @@ func newTrack(sound: view Bool, codec: view String, timescale: view Int) ret Wri
   }
 }
 
-# A video track ("avc1", "hvc1", or ProRes's "apco" ... "ap4h"): its index
+# A video track ("avc1", "hvc1", ProRes's "apco" ... "ap4h", DNxHR's "AVdh",
+# "FFV1"): its index
 func addVideoTrack(
   this: mod MediaWriter
   codec: view String
@@ -147,6 +148,9 @@ func addVideoTrack(
     track.configKind = "avcC"
   } else if codec is "hvc1" {
     track.configKind = "hvcC"
+  } else if codec is "FFV1" {
+    # an FFmpeg codec's extradata, as MOV carries it
+    track.configKind = "glbl"
   }
   this.tracks.add(value: own track)
   ret this.tracks.length() - 1

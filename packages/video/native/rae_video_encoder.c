@@ -433,6 +433,90 @@ int64_t rae_video_vte_copy_config(int64_t handle, uint8_t* into, int64_t capacit
 void rae_video_vte_close(int64_t handle) { (void)handle; }
 #endif
 
+/* ---- registered encoders ----------------------------------------------------
+ * Written once per backend at start-up on the main thread, then only read. */
+#define RAE_ENCODER_BACKEND_MAX 8
+static const RaeVideoEncoderCalls* g_rae_encoder_backends[RAE_ENCODER_BACKEND_MAX];
+
+int64_t rae_video_encoder_register(void* pointer) {
+  const RaeVideoEncoderCalls* calls = (const RaeVideoEncoderCalls*)pointer;
+  if (!calls || calls->version != RAE_VIDEO_ENCODER_CALLS_VERSION) return 0;
+  for (int i = 0; i < RAE_ENCODER_BACKEND_MAX; i++) {
+    if (g_rae_encoder_backends[i] == calls) return i + 1;
+    if (!g_rae_encoder_backends[i]) {
+      g_rae_encoder_backends[i] = calls;
+      return i + 1;
+    }
+  }
+  return 0;
+}
+
+static const RaeVideoEncoderCalls* rae_encoder_backend(int64_t backend) {
+  if (backend < 1 || backend > RAE_ENCODER_BACKEND_MAX) return NULL;
+  return g_rae_encoder_backends[backend - 1];
+}
+
+int64_t rae_video_registered_encoder_open(int64_t backend, uint8_t* encoder_z, uint8_t* profile_z,
+                                          int64_t width, int64_t height, int64_t timescale,
+                                          int64_t bit_rate, int64_t keyframe_interval) {
+  const RaeVideoEncoderCalls* calls = rae_encoder_backend(backend);
+  return calls ? calls->open(encoder_z, profile_z, width, height, timescale, bit_rate,
+                             keyframe_interval)
+               : 0;
+}
+
+int64_t rae_video_registered_encoder_input_layout(int64_t backend, int64_t encoder) {
+  const RaeVideoEncoderCalls* calls = rae_encoder_backend(backend);
+  return calls && encoder ? calls->input_layout(encoder) : 0;
+}
+
+int64_t rae_video_registered_encoder_encode(int64_t backend, int64_t encoder, uint8_t* planes,
+                                            int64_t time) {
+  const RaeVideoEncoderCalls* calls = rae_encoder_backend(backend);
+  return calls && encoder ? calls->encode(encoder, planes, time) : -1;
+}
+
+int64_t rae_video_registered_encoder_finish(int64_t backend, int64_t encoder) {
+  const RaeVideoEncoderCalls* calls = rae_encoder_backend(backend);
+  return calls && encoder ? calls->finish(encoder) : -1;
+}
+
+int64_t rae_video_registered_encoder_packet_count(int64_t backend, int64_t encoder) {
+  const RaeVideoEncoderCalls* calls = rae_encoder_backend(backend);
+  return calls && encoder ? calls->packet_count(encoder) : 0;
+}
+
+int64_t rae_video_registered_encoder_packet_info(int64_t backend, int64_t encoder, int64_t* out) {
+  const RaeVideoEncoderCalls* calls = rae_encoder_backend(backend);
+  return calls && encoder ? calls->packet_info(encoder, out) : -1;
+}
+
+int64_t rae_video_registered_encoder_take_packet(int64_t backend, int64_t encoder, uint8_t* into,
+                                                 int64_t capacity) {
+  const RaeVideoEncoderCalls* calls = rae_encoder_backend(backend);
+  return calls && encoder ? calls->take_packet(encoder, into, capacity) : -1;
+}
+
+int64_t rae_video_registered_encoder_config_size(int64_t backend, int64_t encoder, int64_t* out) {
+  const RaeVideoEncoderCalls* calls = rae_encoder_backend(backend);
+  if (!calls || !encoder) {
+    if (out) out[0] = 0;
+    return 0;
+  }
+  return calls->config_size(encoder, out);
+}
+
+int64_t rae_video_registered_encoder_copy_config(int64_t backend, int64_t encoder, uint8_t* into,
+                                                 int64_t capacity) {
+  const RaeVideoEncoderCalls* calls = rae_encoder_backend(backend);
+  return calls && encoder ? calls->copy_config(encoder, into, capacity) : -1;
+}
+
+void rae_video_registered_encoder_close(int64_t backend, int64_t encoder) {
+  const RaeVideoEncoderCalls* calls = rae_encoder_backend(backend);
+  if (calls && encoder) calls->close(encoder);
+}
+
 /* ---- files for writing ------------------------------------------------------ */
 #include <errno.h>
 #include <fcntl.h>

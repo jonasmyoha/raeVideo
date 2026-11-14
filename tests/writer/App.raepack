@@ -9,6 +9,9 @@ pack App {
     dep video: {
       path: "../../packages/video"
     }
+    dep ffmpeg: {
+      path: "../../packages/ffmpeg"
+    }
   }
   targets: {
     target compiled: {

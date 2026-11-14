@@ -208,6 +208,72 @@ func rae_video_vte_copy_config(
 
 func rae_video_vte_close(encoder: Int) unsafe extern("rae_video_vte_close")
 
+func rae_video_encoder_register(calls: Ptr) unsafe extern("rae_video_encoder_register") ret Int
+
+func rae_video_registered_encoder_open(
+  backend: Int
+  encoderZ: Buffer(UInt8)
+  profileZ: Buffer(UInt8)
+  width: Int
+  height: Int
+  timescale: Int
+  bitRate: Int
+  keyframeInterval: Int
+) unsafe extern("rae_video_registered_encoder_open") ret Int
+
+func rae_video_registered_encoder_input_layout(
+  backend: Int
+  encoder: Int
+) unsafe extern("rae_video_registered_encoder_input_layout") ret Int
+
+func rae_video_registered_encoder_encode(
+  backend: Int
+  encoder: Int
+  planes: Buffer(UInt8)
+  time: Int
+) unsafe extern("rae_video_registered_encoder_encode") ret Int
+
+func rae_video_registered_encoder_finish(
+  backend: Int
+  encoder: Int
+) unsafe extern("rae_video_registered_encoder_finish") ret Int
+
+func rae_video_registered_encoder_packet_count(
+  backend: Int
+  encoder: Int
+) unsafe extern("rae_video_registered_encoder_packet_count") ret Int
+
+func rae_video_registered_encoder_packet_info(
+  backend: Int
+  encoder: Int
+  out: Buffer(Int)
+) unsafe extern("rae_video_registered_encoder_packet_info") ret Int
+
+func rae_video_registered_encoder_take_packet(
+  backend: Int
+  encoder: Int
+  into: Buffer(UInt8)
+  capacity: Int
+) unsafe extern("rae_video_registered_encoder_take_packet") ret Int
+
+func rae_video_registered_encoder_config_size(
+  backend: Int
+  encoder: Int
+  out: Buffer(Int)
+) unsafe extern("rae_video_registered_encoder_config_size") ret Int
+
+func rae_video_registered_encoder_copy_config(
+  backend: Int
+  encoder: Int
+  into: Buffer(UInt8)
+  capacity: Int
+) unsafe extern("rae_video_registered_encoder_copy_config") ret Int
+
+func rae_video_registered_encoder_close(
+  backend: Int
+  encoder: Int
+) unsafe extern("rae_video_registered_encoder_close")
+
 func rae_video_file_create(pathZ: Buffer(UInt8)) unsafe extern("rae_video_file_create") ret Int
 
 func rae_video_file_write_at(
