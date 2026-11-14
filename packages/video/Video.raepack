@@ -2,10 +2,10 @@ pack Video {
   format: "raepack"
   version: 1
   meta: {
-    version: "0.8.0"
+    version: "0.9.0"
   }
   rae: {
-    version: "0.3.123"
+    version: "0.3.138"
   }
   dependencies: {
     dep audio: {

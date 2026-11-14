@@ -165,6 +165,13 @@ ffprobe on an H.264 clip with B-frames (fixture 1414). Not yet: fragmented MP4
 (moof / traf), the `colr` tags, and the packet type with `MediaTime` (§6.1),
 which comes with audio step 4.
 
+**Landed (2026-11-15), in Rae: the MP4 / MOV writer, `lib/media/Mp4Writer.rae`**,
+beside the reader: pure functions that build ftyp, the moov (mvhd; per track
+tkhd, the edit, mdia and the sample table with co64 offsets) and the sample
+entries (avc1 / hvc1 / ProRes / DNxHD / FFV1 with colr, mp4a with esds and its
+roll group, sowt PCM). `MediaWriter` (§11 step 4) writes the file with them;
+Rae's case 1471 reads what they write back with `media/Mp4`.
+
 ---
 
 ## 4. FFmpeg as a separate package
@@ -563,7 +570,7 @@ Depends on the audio steps for its clock (audio 1/6 to 4/6).
    (H.264, HEVC, ProRes 422 Proxy / LT / 422 / HQ / 4444, fed from an RGBA
    texture by a GPU pass and a readback, BT.709 tags), `MediaWriter` (MOV and
    MP4: AAC packets, 16-bit PCM in MOV, interleaved by time), the boxes in
-   `packages/video/Mp4Writer.rae` until they move to `lib/media`; the round trip
+   Rae's `lib/media/Mp4Writer.rae` (moved there with video 0.9.0); the round trip
    in `tests/writer`, ffprobe / ffmpeg / AVFoundation in
    `tools/checkWrittenFiles.sh`; the FFmpeg package's DNxHR and FFV1 encoders
    as backends of the same API (video 0.7.0, ffmpeg 0.2.0); AAC through

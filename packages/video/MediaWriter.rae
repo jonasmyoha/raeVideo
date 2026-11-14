@@ -14,13 +14,13 @@
 #     let written: Bool = writer.finish()
 #
 # Layout: ftyp, then one mdat the samples are written into as they come (its
-# 64-bit size patched at the end), then the moov (video/Mp4Writer) with every
+# 64-bit size patched at the end), then the moov (media/Mp4Writer) with every
 # track's tables, so nothing is held in memory but what waits to be
 # interleaved: a packet is written once every track has one waiting, the one
 # that decodes first (in seconds) going first; `finish` writes the rest in the
 # same order. One write is one chunk.
 import Math
-open video/Mp4Writer
+open media/Mp4Writer
 open video/VideoGlue
 
 # The movie's own time unit (mvhd, tkhd durations, edits) when it has no

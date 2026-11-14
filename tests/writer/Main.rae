@@ -19,10 +19,10 @@ open ffmpeg/Ffmpeg
 open gpu/GpuIds
 open gpu/GpuResources
 open media/Mp4
+open media/Mp4Writer
 open video/FrameStream
 open video/MediaReader
 open video/MediaWriter
-open video/Mp4Writer
 open video/VideoBackends
 open video/VideoDecoder
 open video/VideoEncoder

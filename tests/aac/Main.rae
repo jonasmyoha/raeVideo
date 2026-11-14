@@ -18,9 +18,9 @@ import Math
 open Sys
 open audio/Decoder
 open audio/Sound
+open media/Mp4Writer
 open video/AacEncoder
 open video/MediaWriter
-open video/Mp4Writer
 
 const frames: Int = 100000
 
