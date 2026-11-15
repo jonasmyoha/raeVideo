@@ -230,6 +230,48 @@ codec (`EncoderBackend`), the frame converted to planar Y'CbCr on the GPU
 (`rgbaToPlanar.wgsl`) and read back. FFV1's extradata goes in MOV's `glbl` box,
 which `MediaReader` reads back.
 
+**Then, 2026-11-15: `packages/ffmpeg` 0.4.0, FFmpeg in a shipped app.** A Rae
+program is a bare executable (Rae makes no `.app` yet), so the package gives
+what a macOS app needs to carry FFmpeg, and the check of it:
+
+- **What to bundle.** The build writes `BUNDLE` in its install folder: each
+  file and where it goes in the app. That is `libavutil.<major>.dylib` and
+  `libavcodec.<major>.dylib` in `Contents/Frameworks`, and `NOTICE.md`,
+  `COPYING.LGPLv2.1`, `CONFIGURE` and `SOURCE` in
+  `Contents/Resources/legal/ffmpeg`. libavformat is built but not loaded, so it
+  is not bundled. `packages/ffmpeg/tools/bundleFfmpeg.sh <Name.app> <build>`
+  copies them, and a program finds its build with `ffmpegLibraryFolder()`.
+- **Where the glue loads from:** `RAE_FFMPEG_LIBRARY_DIR` when it is set, else
+  the app's `Contents/Frameworks` when libavutil is there (beside the program
+  on Linux), else the package's build. FFmpeg is configured with the neutral
+  prefix `/ffmpeg`, installed under `DESTDIR`, and each library names the
+  other by `@loader_path`. So the same files load from either folder, nothing
+  is rewritten or re-signed when bundling, and no path of the machine that
+  built them is inside them. One stays in the program: the glue's fallback
+  build folder, and Rae's own shader paths (Rae's to fix when it bundles apps).
+- **The check.** `packages/ffmpeg/tools/checkFfmpegInApp.sh <Name.app>` refuses
+  an app unless both libraries are shared libraries in separate files (not
+  links, no `libav*.a`, no FFmpeg function linked into a program in
+  `Contents/MacOS`), they name only each other and the system's libraries, the
+  configure line inside each has no `--enable-gpl` or `--enable-nonfree` and
+  its license is LGPL, and the four legal files are there.
+  `tools/checkFfmpegBundle.sh` builds `examples/ffmpegApp` with a Rae home of
+  its own and bundles it. With that home's FFmpeg build removed, the app
+  decodes and shows the DNxHR test file from its own Frameworks. The check
+  also shows that it refuses a libavcodec configured with `--enable-gpl` and a
+  static one.
+- **Library validation (macOS).** An app signed with the hardened runtime
+  (which notarization requires) loads only libraries signed by the same team or
+  by Apple. FFmpeg's libraries are signed with the app, and they load as
+  shipped. A user who replaces them with their own build, as the LGPL allows,
+  is refused by that check. Either the user re-signs the whole app, libraries
+  included, with one identity of their own
+  (`codesign --force --deep --sign <identity> <Name.app>`), or the app carries
+  the `com.apple.security.cs.disable-library-validation` entitlement. An
+  app that ships FFmpeg should do one of these on purpose: either take the
+  entitlement, or say in its NOTICE that a replaced library needs a re-signed
+  app. The editor (`mediaeditor`) decides which; the package works either way.
+
 Platform notes:
 
 - **iOS:** an LGPL dynamic library inside an App Store app is legally debated

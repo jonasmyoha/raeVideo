@@ -1,5 +1,6 @@
 /* The C glue of the FFmpeg package (docs/design.md §4): FFmpeg's libavcodec and
- * libavutil loaded at run time (dlopen) from the package's own build, and its
+ * libavutil loaded at run time (dlopen) from the app bundle's Frameworks folder
+ * or the package's own build, and its
  * decoders handed to the video package as a registered backend (a
  * RaeVideoBackendCalls, packages/video/native/rae_video.h). Each function makes
  * one FFmpeg call or one small group that only makes sense together; which
@@ -21,7 +22,7 @@ void* rae_ffmpeg_backend_calls(void);
 void* rae_ffmpeg_encoder_calls(void);
 /* A text about the loaded FFmpeg into `into` (at most `capacity` bytes, no
  * zero added): 1 its configure line, 2 its license, 3 its version, 4 why it
- * did not load. Its length. */
+ * did not load, 5 the folder its libraries were loaded from. Its length. */
 int64_t rae_ffmpeg_text(int64_t which, uint8_t* into, int64_t capacity);
 
 #endif

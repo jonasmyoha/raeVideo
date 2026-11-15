@@ -21,12 +21,16 @@ The design is [docs/design.md](docs/design.md); what lives here,
   AudioToolbox (`AacEncoder`) and MOV / MP4 writing (`MediaWriter`, its boxes from
   Rae's `media/Mp4Writer`), and a simple player on Rae's audio clock
   (`VideoPlayer`). It depends on Rae's `audio` package 0.15.1.
-- `packages/ffmpeg` (0.3.0): FFmpeg 9.0.2, built LGPL-only from its pinned
+- `packages/ffmpeg` (0.4.0): FFmpeg 9.0.2, built LGPL-only from its pinned
   tarball the first time a program uses the package, loaded at run time, as
   one more decoder of the video package (DNxHD/DNxHR, VP8, VP9, FFV1, ProRes):
   `addFfmpegBackend(table:)`, and encoder (DNxHR LB and HQ, FFV1; on one thread per core):
-  `addFfmpegEncoders(table:)`. A program that uses it ships the files in its
-  build's `legal/` folder (`packages/ffmpeg/legal/NOTICE.md`). macOS; never iOS.
+  `addFfmpegEncoders(table:)`. A program that uses it ships FFmpeg's two
+  libraries and the files in its build's `legal/` folder
+  (`packages/ffmpeg/legal/NOTICE.md`): `packages/ffmpeg/tools/bundleFfmpeg.sh`
+  puts them in a macOS app, whose `Contents/Frameworks` the glue loads from
+  first, and `checkFfmpegInApp.sh` checks the app (no GPL or nonfree, shared,
+  separate files). macOS; never iOS.
 
 ## Examples
 
@@ -34,6 +38,10 @@ The design is [docs/design.md](docs/design.md); what lives here,
   button, a play/pause button and a seek bar (its README has the 4K numbers):
   `make run-player FILE=clip.mp4` (or `make run`; without `FILE` it asks for
   a file).
+- `examples/ffmpegApp`: the DNxHR test file decoded through packages/ffmpeg
+  and shown on the GPU, the program `tools/checkFfmpegBundle.sh` puts in a
+  macOS app with FFmpeg in its `Contents/Frameworks` and runs with the
+  package's build gone.
 
 A program takes a package by git at a release tag:
 

@@ -13,9 +13,13 @@ its license.
   (`--disable-gpl --disable-nonfree`), shared libraries, and only the listed
   decoders, encoders, demuxers and muxers. No GPL or nonfree code is in it.
 - **How it is used:** the program loads libavcodec and libavutil at run time from
-  their own files (dynamic linking). You may replace those files with your own
-  build of FFmpeg of the same major versions, built from the source above or a
-  modified one, and the program will use it.
+  their own files (dynamic linking): in a macOS app, Contents/Frameworks. You may
+  replace those files with your own build of FFmpeg of the same major versions,
+  built from the source above or a modified one, and the program will use it.
+  On macOS a signed app may then need signing again, the app and the libraries
+  with one identity of your own (`codesign --force --deep --sign <identity>
+  <the app>`), because macOS refuses a library signed by someone else in it
+  unless the app allows that.
 - **Codec patents:** some formats FFmpeg can decode may be covered by patents
   in some countries; FFmpeg's license gives no patent license (docs/design.md
   §3.1 in raeVideo).

@@ -12,12 +12,16 @@
 #      with an explicit list of decoders, encoders, demuxers, muxers, parsers and
 #      bitstream filters; refuses the result if its config.h says GPL or nonfree.
 #   3. Builds and installs it into $RAE_PACKAGE_INSTALL/ffmpeg: libavcodec, libavformat and
-#      libavutil as dylibs (.so on Linux) whose install names are their full paths, so the
-#      glue can load them by path and a user can put their own build in their place
-#      (the LGPL's condition, legal/NOTICE.md).
+#      libavutil as dylibs (.so on Linux). Its prefix is a neutral /ffmpeg (installed there
+#      under DESTDIR), so no path of the machine that built it is inside them, and on macOS
+#      each names the others by @loader_path: they load from any one folder, the package's
+#      build or an app's Contents/Frameworks, and a user can put their own build in their
+#      place (the LGPL's condition, legal/NOTICE.md).
 #   4. Compiles native/rae_ffmpeg_glue.c (which loads libavcodec and libavutil with dlopen:
 #      a program links no FFmpeg) into lib/libraeffmpeg.a, and puts the LGPL text, the
 #      notice, the configure line and the source's address and hash in legal/.
+#   5. Writes BUNDLE: the files a program that ships must carry, one per line, each a path
+#      in $RAE_PACKAGE_INSTALL then where it goes in a macOS app (tools/bundleFfmpeg.sh).
 #
 # macOS first (Linux builds the same way, untested). Never iOS: an LGPL library inside an
 # App Store app is not what this package offers (docs/design.md §4).
@@ -69,8 +73,7 @@ cd "$source/ffmpeg-$VERSION"
 rm -rf "${INSTALL:?}"
 mkdir -p "$INSTALL/include" "$INSTALL/lib" "$INSTALL/legal"
 CONFIGURE=(
-  --prefix="$INSTALL/ffmpeg"
-  --install-name-dir="$INSTALL/ffmpeg/lib"
+  --prefix=/ffmpeg
   --disable-gpl --disable-nonfree
   --enable-shared --disable-static
   --disable-programs --disable-doc
@@ -78,6 +81,9 @@ CONFIGURE=(
   --disable-avdevice --disable-avfilter --disable-swscale --disable-swresample
   "${COMPONENTS[@]}"
 )
+if [ "$libraryEnding" = dylib ]; then
+  CONFIGURE+=(--install-name-dir=@loader_path)
+fi
 echo "ffmpeg: configuring $VERSION (LGPL only)"
 ./configure "${CONFIGURE[@]}" > "$CACHE/configure.log" 2>&1 || {
   tail -20 "$CACHE/configure.log" >&2
@@ -90,11 +96,11 @@ fi
 jobs="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
 echo "ffmpeg: building with $jobs jobs"
 make -j"$jobs" > "$CACHE/make.log" 2>&1 || { tail -20 "$CACHE/make.log" >&2; exit 1; }
-make install > "$CACHE/install.log" 2>&1 || { tail -20 "$CACHE/install.log" >&2; exit 1; }
+make install DESTDIR="$INSTALL" > "$CACHE/install.log" 2>&1 || { tail -20 "$CACHE/install.log" >&2; exit 1; }
 
 cp COPYING.LGPLv2.1 "$INSTALL/legal/COPYING.LGPLv2.1"
 cp "$HERE/../legal/NOTICE.md" "$INSTALL/legal/NOTICE.md"
-printf '%s\n' "${CONFIGURE[@]}" | sed "s|$INSTALL|<install>|g" > "$INSTALL/legal/CONFIGURE"
+printf '%s\n' "${CONFIGURE[@]}" > "$INSTALL/legal/CONFIGURE"
 printf 'FFmpeg %s\n%s\nSHA-256 %s\n' "$VERSION" "$URL" "$SHA256" > "$INSTALL/legal/SOURCE"
 
 cp "$HERE/rae_ffmpeg.h" "$INSTALL/include/"
@@ -104,5 +110,24 @@ cc -O2 -DNDEBUG -I"$HERE" -I"$INSTALL/ffmpeg/include" \
   -c "$HERE/rae_ffmpeg_glue.c" -o "$objs/rae_ffmpeg_glue.o"
 ar rcs "$INSTALL/lib/libraeffmpeg.a" "$objs"/*.o
 rm -rf "${objs:?}" "$source"
+
+# What a shipped program carries (the LGPL's conditions, legal/NOTICE.md): the two
+# libraries the glue loads, as files (not links), and legal/
+avcodecMajor="$(sed -n 's/^#define LIBAVCODEC_VERSION_MAJOR *//p' "$INSTALL/ffmpeg/include/libavcodec/version_major.h")"
+avutilMajor="$(sed -n 's/^#define LIBAVUTIL_VERSION_MAJOR *//p' "$INSTALL/ffmpeg/include/libavutil/version.h")"
+if [ "$libraryEnding" = dylib ]; then
+  avcodecFile="libavcodec.$avcodecMajor.dylib"
+  avutilFile="libavutil.$avutilMajor.dylib"
+else
+  avcodecFile="libavcodec.so.$avcodecMajor"
+  avutilFile="libavutil.so.$avutilMajor"
+fi
+{
+  echo "ffmpeg/lib/$avutilFile Contents/Frameworks/$avutilFile"
+  echo "ffmpeg/lib/$avcodecFile Contents/Frameworks/$avcodecFile"
+  for file in NOTICE.md COPYING.LGPLv2.1 CONFIGURE SOURCE; do
+    echo "legal/$file Contents/Resources/legal/ffmpeg/$file"
+  done
+} > "$INSTALL/BUNDLE"
 end=$(date +%s)
 echo "ffmpeg: FFmpeg $VERSION built into $INSTALL in $((end - start)) s"

@@ -13,8 +13,10 @@
 # FFmpeg is LGPL: built by this package from one pinned release, LGPL-only and
 # shared (native/build.sh), and loaded at run time, so a program that does not
 # import this package never builds or links it, and one that does ships the
-# notice and license text in its build's legal/ folder (legal/NOTICE.md). It is
-# never offered on iOS (docs/design.md §4).
+# libraries and the notice and license text: the build's BUNDLE lists them,
+# tools/bundleFfmpeg.sh puts them in a macOS app (Contents/Frameworks, from
+# which the glue loads them first), and tools/checkFfmpegInApp.sh checks the app
+# (legal/NOTICE.md). It is never offered on iOS (docs/design.md §4).
 open ffmpeg/FfmpegGlue
 open video/VideoBackends
 open video/VideoEncoder
@@ -142,4 +144,13 @@ func ffmpegVersion() ret String {
 # Why FFmpeg did not load ("" when it did)
 func ffmpegProblem() ret String {
   ret ffmpegText(which: 4)
+}
+
+# The folder FFmpeg's libraries were loaded from ("" when they did not load):
+# RAE_FFMPEG_LIBRARY_DIR when it is set, else the app bundle's
+# Contents/Frameworks when they are there (tools/bundleFfmpeg.sh), else this
+# package's build. A program that bundles FFmpeg prints it to find the build
+# it bundles from.
+func ffmpegLibraryFolder() ret String {
+  ret ffmpegText(which: 5)
 }

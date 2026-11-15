@@ -16,6 +16,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
@@ -78,25 +83,98 @@ static pthread_once_t g_rae_ffmpeg_once = PTHREAD_ONCE_INIT;
 static int g_rae_ffmpeg_ready = 0;
 static char g_rae_ffmpeg_problem[512] = "";
 
-static void* rae_ffmpeg_open_library(const char* name, int major) {
-  char path[1024];
-  const char* folder = getenv("RAE_FFMPEG_LIBRARY_DIR");
-  if (!folder || !folder[0]) folder = RAE_FFMPEG_LIBRARY_DIR;
+static char g_rae_ffmpeg_folder[1024] = "";
+
+/* A library's file in a folder: libavcodec.62.dylib on macOS, libavcodec.so.62
+ * on Linux */
+static void rae_ffmpeg_library_file(char* path, size_t size, const char* folder,
+                                     const char* name, int major) {
 #if defined(__APPLE__)
-  snprintf(path, sizeof(path), "%s/lib%s.%d.%s", folder, name, major, RAE_FFMPEG_LIBRARY_ENDING);
+  snprintf(path, size, "%s/lib%s.%d.%s", folder, name, major, RAE_FFMPEG_LIBRARY_ENDING);
 #else
-  snprintf(path, sizeof(path), "%s/lib%s.%s.%d", folder, name, RAE_FFMPEG_LIBRARY_ENDING, major);
+  snprintf(path, size, "%s/lib%s.%s.%d", folder, name, RAE_FFMPEG_LIBRARY_ENDING, major);
 #endif
+}
+
+/* The folder a shipped app keeps them in: Contents/Frameworks of the .app the
+ * program runs from (macOS), the folder of the program itself (Linux); "" when
+ * the program is not in one */
+static void rae_ffmpeg_bundle_folder(char* folder, size_t size) {
+  folder[0] = 0;
+  char program[1024];
+#if defined(__APPLE__)
+  uint32_t length = sizeof(program);
+  if (_NSGetExecutablePath(program, &length) != 0) return;
+#else
+  ssize_t length = readlink("/proc/self/exe", program, sizeof(program) - 1);
+  if (length <= 0) return;
+  program[length] = 0;
+#endif
+  char* slash = strrchr(program, '/');
+  if (!slash) return;
+  *slash = 0;
+#if defined(__APPLE__)
+  /* .../Name.app/Contents/MacOS/program */
+  size_t folderLength = strlen(program);
+  const char* inBundle = "/Contents/MacOS";
+  size_t inBundleLength = strlen(inBundle);
+  if (folderLength < inBundleLength || strcmp(program + folderLength - inBundleLength, inBundle) != 0) {
+    return;
+  }
+  program[folderLength - inBundleLength] = 0;
+  snprintf(folder, size, "%s/Contents/Frameworks", program);
+#else
+  snprintf(folder, size, "%s", program);
+#endif
+}
+
+static int rae_ffmpeg_has_file(const char* path) {
+  struct stat info;
+  return stat(path, &info) == 0 && S_ISREG(info.st_mode);
+}
+
+static void* rae_ffmpeg_open_library(const char* folder, const char* name, int major) {
+  char path[1024];
+  rae_ffmpeg_library_file(path, sizeof(path), folder, name, major);
   void* library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-  if (!library) snprintf(g_rae_ffmpeg_problem, sizeof(g_rae_ffmpeg_problem), "cannot load %s", path);
+  if (!library) {
+    const char* reason = dlerror();
+    snprintf(g_rae_ffmpeg_problem, sizeof(g_rae_ffmpeg_problem), "cannot load %s%s%s", path,
+             reason ? ": " : "", reason ? reason : "");
+  }
   return library;
 }
 
+/* Where the libraries come from, the first folder that has libavutil:
+ * RAE_FFMPEG_LIBRARY_DIR when it is set, else the app bundle's Frameworks,
+ * else the package's own build */
+static void rae_ffmpeg_choose_folder(void) {
+  char path[1024];
+  const char* chosen = getenv("RAE_FFMPEG_LIBRARY_DIR");
+  if (chosen && chosen[0]) {
+    snprintf(g_rae_ffmpeg_folder, sizeof(g_rae_ffmpeg_folder), "%s", chosen);
+    return;
+  }
+  char bundle[1024];
+  rae_ffmpeg_bundle_folder(bundle, sizeof(bundle));
+  if (bundle[0]) {
+    rae_ffmpeg_library_file(path, sizeof(path), bundle, "avutil", LIBAVUTIL_VERSION_MAJOR);
+    if (rae_ffmpeg_has_file(path)) {
+      snprintf(g_rae_ffmpeg_folder, sizeof(g_rae_ffmpeg_folder), "%s", bundle);
+      return;
+    }
+  }
+  snprintf(g_rae_ffmpeg_folder, sizeof(g_rae_ffmpeg_folder), "%s", RAE_FFMPEG_LIBRARY_DIR);
+}
+
 static void rae_ffmpeg_load(void) {
-  /* libavutil first: libavcodec names it by its full path */
-  void* avutil = rae_ffmpeg_open_library("avutil", LIBAVUTIL_VERSION_MAJOR);
+  rae_ffmpeg_choose_folder();
+  /* libavutil first: libavcodec names it (by the path its build gave it, or
+   * @loader_path in a bundle, tools/bundleFfmpeg.sh), and the one already
+   * loaded is used */
+  void* avutil = rae_ffmpeg_open_library(g_rae_ffmpeg_folder, "avutil", LIBAVUTIL_VERSION_MAJOR);
   if (!avutil) return;
-  void* avcodec = rae_ffmpeg_open_library("avcodec", LIBAVCODEC_VERSION_MAJOR);
+  void* avcodec = rae_ffmpeg_open_library(g_rae_ffmpeg_folder, "avcodec", LIBAVCODEC_VERSION_MAJOR);
   if (!avcodec) return;
   int ready = 1;
 #define RAE_FFMPEG_LOAD(library, name)                       \
@@ -124,7 +202,10 @@ int64_t rae_ffmpeg_available(void) {
 
 int64_t rae_ffmpeg_text(int64_t which, uint8_t* into, int64_t capacity) {
   const char* text = g_rae_ffmpeg_problem;
-  if (which != 4) {
+  if (which == 5) {
+    if (!rae_ffmpeg_available()) return 0;
+    text = g_rae_ffmpeg_folder;
+  } else if (which != 4) {
     if (!rae_ffmpeg_available()) return 0;
     text = which == 1 ? p_avcodec_configuration()
          : which == 2 ? p_avcodec_license()

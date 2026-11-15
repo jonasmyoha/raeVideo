@@ -1,0 +1,112 @@
+# FFmpeg in a shipped app (packages/ffmpeg, docs/design.md §4): a program that
+# tools/checkFfmpegBundle.sh puts in a macOS .app with FFmpeg's libraries in
+# its Contents/Frameworks (packages/ffmpeg/tools/bundleFfmpeg.sh), then runs
+# with the package's build folder gone.
+#
+#   ffmpegApp --ffmpeg-folder        the folder FFmpeg loads from (to bundle it)
+#   ffmpegApp <file.mov>             decodes and shows every frame of the file
+#
+# It decodes the file (tests/media/counterDnxhr.mov: DNxHR LB, which only
+# FFmpeg decodes here) through the FFmpeg backend, converts each frame to RGB
+# on the GPU, checks that each shows its own burned-in counter, and says where
+# FFmpeg came from and that it is LGPL.
+open Sys
+open ffmpeg/Ffmpeg
+open gpu/GpuIds
+open gpu/GpuResources
+open video/FrameStream
+open video/VideoBackends
+open video/VideoDecoder
+open video/YuvPicture
+open webgpu/Context
+
+# The 16-bit counter burned into the frame's luma (tests/media/make.sh)
+func readCounter(frame: view VideoFrame) ret Int {
+  let luma: List(UInt8) = frame.copyPlane(plane: 0)
+  let row: Int = frame.height * 3 / 4 + frame.height / 16
+  var value: Int = 0
+  loop var bit: Int = 0, bit < 16, ++bit {
+    let x: Int = bit * frame.width / 16 + frame.width / 32
+    value = value * 2
+    if (luma.copyAtDefault(index: row * frame.width + x) as Int) > 128 {
+      value = value + 1
+    }
+  }
+  ret value
+}
+
+func showFile(path: view String) ret Int {
+  var table: List(VideoBackendChoice) = defaultVideoBackends()
+  if not addFfmpegBackend(table: table) {
+    log("FFmpeg did not load: {ffmpegProblem()}")
+    ret 1
+  }
+  log("FFmpeg {ffmpegVersion()} ({ffmpegLicense()}) from {ffmpegLibraryFolder()}")
+  var ready: Int = 0
+  unsafe {
+    ready = webgpuBootstrap()
+  }
+  if ready is not 1 {
+    log("no GPU")
+    ret 1
+  }
+  var stream: FrameStream = openFrameStream(path: path, table: table)
+  if stream.error.length() > 0 {
+    log("{path}: {stream.error}")
+    ret 1
+  }
+  var issuer: IdIssuer = IdIssuer.create()
+  var shown: Int = 0
+  var inOrder: Int = 0
+  if var resources: GpuResources = GpuResources.create(issuer: issuer, capacity: 64) {
+    var first: VideoFrame = stream.takeFrame(frameIndex: 0)
+    if var picture: YuvPicture = createYuvPicture(
+      resources: resources
+      width: first.width
+      height: first.height
+      layout: first.layout
+    ) {
+      releaseFrame(frame: first)
+      loop var i: Int = 0, i < stream.frameCount(), ++i {
+        var frame: VideoFrame = stream.takeFrame(frameIndex: i)
+        if frame.handle is not 0 {
+          if readCounter(frame: frame) is i {
+            inOrder = inOrder + 1
+          }
+          if picture.uploadFrame(resources: resources, frame: frame) and picture.convertNow(
+            resources: resources
+          ) {
+            shown = shown + 1
+          }
+        }
+        releaseFrame(frame: frame)
+      }
+    }
+  }
+  let frames: Int = stream.frameCount()
+  stream.close()
+  log(
+    "{path}: {shown} of {frames} frames shown on the GPU, counters 0..{frames - 1} in order: {inOrder is frames}"
+  )
+  if shown is frames and inOrder is frames and frames > 0 {
+    ret 0
+  }
+  ret 1
+}
+
+func main() ret Int {
+  if argCount() is 0 {
+    log("usage: ffmpegApp --ffmpeg-folder | ffmpegApp <file.mov>")
+    ret 2
+  }
+  let first: String = argAt(index: 0)
+  if first is "--ffmpeg-folder" {
+    if not ffmpegAvailable() {
+      log("FFmpeg did not load: {ffmpegProblem()}")
+      ret 1
+    }
+    log("{ffmpegLibraryFolder()}")
+    ret 0
+  }
+  ret showFile(path: first)
+}
