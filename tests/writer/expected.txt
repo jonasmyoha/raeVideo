@@ -8,4 +8,5 @@ prores4444.mov: 30 frames of 30 read back, counters 0..29 in order: true
 dnxhrLb.mov: 30 frames of 30 read back, counters 0..29 in order: true; PCM sound 48048 frames, byte for byte: true
 dnxhrHq.mov: 30 frames of 30 read back, counters 0..29 in order: true
 ffv1.mov: 30 frames of 30 read back, counters 0..29 in order: true
+alternating.mp4: 90 frames of 90 read back, counters 0..89 in order: true
 done

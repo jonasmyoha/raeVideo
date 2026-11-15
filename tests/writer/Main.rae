@@ -10,6 +10,9 @@
 #   by time) byte for byte;
 # - an MP4's AAC sound (the source's packets, copied) packet for packet, with
 #   its edit.
+# - an encoder given two textures in turn (a compositor's two frames), on a
+#   GPU manager of 32 slots a table, for 90 frames: none of its views or bind
+#   groups piles up.
 #
 # The files stay in build/writer for tools/checkWrittenFiles.sh (ffprobe, and
 # AVFoundation, which QuickTime Player is built on).
@@ -206,6 +209,119 @@ func writeCase(
   ret written
 }
 
+# The frames given from two textures in turn, as a compositor's two frames
+# are, to an encoder on a GPU manager of `capacity` slots a table: more frames
+# than that, so a view or bind group kept a frame would fill a table and stop
+# the encoding
+func writeAlternating(
+  resources: mod GpuResources
+  test: view Case
+  encoders: view List(EncoderBackend)
+) ret Bool {
+  let path: String = "build/writer/{test.name}"
+  var stream: FrameStream = openFrameStream(path: sourcePath, table: defaultVideoBackends())
+  let settings: EncoderSettings = {
+    codec: test.codec
+    width: 320
+    height: 180
+    timescale: 30000
+    bitRate: 2000000
+    quality: 0
+    keyframeInterval: 15
+  }
+  var encoder: VideoEncoder = openVideoEncoder(
+    resources: resources
+    settings: settings
+    table: encoders
+  )
+  if encoder.error.length() > 0 {
+    log("FAIL: {test.name}: {encoder.error}")
+    ret false
+  }
+  var writer: MediaWriter = openMediaWriter(path: path, container: test.container)
+  let video: Int = writer.addVideoTrack(
+    codec: codecFourCharacters(codec: test.codec)
+    width: 320
+    height: 180
+    timescale: 30000
+  )
+  var encoded: Int = 0
+  if var even: YuvPicture = createYuvPicture(
+    resources: resources
+    width: 320
+    height: 180
+    layout: FrameLayout.nv12
+  ) {
+    if var odd: YuvPicture = createYuvPicture(
+      resources: resources
+      width: 320
+      height: 180
+      layout: FrameLayout.nv12
+    ) {
+      loop var frameIndex: Int = 0, frameIndex < test.frames, ++frameIndex {
+        var frame: VideoFrame = stream.takeFrame(frameIndex: frameIndex)
+        var given: Bool = false
+        if frameIndex % 2 is 0 {
+          given = even.uploadFrame(resources: resources, frame: frame) and even.convertNow(
+            resources: resources
+          ) and encoder.encodeTexture(
+            resources: resources
+            texture: even.picture
+            time: frameIndex * 1001
+          )
+        } else {
+          given = odd.uploadFrame(resources: resources, frame: frame) and odd.convertNow(
+            resources: resources
+          ) and encoder.encodeTexture(
+            resources: resources
+            texture: odd.picture
+            time: frameIndex * 1001
+          )
+        }
+        releaseFrame(frame: frame)
+        if not given {
+          log("FAIL: {test.name}: frame {frameIndex}: {encoder.error}")
+          ret false
+        }
+        encoded = encoded + 1
+        loop let packet: view EncodedPacket in encoder.takePackets() {
+          let wrote: Bool = writer.writePacket(
+            trackIndex: video
+            bytes: packet.bytes
+            time: packet.time
+            decodeTime: packet.decodeTime
+            duration: 1001
+            keyframe: packet.keyframe
+          )
+        }
+      }
+      if not encoder.finish() {
+        log("FAIL: {test.name}: the encoder failed")
+        ret false
+      }
+      loop let packet: view EncodedPacket in encoder.takePackets() {
+        let wrote: Bool = writer.writePacket(
+          trackIndex: video
+          bytes: packet.bytes
+          time: packet.time
+          decodeTime: packet.decodeTime
+          duration: 1001
+          keyframe: packet.keyframe
+        )
+      }
+    }
+  }
+  writer.setTrackConfig(trackIndex: video, config: encoder.codecConfig())
+  let written: Bool = writer.finish()
+  encoder.close(resources: resources)
+  stream.close()
+  if encoded is not test.frames or not written {
+    log("FAIL: {test.name}: {encoded} frames encoded, {writer.error}")
+    ret false
+  }
+  ret true
+}
+
 # Reads the file back: its frames' counters, and its sound
 func checkCase(test: view Case, decoders: view List(VideoBackendChoice)) ret Bool {
   let path: String = "build/writer/{test.name}"
@@ -370,6 +486,22 @@ func main() ret Int {
         decoders: decoders
       ) {
         ok = checkCase(test: test, decoders: decoders) and ok
+      } else {
+        ok = false
+      }
+    }
+    # two textures in turn, on a manager of 32 slots a table, for 90 frames
+    var smallIssuer: IdIssuer = IdIssuer.create()
+    if var small: GpuResources = GpuResources.create(issuer: smallIssuer, capacity: 32) {
+      let alternating: Case = {
+        name: "alternating.mp4"
+        codec: VideoCodec.h264
+        container: ContainerKind.mp4
+        frames: 90
+        sound: 0
+      }
+      if writeAlternating(resources: small, test: alternating, encoders: encoders) {
+        ok = checkCase(test: alternating, decoders: decoders) and ok
       } else {
         ok = false
       }

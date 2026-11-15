@@ -24,6 +24,12 @@
 # longer (checks/export4k, docs/measurements.md). The frame is read into one
 # list per encoder, made once.
 #
+# A caller may give a different texture each frame, or alternate two (a
+# compositor's two frames): the encoder makes a view and bind group for the
+# texture when it is not the last one given, and retires the last one's, so
+# alternating costs that remaking and nothing piles up. Handing over the same
+# texture every frame makes them once.
+#
 # Frames are encoded in order, without reordering (no B-frames): each packet's
 # decode time is its time. The packets come out on VideoToolbox's thread and
 # wait in the glue until takePackets.
@@ -100,9 +106,13 @@ type VideoEncoder {
   sizes: BufferId
   bounds: ComputeBounds
   pipeline: PipelineId
-  # the bind group for the texture last given (rebuilt for another)
+  # the texture last given (its slot, -1 for none, and generation), the view
+  # made of it and the bind group: made again for another texture, the old
+  # view and bind group retired with it
+  textureView: TextureViewId
   bindGroup: BindGroupId
   boundTexture: Int
+  boundGeneration: Int
   # the frame read back, made once (a 4K BGRA frame is 33 MB)
   pixels: List(UInt8)
   framesGiven: Int
@@ -216,8 +226,10 @@ func noVideoEncoder(settings: view EncoderSettings) ret VideoEncoder {
     sizes: noBufferId()
     bounds: noComputeBounds(workgroupSize: conversionWorkgroupSize)
     pipeline: noPipelineId()
+    textureView: noTextureViewId()
     bindGroup: noBindGroupId()
     boundTexture: -1
+    boundGeneration: -1
     pixels: {}
     framesGiven: 0
     lastPassNs: 0
@@ -385,12 +397,10 @@ func encodeTexture(
   if this.handle is 0 or this.error.length() > 0 {
     ret false
   }
-  if this.boundTexture is not texture.slot {
-    if this.boundTexture >= 0 {
-      let gone: Bool = retireBindGroup(resources: resources, id: this.bindGroup)
-    }
-    this.boundTexture = -1
+  if this.boundTexture is not texture.slot or this.boundGeneration is not texture.generation {
+    this.unbindTexture(resources: resources)
     if let textureView: TextureViewId = createTextureView(resources: resources, texture: texture) {
+      this.textureView = textureView
       var buffers: List(BufferId) = {}
       buffers.add(value: this.sizes)
       buffers.add(value: this.packed)
@@ -407,6 +417,10 @@ func encodeTexture(
       ) {
         this.bindGroup = bindGroup
         this.boundTexture = texture.slot
+        this.boundGeneration = texture.generation
+      } else {
+        let gone: Bool = retireTextureView(resources: resources, id: textureView)
+        this.textureView = noTextureViewId()
       }
     }
     if this.boundTexture < 0 {
@@ -636,8 +650,18 @@ func close(this: mod VideoEncoder, resources: mod GpuResources) {
     }
     this.handle = 0
   }
+  this.unbindTexture(resources: resources)
+}
+
+# Retires the view and bind group of the texture last given (the GPU manager
+# frees them once the work submitted with them is done)
+func unbindTexture(this: mod VideoEncoder, resources: mod GpuResources) {
   if this.boundTexture >= 0 {
-    let gone: Bool = retireBindGroup(resources: resources, id: this.bindGroup)
+    let groupGone: Bool = retireBindGroup(resources: resources, id: this.bindGroup)
+    let viewGone: Bool = retireTextureView(resources: resources, id: this.textureView)
+    this.bindGroup = noBindGroupId()
+    this.textureView = noTextureViewId()
     this.boundTexture = -1
+    this.boundGeneration = -1
   }
 }
