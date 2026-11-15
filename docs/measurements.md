@@ -109,6 +109,33 @@ landing within 2 ms after a frame's start, two frames after the one shown,
 jitter, and shows the frame in between: one frame per refresh, at most 2 ms
 behind the clock. Before it, 1 or 2 frames of 600 were skipped in some runs.
 
+### The conversion's own GPU time — 2026-11-15
+
+`FramePipeline.recordShow` takes `timestampWrites:` (video 0.10.0): the
+conversion's compute pass writes its own timestamps where a gpu/GpuTiming
+points, as Rae's render passes do. Before, a caller could only put timestamp
+marks around the pass, and on Apple a mark does not wait for the pass's work:
+the media editor read 14 µs for a 4K frame. checks/pipeline4k now asks for
+the device's timestamp queries (`chooseDeviceFeatures()`, as a window's
+`Gpu2d.initWindow` does). It then times a frame's conversion whenever no timed
+frame or sample is still in flight (GpuTiming has one readback), and reads the
+sample later without waiting. Apple M1 Max, macOS 27.0, 4K, means (p95):
+
+| file | frames timed | the conversion on the GPU, by its timestamps |
+|---|---|---|
+| 59.94 fps, run 1 | 300 of 600 | 1.12 ms (3.31 ms) |
+| 59.94 fps, run 2 | 300 of 600 | 1.17 ms (3.59 ms) |
+| 29.97 fps H.264 | 299 of 300 | 0.91 ms (2.70 ms) |
+| 29.97 fps HEVC | 298 of 300 | 0.91 ms (2.82 ms) |
+
+The same pass waited for on the CPU (checks/copyPath4k's "convert", run the
+same day) took 2.42 ms (p95 6.28) for H.264 and 2.34 ms (p95 6.34) for HEVC.
+That fits: the CPU-waited time is the GPU's work plus the submission and the
+wait to hear it finished, about 1.3 ms more. The timestamps time the
+conversion alone, and its 1 to 1.2 ms per 4K frame is what a GPU budget should
+count. Half the 59.94 fps frames are timed because a sample takes about a
+refresh to come back.
+
 ## Thumbnails of a 4K file — 2026-11-15
 
 What it measures: `checks/thumbnails4k/Main.rae`, run by hand after

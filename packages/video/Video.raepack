@@ -2,7 +2,7 @@ pack Video {
   format: "raepack"
   version: 1
   meta: {
-    version: "0.9.1"
+    version: "0.10.0"
   }
   rae: {
     version: "0.3.138"

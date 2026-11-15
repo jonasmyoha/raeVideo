@@ -15,11 +15,17 @@
 # pipeline, not a display's presentation). It reports the main thread's work
 # per refresh, the frames shown, skipped (never shown) and late (a refresh
 # whose frame was not decoded yet), and the cache's most against its budget.
+# And the conversion's own GPU time, by its compute pass's timestamps
+# (recordShow with gpu/GpuTiming's timestampWrites): a frame is timed when no
+# timed frame or sample is still in flight (GpuTiming has one readback), the
+# sample read later without waiting.
 open Atomic
 open audio/Audio
+open gpu/DeviceFeatures
 open gpu/GpuIds
 open gpu/GpuLifetime
 open gpu/GpuResources
+open gpu/GpuTiming
 open Sys
 open Time
 open video/FrameCache
@@ -63,6 +69,9 @@ func main() ret Int {
     path = argAt(index: 0)
   }
   var ready: Int = 0
+  # timestamp queries (and the other optional features the adapter has), as a
+  # window's Gpu2d.initWindow asks for them, before the device exists
+  chooseDeviceFeatures()
   unsafe {
     ready = webgpuBootstrap()
   }
@@ -100,6 +109,12 @@ func main() ret Int {
         sleep(ms: 1)
       }
       var inFlight: List(SubmissionId) = {}
+      var timing: GpuTiming = createGpuTiming(resources: resources, maxPasses: 1)
+      # the one timed submission in flight, its frame's sample, and the
+      # conversions timed (ns)
+      var timedSubmissions: List(SubmissionId) = {}
+      var sample: List(Int) = {}
+      var gpuTimes: List(Int) = {}
       var workTimes: List(Int) = {}
       var aheadLeast: Int = 1000
       # frame 0 shown paused, then play
@@ -132,20 +147,64 @@ func main() ret Int {
         )
         if changed {
           if var recording: Recording = beginRecording(resources: resources) {
-            let shown: Bool = pipeline.recordShow(
-              resources: resources
-              recording: recording
-              output: output
-              sourceNumber: source
-              frameIndex: player.shownFrame
+            var timed: Bool = timingAvailable(timing: timing) and timedSubmissions.length() is 0 and not timingSampleInFlight(
+              timing: timing
             )
+            var shown: Bool = false
+            if timed {
+              beginTimingFrame(timing: timing)
+              if let pass: Int = timedPassNamed(timing: timing, name: "conversion") {
+                unsafe {
+                  shown = pipeline.recordShow(
+                    resources: resources
+                    recording: recording
+                    output: output
+                    sourceNumber: source
+                    frameIndex: player.shownFrame
+                    timestampWrites: timingWrites(timing: timing)
+                  )
+                }
+              }
+              if shown {
+                timed = recordTimingResolve(
+                  timing: timing
+                  recording: recording
+                  resources: resources
+                )
+              } else {
+                # nothing was timed: no sample of it
+                beginTimingFrame(timing: timing)
+                timed = false
+              }
+            } else {
+              shown = pipeline.recordShow(
+                resources: resources
+                recording: recording
+                output: output
+                sourceNumber: source
+                frameIndex: player.shownFrame
+              )
+            }
             if let submission: SubmissionId = submit(resources: resources, recording: recording) {
-              inFlight.add(value: submission)
+              if timed {
+                timedSubmissions.add(value: submission)
+              } else {
+                inFlight.add(value: submission)
+              }
             }
           }
         }
         pollSubmissions(inFlight: inFlight, resources: resources)
         workTimes.add(value: nowNs() - workStart)
+        # the timed frame done: read its timestamps, later, without waiting
+        let wasTimed: Bool = timedSubmissions.length() > 0
+        pollSubmissions(inFlight: timedSubmissions, resources: resources)
+        if wasTimed and timedSubmissions.length() is 0 {
+          let sampling: Bool = startTimingSample(timing: timing, resources: resources)
+        }
+        if collectTiming(timing: timing, resources: resources, out: sample) {
+          gpuTimes.add(value: sample.copyAtDefault(index: 0) * 1000)
+        }
         # how many frames after the shown one are cached: the decode-ahead's slack
         var ahead: Int = 0
         loop ahead < 16 and pipeline.isCached(
@@ -166,10 +225,20 @@ func main() ret Int {
       )
       log("  main thread work per refresh: {summary(times: workTimes)}")
       log("  decoded ahead of the frame shown, at least: {aheadLeast} frames")
+      if timingAvailable(timing: timing) {
+        log(
+          "  the conversion on the GPU, by its own timestamps: {summary(times: gpuTimes)} ({gpuTimes.length()} of {player.shownFrames} frames timed)"
+        )
+      } else {
+        log("  the conversion on the GPU: this adapter has no timestamp queries")
+      }
       log(
         "  cache: most {pipeline.cache.mostBytes / 1048576} MB of a {budgetBytes / 1048576} MB budget, {pipeline.cache.uploaded} frames uploaded, {pipeline.cache.evicted} given up, {pipeline.cache.refused} refused"
       )
       loop let submission: SubmissionId in inFlight {
+        let done: Bool = awaitSubmission(resources: resources, id: submission)
+      }
+      loop let submission: SubmissionId in timedSubmissions {
         let done: Bool = awaitSubmission(resources: resources, id: submission)
       }
     }

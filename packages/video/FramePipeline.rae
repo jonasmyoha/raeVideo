@@ -41,6 +41,7 @@ open video/FrameStream
 open video/VideoBackends
 open video/VideoDecoder
 open video/YuvPicture
+open webgpu/Context
 open webgpu/WebgpuEnums
 
 type PipelineSource {
@@ -368,6 +369,50 @@ func createFrameOutput(
   ret none
 }
 
+# gpu/GpuCompute's recordBoundedCompute, its pass writing timestamps where
+# `timestampWrites` points (null: untimed). Rae has the timed dispatch
+# (recordComputeTimed) but not this bounded form of it.
+func recordBoundedComputeTimed(
+  recording: mod Recording
+  resources: view GpuResources
+  pipeline: view PipelineId
+  bindGroup: view BindGroupId
+  bounds: view ComputeBounds
+  elementCount: view Int
+  timestampWrites: copy Ptr
+) ret Bool {
+  let workgroups: Int = workgroupCountFor(
+    elementCount: elementCount
+    workgroupSize: bounds.workgroupSize
+  )
+  if workgroups is 0 {
+    ret true
+  }
+  if workgroups > maxWorkgroupsPerDimension {
+    ret false
+  }
+  if writeBuffer(
+    resources: resources
+    id: bounds.buffer
+    offset: 0
+    bytes: boundsBytes(elementCount: elementCount, workgroups: workgroups)
+  ) is false {
+    ret false
+  }
+  unsafe {
+    ret recordComputeTimed(
+      recording: recording
+      resources: resources
+      pipeline: pipeline
+      bindGroup: bindGroup
+      workgroupsX: workgroups
+      workgroupsY: 1
+      workgroupsZ: 1
+      timestampWrites: timestampWrites
+    )
+  }
+}
+
 func outputPipeline(output: view FrameOutput, layout: view FrameLayout) ret PipelineId {
   if layout is FrameLayout.nv12 {
     ret output.nv12Pipeline
@@ -378,7 +423,8 @@ func outputPipeline(output: view FrameOutput, layout: view FrameLayout) ret Pipe
 # Records the conversion of the cached frame into `output`'s texture, into the
 # caller's recording (submitted with the caller's frame, never waited for
 # here). False when the frame is not cached (a miss: show the last one) or is
-# not of the output's size.
+# not of the output's size. An untimed pass; the form with `timestampWrites`
+# times it.
 func recordShow(
   this: mod FramePipeline
   resources: mod GpuResources
@@ -386,6 +432,34 @@ func recordShow(
   output: view FrameOutput
   sourceNumber: view Int
   frameIndex: view Int
+) ret Bool {
+  unsafe {
+    let untimed: Ptr = webgpuNull()
+    ret this.recordShow(
+      resources: resources
+      recording: recording
+      output: output
+      sourceNumber: sourceNumber
+      frameIndex: frameIndex
+      timestampWrites: untimed
+    )
+  }
+}
+
+# recordShow with the conversion's compute pass writing its own timestamps
+# where `timestampWrites` points (gpu/GpuTiming: timedPassNamed, then
+# timingWrites; null for an untimed pass), as Rae's render passes take them.
+# A mark recorded around the pass does not time it: on Apple a mark does not
+# wait for the pass's work, so only the pass's own timestamps say how long the
+# conversion took on the GPU.
+func recordShow(
+  this: mod FramePipeline
+  resources: mod GpuResources
+  recording: mod Recording
+  output: view FrameOutput
+  sourceNumber: view Int
+  frameIndex: view Int
+  timestampWrites: copy Ptr
 ) ret Bool {
   let index: Int = this.cache.indexOf(sourceNumber: sourceNumber, frameIndex: frameIndex)
   if index < 0 {
@@ -432,14 +506,17 @@ func recordShow(
     bindGroup = entry.bindGroup
   }
   this.hits = this.hits + 1
-  ret recordBoundedCompute(
-    recording: recording
-    resources: resources
-    pipeline: outputPipeline(output: output, layout: layout)
-    bindGroup: bindGroup
-    bounds: output.bounds
-    elementCount: output.width * output.height
-  )
+  unsafe {
+    ret recordBoundedComputeTimed(
+      recording: recording
+      resources: resources
+      pipeline: outputPipeline(output: output, layout: layout)
+      bindGroup: bindGroup
+      bounds: output.bounds
+      elementCount: output.width * output.height
+      timestampWrites: timestampWrites
+    )
+  }
 }
 
 # Stops a source's worker (it finishes the frame it is on) and forgets its

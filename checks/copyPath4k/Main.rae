@@ -72,6 +72,7 @@ func measureFrames(resources: mod GpuResources, path: view String) ret Bool {
     resources: resources
     width: track.width
     height: track.height
+    layout: FrameLayout.nv12
   ) {
     loop var i: Int = 0, i < stream.frameCount(), ++i {
       let started: Int = nowNs()
@@ -123,6 +124,7 @@ func playInRealTime(resources: mod GpuResources, path: view String) ret Bool {
     resources: resources
     width: track.width
     height: track.height
+    layout: FrameLayout.nv12
   ) {
     let started: Int = nowNs()
     player.startPlaying(audio: audio, hostNs: started)
