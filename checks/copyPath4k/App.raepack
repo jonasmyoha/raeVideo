@@ -3,7 +3,7 @@ pack App {
   version: 1
   defaultTarget: compiled
   rae: {
-    version: "0.3.138"
+    version: "0.3.171"
   }
   dependencies: {
     dep video: {
