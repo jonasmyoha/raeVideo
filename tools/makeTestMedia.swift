@@ -10,7 +10,9 @@
 //           Y'CbCr (Y, then Cb and Cr at half width), for an encoder this
 //           platform does not have (tests/media/make.sh: DNxHR)
 //   matrix: 709 | 601     range: limited | full
-//   audio:  "tone" adds a rising tone at -12 dBFS, 48 kHz stereo AAC: from
+//   audio:  "flash": frames n % 30 == 15 all white and a click at each one's
+//           first sample, else silence (an A/V sync check)
+//           "tone" adds a rising tone at -12 dBFS, 48 kHz stereo AAC: from
 //           500 Hz at the start to 1500 Hz at the end, so no two places in
 //           the file sound the same (a player's sync can be checked to the
 //           sample: tests/player)
@@ -58,7 +60,14 @@ let timescale = Int32(arguments[6])!
 let frameDuration = Int64(arguments[7])!
 let matrixName = arguments[8]
 let fullRange = arguments[9] == "full"
-let withTone = arguments.count > 10 && arguments[10] == "tone"
+let audioMode = arguments.count > 10 ? arguments[10] : ""
+// "flash": no tone; frames 15, 45, 75, ... (n % 30 == 15) all white, and the
+// sound silent but for a click (48 samples at 0.8) starting at each such
+// frame's first sample, so a player's or an exporter's A/V sync can be
+// checked (the editor's tests/movieExport)
+let flash = audioMode == "flash"
+let withTone = audioMode == "tone" || flash
+func isFlash(_ n: Int) -> Bool { return flash && n % 30 == 15 }
 
 let (kr, kb): (Double, Double) = matrixName == "601" ? (0.299, 0.114) : (0.2126, 0.0722)
 let kg = 1.0 - kr - kb
@@ -114,6 +123,9 @@ func digitLit(_ digit: Int, _ x: Int, _ y: Int, _ cellWidth: Int, _ cellHeight: 
 
 // The R'G'B' of pixel (x, y) in frame n
 func pixel(_ x: Int, _ y: Int, _ n: Int) -> (Double, Double, Double) {
+  if isFlash(n) {
+    return (255, 255, 255)
+  }
   if y < height / 2 {
     let bar = min(6, x * 7 / width)
     return bars[bar]
@@ -421,7 +433,16 @@ func toneBuffer(first: Int, count: Int) -> CMSampleBuffer {
   CMBlockBufferAssureBlockMemory(block!)
   var samples = [Float](repeating: 0, count: count * channels)
   for i in 0..<count {
-    let value = Float(0.25 * sin(tonePhase(first + i)))
+    var value = Float(0.25 * sin(tonePhase(first + i)))
+    if flash {
+      value = 0
+      let sampleIndex = first + i
+      let frame = Int((Int64(sampleIndex) * Int64(timescale)) / (frameDuration * Int64(sampleRate)))
+      for f in [frame - 1, frame] where f >= 0 && isFlash(f) {
+        let start = Int((Int64(f) * frameDuration * Int64(sampleRate) + Int64(timescale) - 1) / Int64(timescale))
+        if sampleIndex >= start && sampleIndex < start + 48 { value = 0.8 }
+      }
+    }
     for c in 0..<channels { samples[i * channels + c] = value }
   }
   samples.withUnsafeBytes { raw in
@@ -483,4 +504,4 @@ if writer.status != .completed {
   FileHandle.standardError.write("writing failed: \(String(describing: writer.error))\n".data(using: .utf8)!)
   exit(1)
 }
-print("made \(outPath): \(codecName) \(width)x\(height), \(frameCount) frames at \(timescale)/\(frameDuration), BT.\(matrixName) \(fullRange ? "full" : "limited")\(withTone ? ", tone" : "")")
+print("made \(outPath): \(codecName) \(width)x\(height), \(frameCount) frames at \(timescale)/\(frameDuration), BT.\(matrixName) \(fullRange ? "full" : "limited")\(flash ? ", flash and click" : withTone ? ", tone" : "")")
