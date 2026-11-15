@@ -268,7 +268,7 @@ void* rae_ffmpeg_backend_calls(void) {
 /* ---- the encoder ------------------------------------------------------------
  * Frames come in as 8-bit planar Y'CbCr, the planes packed one after another
  * (video's RaeVideoEncoderCalls); packets are kept until the caller takes them.
- * Everything runs on the caller's thread. */
+ * The encode runs on the caller's thread and FFmpeg's own threads. */
 typedef struct {
   int64_t version;
   int64_t (*open)(uint8_t*, uint8_t*, int64_t, int64_t, int64_t, int64_t, int64_t);
@@ -342,6 +342,18 @@ static int64_t rae_ffmpeg_encoder_open(uint8_t* encoder_z, uint8_t* profile_z, i
   if (!dnxhd) context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
   if (profile_z && profile_z[0]) {
     p_av_opt_set(context->priv_data, "profile", (const char*)profile_z, 0);
+  }
+  /* threads: as many as the machine has; slices of a frame where the codec
+   * splits one (DNxHR's macroblock rows, FFV1's slices), frames side by side
+   * where it encodes them so (DNxHR). Frame threads hold packets back a few
+   * frames: drain queues what comes out, and finish flushes the rest. */
+  context->thread_count = 0;
+  context->thread_type = FF_THREAD_SLICE | FF_THREAD_FRAME;
+  if (!dnxhd) {
+    /* FFV1 encodes slices in parallel only when the frame has several
+     * (version 3, which also checksums each slice by default) */
+    p_av_opt_set(context->priv_data, "slices", "24", 0);
+    context->level = 3;
   }
   if (p_avcodec_open2(context, codec, NULL) < 0) {
     rae_ffmpeg_encoder_close((int64_t)(intptr_t)encoder);

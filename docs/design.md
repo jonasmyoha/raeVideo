@@ -573,7 +573,7 @@ Depends on the audio steps for its clock (audio 1/6 to 4/6).
    Rae's `lib/media/Mp4Writer.rae` (moved there with video 0.9.0); the round trip
    in `tests/writer`, ffprobe / ffmpeg / AVFoundation in
    `tools/checkWrittenFiles.sh`; the FFmpeg package's DNxHR and FFV1 encoders
-   as backends of the same API (video 0.7.0, ffmpeg 0.2.0); AAC through
+   as backends of the same API (video 0.7.0, ffmpeg 0.2.0; on threads, ffmpeg 0.3.0); AAC through
    AudioToolbox (`AacEncoder`, video 0.8.0: here rather than in Rae's audio
    package, beside the writer an export uses), its priming the track's edit
    start, the frames fed its length, AAC's pre-roll written as a roll sample

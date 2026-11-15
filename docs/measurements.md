@@ -197,10 +197,46 @@ What it says:
 - **DNxHR is slow, but not because of its input.** At 40 ms a frame (0.8 times
   real time), 30 ms is FFmpeg's encode on one thread: the glue sets no
   `thread_count` for encoders (it does for decoders). Its fix is FFmpeg's
-  threads (QUEUE.md), not zero-copy.
+  threads, not zero-copy: done in ffmpeg 0.3.0 (the next section).
 
 Decision for §12 V3: export keeps the readback. Zero-copy (an IOSurface-backed
 texture imported into WebGPU, which `webgpu.h` cannot do) would save at most
 about 1.5 ms of a 4K frame, and nothing for H.264 or HEVC. Not measured: an
 iPhone, 10-bit sources and ProRes 4444 (64-bit BGRA would double the copies),
 and an export that decodes ahead.
+
+## FFmpeg's encoders on threads — 2026-11-15
+
+What it measures: the same `checks/export4k/Main.rae`, which now also exports
+FFV1 (4:2:0, 12.4 MB read back a frame). packages/ffmpeg 0.3.0 opens its
+encoders with `thread_count` 0 (one thread per core) and both slice and frame
+threads. FFmpeg uses whichever the codec has: DNxHR encodes several frames side
+by side, and FFV1 encodes the slices of a frame side by side, so FFV1 is now
+version 3 with 24 slices. Frame threads hold packets back a few frames. The
+glue already queues whatever comes out, and `finish` flushes the rest, so the
+writer sees nothing different. Apple M1 Max (10 cores), macOS 27.0, means in ms
+(p95 in brackets):
+
+| encoder | threads | export per frame | hand-off (the encode on the caller's thread) | real time at 29.97 fps |
+|---|---|---|---|---|
+| DNxHR HQ | one | 41.34 | 30.36 (31.34) | 0.8 times |
+| DNxHR HQ | per core | 11.51 | 0.61 (0.65) | 2.9 times |
+| FFV1 | one | 36.33 | 27.17 (28.81) | 0.9 times |
+| FFV1, 24 slices | per core | 13.85 | 5.03 (6.05) | 2.4 times |
+
+ffprobe counts 300 frames in both threaded files, and ffmpeg decodes them
+without an error. tests/writer still reads its DNxHR and FFV1 files back with
+every counter in order.
+
+What it says:
+
+- **DNxHR now exports almost as fast as H.264** (11.5 against 10.5 ms a
+  frame), and its encode hardly holds up the caller (a 0.6 ms hand-off against
+  H.264's 3 ms). What is left is the source's decode and conversion (5.5 ms)
+  and the planar pass (3.2 ms).
+- **FFV1 slices are encoded in parallel within a frame only**, so the caller
+  still waits 5 ms a frame for it. That is enough for a lossless master at 2.4
+  times real time.
+- **The planar pass is 3.2 ms, against 1.1 ms for BGRA**, although it writes
+  less. It packs a 4-byte word per invocation, reading 4 to 8 texels for it;
+  that is the next thing to look at if the planar export matters.

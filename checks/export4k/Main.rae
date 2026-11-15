@@ -7,8 +7,9 @@
 # build/media/counter4k.mp4 (3840x2160, 300 frames at 29.97 fps) decoded and
 # converted to RGBA on the GPU, then exported as a MOV with each encoder that
 # takes it: H.264, HEVC and ProRes 422 HQ through VideoToolbox (a BGRA
-# readback, 33 MB a frame) and DNxHR HQ through packages/ffmpeg (planar 4:2:2,
-# 16.6 MB). For each frame VideoEncoder.encodeTexture's steps: the GPU pass and
+# readback, 33 MB a frame), DNxHR HQ (planar 4:2:2, 16.6 MB) and FFV1 (4:2:0,
+# 12.4 MB) through packages/ffmpeg. For each frame VideoEncoder.encodeTexture's steps: the GPU pass
+# and
 # its buffer copy (waited for), mapping the readback, copying it into the
 # encoder's list, and handing it to the encoder: the glue's copy into the
 # encoder's own buffer, plus VideoToolbox's wait when its queue is full, or the
@@ -210,12 +211,19 @@ func main() ret Int {
     if not addFfmpegEncoders(table: encoders) {
       log("FFmpeg did not load: {ffmpegProblem()} (DNxHR left out)")
     }
-    let names: List(String) = { "h264.mov", "hevc.mov", "prores422Hq.mov", "dnxhrHq.mov" }
+    let names: List(String) = {
+      "h264.mov"
+      "hevc.mov"
+      "prores422Hq.mov"
+      "dnxhrHq.mov"
+      "ffv1.mov"
+    }
     let codecs: List(VideoCodec) = {
       VideoCodec.h264
       VideoCodec.hevc
       VideoCodec.prores422Hq
       VideoCodec.dnxhrHq
+      VideoCodec.ffv1
     }
     loop var i: Int = 0, i < names.length(), ++i {
       let ok: Bool = exportFile(
