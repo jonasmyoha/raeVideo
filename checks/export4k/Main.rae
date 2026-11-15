@@ -1,0 +1,231 @@
+# The 4K export, measured (docs/design.md §12 V3, QUEUE.md [encoder input
+# without readback]): not a test (it needs the 4K file, `sh tests/media/make.sh
+# 4k`), a measurement to run by hand and write down in docs/measurements.md.
+#
+#   ./rae run checks/export4k/Main.rae
+#
+# build/media/counter4k.mp4 (3840x2160, 300 frames at 29.97 fps) decoded and
+# converted to RGBA on the GPU, then exported as a MOV with each encoder that
+# takes it: H.264, HEVC and ProRes 422 HQ through VideoToolbox (a BGRA
+# readback, 33 MB a frame) and DNxHR HQ through packages/ffmpeg (planar 4:2:2,
+# 16.6 MB). For each frame VideoEncoder.encodeTexture's steps: the GPU pass and
+# its buffer copy (waited for), mapping the readback, copying it into the
+# encoder's list, and handing it to the encoder: the glue's copy into the
+# encoder's own buffer, plus VideoToolbox's wait when its queue is full, or the
+# whole encode for FFmpeg, which encodes on the caller's thread. The copies are
+# what an IOSurface-backed texture would save. Beside them the whole export's
+# time per frame, from the first frame to the file written, the encoder
+# finishing included.
+import Math
+open Time
+open ffmpeg/Ffmpeg
+open gpu/GpuIds
+open gpu/GpuResources
+open media/Mp4
+open media/Mp4Writer
+open video/FrameStream
+open video/MediaWriter
+open video/VideoBackends
+open video/VideoDecoder
+open video/VideoEncoder
+open video/YuvPicture
+open webgpu/Context
+
+const sourcePath: String = "build/media/counter4k.mp4"
+
+func milliseconds(nanoseconds: view Int) ret Float {
+  ret (nanoseconds as Float) / 1000000.0
+}
+
+func total(times: view List(Int)) ret Int {
+  var sum: Int = 0
+  loop let time: Int in times {
+    sum = sum + time
+  }
+  ret sum
+}
+
+# "mean / p95 / largest" of a list of ns, in ms
+func summary(times: view List(Int)) ret String {
+  let count: Int = times.length()
+  if count is 0 {
+    ret "none"
+  }
+  var sorted: List(Int) = List.create(Int, cap: count)
+  loop let time: Int in times {
+    var at: Int = sorted.length()
+    loop at > 0 and sorted.copyAtDefault(index: at - 1) > time {
+      at = at - 1
+    }
+    sorted.insert(index: at, value: time)
+  }
+  let mean: Float = milliseconds(nanoseconds: total(times: times) / count)
+  let p95: Float = milliseconds(nanoseconds: sorted.copyAtDefault(index: count * 95 / 100))
+  let largest: Float = milliseconds(nanoseconds: sorted.copyAtDefault(index: count - 1))
+  ret "{mean} / {p95} / {largest}"
+}
+
+func writePackets(writer: mod MediaWriter, video: view Int, packets: view List(EncodedPacket)) {
+  loop let packet: view EncodedPacket in packets {
+    let wrote: Bool = writer.writePacket(
+      trackIndex: video
+      bytes: packet.bytes
+      time: packet.time
+      decodeTime: packet.decodeTime
+      duration: 1001
+      keyframe: packet.keyframe
+    )
+  }
+}
+
+func exportFile(
+  resources: mod GpuResources
+  name: view String
+  codec: view VideoCodec
+  encoders: view List(EncoderBackend)
+) ret Bool {
+  var stream: FrameStream = openFrameStream(path: sourcePath, table: defaultVideoBackends())
+  if stream.error.length() > 0 {
+    log("{sourcePath}: {stream.error} (make it with: sh tests/media/make.sh 4k)")
+    ret false
+  }
+  let track: Mp4Track = stream.reader.track(trackIndex: stream.trackIndex)
+  let settings: EncoderSettings = {
+    codec: codec
+    width: track.width
+    height: track.height
+    timescale: 30000
+    bitRate: 50000000
+    quality: 0
+    keyframeInterval: 30
+  }
+  var encoder: VideoEncoder = openVideoEncoder(
+    resources: resources
+    settings: settings
+    table: encoders
+  )
+  if encoder.error.length() > 0 {
+    log("{name}: {encoder.error}")
+    ret false
+  }
+  let path: String = "build/export4k/{name}"
+  var writer: MediaWriter = openMediaWriter(path: path, container: ContainerKind.mov)
+  let video: Int = writer.addVideoTrack(
+    codec: codecFourCharacters(codec: codec)
+    width: track.width
+    height: track.height
+    timescale: 30000
+  )
+  var decodeTimes: List(Int) = {}
+  var passTimes: List(Int) = {}
+  var mapTimes: List(Int) = {}
+  var copyTimes: List(Int) = {}
+  var handOffTimes: List(Int) = {}
+  var readbackTimes: List(Int) = {}
+  var encodeTimes: List(Int) = {}
+  var started: Int = nowNs()
+  var finished: Int = started
+  if var picture: YuvPicture = createYuvPicture(
+    resources: resources
+    width: track.width
+    height: track.height
+    layout: FrameLayout.nv12
+  ) {
+    started = nowNs()
+    loop var i: Int = 0, i < stream.frameCount(), ++i {
+      let frameStart: Int = nowNs()
+      var frame: VideoFrame = stream.takeFrame(frameIndex: i)
+      let shown: Bool = picture.uploadFrame(resources: resources, frame: frame) and picture.convertNow(
+        resources: resources
+      )
+      releaseFrame(frame: frame)
+      let decoded: Int = nowNs()
+      if not shown or not encoder.encodeTexture(
+        resources: resources
+        texture: picture.picture
+        time: i * 1001
+      ) {
+        log("{name}: frame {i}: {encoder.error}")
+        ret false
+      }
+      let encoded: Int = nowNs()
+      writePackets(writer: writer, video: video, packets: encoder.takePackets())
+      decodeTimes.add(value: decoded - frameStart)
+      passTimes.add(value: encoder.lastPassNs)
+      mapTimes.add(value: encoder.lastMapNs)
+      copyTimes.add(value: encoder.lastCopyNs)
+      handOffTimes.add(value: encoder.lastHandOffNs)
+      readbackTimes.add(value: encoder.lastMapNs + encoder.lastCopyNs + encoder.lastHandOffNs)
+      encodeTimes.add(value: encoded - decoded)
+    }
+    if not encoder.finish() {
+      log("{name}: the encoder failed")
+      ret false
+    }
+    writePackets(writer: writer, video: video, packets: encoder.takePackets())
+  }
+  writer.setTrackConfig(trackIndex: video, config: encoder.codecConfig())
+  let written: Bool = writer.finish()
+  finished = nowNs()
+  encoder.close(resources: resources)
+  stream.close()
+  if not written {
+    log("{name}: {writer.error}")
+    ret false
+  }
+  let frames: Int = decodeTimes.length()
+  let perFrame: Int = (finished - started) / max(a: 1, b: frames)
+  let share: Int = total(times: readbackTimes) * 100 / max(a: 1, b: finished - started)
+  log(
+    "{name}: {frames} frames of {track.width}x{track.height} in {milliseconds(
+      nanoseconds: finished - started
+    )} ms, {milliseconds(nanoseconds: perFrame)} ms a frame"
+  )
+  log("  decode + convert:   {summary(times: decodeTimes)}")
+  log("  encodeTexture:      {summary(times: encodeTimes)}")
+  log("    pass + copy:      {summary(times: passTimes)}")
+  log("    map:              {summary(times: mapTimes)}")
+  log("    copy to a list:   {summary(times: copyTimes)}")
+  log("    hand-off:         {summary(times: handOffTimes)}")
+  log(
+    "  map + copy + hand-off: {summary(times: readbackTimes)}, {share}% of the export (the hand-off includes the encoder's wait, or its whole encode when it encodes on the caller's thread)"
+  )
+  ret true
+}
+
+func main() ret Int {
+  var ready: Int = 0
+  unsafe {
+    ready = webgpuBootstrap()
+  }
+  if ready is not 1 {
+    log("no GPU")
+    ret 1
+  }
+  let made: Bool = makeDir(path: "build")
+  let madeExport: Bool = makeDir(path: "build/export4k")
+  var issuer: IdIssuer = IdIssuer.create()
+  if var resources: GpuResources = GpuResources.create(issuer: issuer, capacity: 64) {
+    var encoders: List(EncoderBackend) = defaultEncoderBackends()
+    if not addFfmpegEncoders(table: encoders) {
+      log("FFmpeg did not load: {ffmpegProblem()} (DNxHR left out)")
+    }
+    let names: List(String) = { "h264.mov", "hevc.mov", "prores422Hq.mov", "dnxhrHq.mov" }
+    let codecs: List(VideoCodec) = {
+      VideoCodec.h264
+      VideoCodec.hevc
+      VideoCodec.prores422Hq
+      VideoCodec.dnxhrHq
+    }
+    loop var i: Int = 0, i < names.length(), ++i {
+      let ok: Bool = exportFile(
+        resources: resources
+        name: names.copyAtDefault(index: i)
+        codec: codecs.copyAtDefault(index: i)
+        encoders: encoders
+      )
+    }
+    ret 0
+  }
+  ret 1
+}

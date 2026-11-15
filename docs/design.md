@@ -578,7 +578,9 @@ Depends on the audio steps for its clock (audio 1/6 to 4/6).
    package, beside the writer an export uses), its priming the track's edit
    start, the frames fed its length, AAC's pre-roll written as a roll sample
    group as Apple does (without it AVFoundation takes the priming out twice).
-   Not yet: input without the readback (QUEUE.md); the offline loop with audio and the round-trip tests
+   Input without the readback was measured and not done (2026-11-15,
+   measurements.md: the copies are about 1.5 ms of a 4K frame, and the encoder
+   limits H.264 and HEVC). Not yet: the offline loop with audio and the round-trip tests
    where the timeline is, in `mediaeditor`.
 5. **The FFmpeg package** (`packages/ffmpeg`, `ffmpeg/v0.1.0`, **landed
    2026-11-14**, §4), dav1d, libvpx, the WebM reader.
@@ -619,8 +621,10 @@ Depends on the audio steps for its clock (audio 1/6 to 4/6).
   enough for playback; the peaks come from the decode and the waiting, which the
   frame pipeline (V3 decode-ahead) addresses: with it, 4K at 59.94 fps plays
   with no frame skipped and the main thread's work is about 2.5 ms a refresh
-  (measured 2026-11-15). Still open for the iPhone, 10-bit
-  and 60 fps 4K, and many-layer editing.
+  (measured 2026-11-15). For export too, the readback is not the cost: about
+  1.5 ms of CPU copies in a 4K frame that VideoToolbox takes 10.5 ms to encode
+  as H.264 (measured 2026-11-15), so export keeps it. Still open for the
+  iPhone, 10-bit and 60 fps 4K, and many-layer editing.
 - **V4 — HDR surfaces** in our WebGPU build (float surface, extended range,
   color space) on macOS and iOS.
 - **V5 — `color-management-plan.md`** (Rae's). Its backend phases (a Metal

@@ -142,3 +142,65 @@ not a call (the longest call of that run was 3 µs). Most of a thumbnail's time
 is the 4K frame's conversion and the wait for the readback on the worker; a
 keyframe thumbnail saves the decode of the frames between the keyframe and the
 frame.
+
+## The 4K export and its readback (decides §12 V3 for export) — 2026-11-15
+
+What it measures: `checks/export4k/Main.rae`, run by hand after
+`sh tests/media/make.sh 4k`.
+
+    ./rae run checks/export4k/Main.rae
+
+`build/media/counter4k.mp4` (3840x2160, 300 frames at 29.97 fps) is decoded,
+converted to RGBA on the GPU (both waited for: "decode + convert") and exported
+to a MOV through `VideoEncoder.encodeTexture` and `MediaWriter`, once per
+encoder. `encodeTexture`'s steps, timed inside it (`lastPassNs` ...
+`lastHandOffNs`):
+
+- **pass + copy**: the GPU pass that packs the frame (BGRA for VideoToolbox,
+  planar 4:2:2 for DNxHR) and the copy into the readback buffer, waited for;
+- **map**: mapping the readback buffer;
+- **copy to a list**: the mapped bytes into the encoder's list (33 MB of BGRA,
+  16.6 MB of 4:2:2);
+- **hand-off**: the call into the encoder. For VideoToolbox, the glue copies
+  the frame into a pixel buffer from the session's pool and queues it, and the
+  call waits when VideoToolbox's queue is full. FFmpeg encodes on the caller's
+  thread, so for DNxHR this is the whole encode.
+
+Apple M1 Max, macOS 27.0. Means in ms (p95 in brackets), with the list made
+once per encoder (video 0.9.1). Three runs agreed within 0.4 ms a frame (ProRes
+7.78 to 8.18 ms); the table is the second:
+
+| encoder | export per frame | decode + convert | pass + copy | map | copy to a list | hand-off |
+|---|---|---|---|---|---|---|
+| H.264 (VideoToolbox) | 10.54 | 5.11 (9.24) | 1.08 (1.18) | 0.003 | 0.72 (0.82) | 3.19 (5.77) |
+| HEVC (VideoToolbox) | 10.53 | 5.05 (9.12) | 1.06 (1.15) | 0.002 | 0.72 (0.81) | 3.26 (5.74) |
+| ProRes 422 HQ (VideoToolbox) | 7.93 | 5.10 (9.03) | 1.12 (1.25) | 0.002 | 0.72 (0.79) | 0.83 (0.89) |
+| DNxHR HQ (FFmpeg) | 40.15 | 5.29 (9.53) | 3.16 (3.62) | 0.003 | 0.41 (0.42) | 29.61 (30.47) |
+
+Before this measurement, `encodeTexture` made a new 33 MB list for every frame.
+That made "copy to a list" 1.35 ms, and ProRes 422 HQ took 8.61 ms a frame.
+H.264 and HEVC took the same 10.5 ms a frame either way: the time saved moved
+into the hand-off, waiting for VideoToolbox.
+
+What it says:
+
+- **The readback is not what limits an export.** Mapping costs nothing on
+  unified memory. The two CPU copies an IOSurface-backed texture would save, the
+  list (0.72 ms) and the pixel buffer (about 0.8 ms, ProRes's hand-off), come
+  to about 1.5 ms of a 4K frame. H.264 and HEVC run at about 95 frames a second
+  (3.2 times real time at 29.97 fps), held back by VideoToolbox's encoder: the
+  frames would wait for it anyway. ProRes 422 HQ runs at about 125 frames a second,
+  and the most zero-copy could save there is about 20%.
+- **The largest step is the source's decode and conversion** (5 ms, waited for
+  in this check). An export of a timeline would decode ahead on worker threads
+  (the frame pipeline), which matters more than the copies.
+- **DNxHR is slow, but not because of its input.** At 40 ms a frame (0.8 times
+  real time), 30 ms is FFmpeg's encode on one thread: the glue sets no
+  `thread_count` for encoders (it does for decoders). Its fix is FFmpeg's
+  threads (QUEUE.md), not zero-copy.
+
+Decision for §12 V3: export keeps the readback. Zero-copy (an IOSurface-backed
+texture imported into WebGPU, which `webgpu.h` cannot do) would save at most
+about 1.5 ms of a 4K frame, and nothing for H.264 or HEVC. Not measured: an
+iPhone, 10-bit sources and ProRes 4444 (64-bit BGRA would double the copies),
+and an export that decodes ahead.

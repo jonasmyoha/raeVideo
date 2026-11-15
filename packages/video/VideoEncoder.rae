@@ -18,8 +18,11 @@
 # to the codec's Y'CbCr with BT.709 tags. For a registered encoder the pass
 # (rgbaToPlanar.wgsl) converts it to the 8-bit planar Y'CbCr it takes (BT.709,
 # limited range; 4:2:2 for DNxHR, 4:2:0 for FFV1). Handing it the texture's own
-# memory (an IOSurface-backed texture, no readback) needs a way to import one
-# that webgpu.h does not have yet (docs/design.md §12 V3).
+# memory (an IOSurface-backed texture, no readback) would need a way to import
+# one that webgpu.h does not have (docs/design.md §12 V3), and is not worth it:
+# at 4K the readback's copies are about 1.5 ms a frame, and the encoder takes
+# longer (checks/export4k, docs/measurements.md). The frame is read into one
+# list per encoder, made once.
 #
 # Frames are encoded in order, without reordering (no B-frames): each packet's
 # decode time is its time. The packets come out on VideoToolbox's thread and
@@ -100,7 +103,16 @@ type VideoEncoder {
   # the bind group for the texture last given (rebuilt for another)
   bindGroup: BindGroupId
   boundTexture: Int
+  # the frame read back, made once (a 4K BGRA frame is 33 MB)
+  pixels: List(UInt8)
   framesGiven: Int
+  # the last frame's steps, in ns (checks/export4k): the GPU pass and its
+  # buffer copy, waited for; mapping the readback; copying it into a list;
+  # handing it to the encoder (the glue's copy into its pixel buffer)
+  lastPassNs: Int
+  lastMapNs: Int
+  lastCopyNs: Int
+  lastHandOffNs: Int
   error: String
 }
 
@@ -206,7 +218,12 @@ func noVideoEncoder(settings: view EncoderSettings) ret VideoEncoder {
     pipeline: noPipelineId()
     bindGroup: noBindGroupId()
     boundTexture: -1
+    pixels: {}
     framesGiven: 0
+    lastPassNs: 0
+    lastMapNs: 0
+    lastCopyNs: 0
+    lastHandOffNs: 0
     error: "no encoder for {codecFourCharacters(codec: settings.codec)} here"
   }
 }
@@ -398,6 +415,7 @@ func encodeTexture(
     }
   }
   let size: Int = (this.inputBytes + 3) / 4 * 4
+  let started: Int = nowNs()
   var done: Bool = false
   if var recording: Recording = beginRecording(resources: resources) {
     let converted: Bool = recordBoundedCompute(
@@ -425,8 +443,14 @@ func encodeTexture(
     this.error = "converting frame {this.framesGiven} failed"
     ret false
   }
-  var pixels: List(UInt8) = List.create(UInt8, cap: size)
-  pixels.addDefaults(count: size)
+  let passed: Int = nowNs()
+  var mapped: Int = passed
+  # the list the frame is copied into is made once, here: counted with the copy
+  if this.pixels.length() is not size {
+    this.pixels = List.create(UInt8, cap: size)
+    this.pixels.addDefaults(count: size)
+  }
+  let allocated: Int = nowNs()
   var read: Bool = false
   if let request: ReadRequest = readBuffer(
     resources: resources
@@ -440,18 +464,20 @@ func encodeTexture(
       status = request.poll()
       spins = spins + 1
     }
-    read = status is 1 and request.copyToBytes(destination: pixels)
+    mapped = nowNs()
+    read = status is 1 and request.copyToBytes(destination: this.pixels)
   }
   if not read {
     this.error = "reading frame {this.framesGiven} back failed"
     ret false
   }
+  let copied: Int = nowNs()
   var result: Int = 0
   unsafe {
     if this.kind is VideoBackend.videoToolbox {
       result = rae_video_vte_encode(
         encoder: this.handle
-        bgra: pixels.data
+        bgra: this.pixels.data
         bytesPerRow: this.settings.width * 4
         time: time
       )
@@ -459,7 +485,7 @@ func encodeTexture(
       result = rae_video_registered_encoder_encode(
         backend: this.number
         encoder: this.handle
-        planes: pixels.data
+        planes: this.pixels.data
         time: time
       )
     }
@@ -468,6 +494,11 @@ func encodeTexture(
     this.error = "the encoder refused frame {this.framesGiven} ({result})"
     ret false
   }
+  let handedOff: Int = nowNs()
+  this.lastPassNs = passed - started
+  this.lastMapNs = mapped - allocated
+  this.lastCopyNs = copied - mapped + allocated - passed
+  this.lastHandOffNs = handedOff - copied
   this.framesGiven = this.framesGiven + 1
   ret true
 }

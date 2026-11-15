@@ -10,7 +10,7 @@ The design is [docs/design.md](docs/design.md); what lives here,
 
 ## Packages
 
-- `packages/video` (0.9.0): MP4 and MOV reading (`MediaReader`), decoding
+- `packages/video` (0.9.1): MP4 and MOV reading (`MediaReader`), decoding
   through VideoToolbox on Apple (H.264, HEVC, ProRes: `VideoDecoder`,
   `FrameStream`) or a registered backend, a frame on the GPU as RGBA
   (`YuvPicture`), 10-bit frames as linear light in rgba16float
@@ -61,4 +61,5 @@ package needs from Rae, must be pushed before another machine can fetch them.
 programs in `tests/`; `RAE_ROOT=<a Rae checkout> make test` uses that Rae.
 Media files are in Git LFS: `git lfs install` before cloning. The test media
 is made by `tests/media/make.sh` (macOS: Apple's encoders), the 4K files for
-`checks/copyPath4k` by `sh tests/media/make.sh 4k`.
+the measurements in `checks/` (docs/measurements.md) by
+`sh tests/media/make.sh 4k`.
