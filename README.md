@@ -21,7 +21,7 @@ The design is [docs/design.md](docs/design.md); what lives here,
   AudioToolbox (`AacEncoder`) and MOV / MP4 writing (`MediaWriter`, its boxes from
   Rae's `media/Mp4Writer`), and a simple player on Rae's audio clock
   (`VideoPlayer`). It depends on Rae's `audio` package 0.22.0.
-- `packages/ffmpeg` (0.5.0): FFmpeg 9.0.2, built LGPL-only from its pinned
+- `packages/ffmpeg` (0.6.0): FFmpeg 9.0.2, built LGPL-only from its pinned
   tarball the first time a program uses the package, loaded at run time, as
   one more decoder of the video package (DNxHD/DNxHR, VP8, VP9, FFV1, ProRes):
   `addFfmpegBackend(table:)`, and encoder (DNxHR LB and HQ, FFV1; on one thread per core):
