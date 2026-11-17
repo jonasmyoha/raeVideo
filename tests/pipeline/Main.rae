@@ -49,6 +49,11 @@ func waitCached(
   frameIndex: view Int
 ) ret Bool {
   loop var tries: Int = 0, tries < 5000, ++tries {
+    # asked again each time, as a player asks each refresh
+    # (VideoPlayer.refreshFromPipeline): a full cache may give the frame up
+    # before it is shown, and prefetch asks only for what is neither cached
+    # nor asked for
+    pipeline.prefetch(sourceNumber: sourceNumber, first: frameIndex, last: frameIndex)
     let arrived: Bool = pipeline.uploadDecoded(resources: resources, maxUploads: 8)
     if pipeline.isCached(sourceNumber: sourceNumber, frameIndex: frameIndex) {
       ret true
