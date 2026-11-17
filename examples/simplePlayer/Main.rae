@@ -30,10 +30,10 @@ open Gpu2dCanvas
 open Keys
 open ui/Ecs
 open ui/EventLoop
-open ui/inputSystem/InputSystem
+open ui/InputSystem
 open ui/Pipeline
 open ui/Registry
-open ui/renderSystem/RenderSystem
+open ui/RenderSystem
 open ui/Scene
 open ui/SceneFile
 open ui/SceneLoader

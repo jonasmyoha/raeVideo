@@ -178,6 +178,7 @@ func budgetHolds(resources: mod GpuResources, output: view FrameOutput) ret Bool
     table: defaultVideoBackends()
   )
   var wrong: Int = 0
+  var notCached: Int = 0
   loop var frameIndex: Int = 0, frameIndex < 90, ++frameIndex {
     pipeline.prefetch(sourceNumber: source, first: frameIndex, last: frameIndex + 6)
     if not waitCached(
@@ -187,6 +188,7 @@ func budgetHolds(resources: mod GpuResources, output: view FrameOutput) ret Bool
       frameIndex: frameIndex
     ) {
       wrong = wrong + 1
+      notCached = notCached + 1
     } else if shownCounter(
       pipeline: pipeline
       resources: resources
@@ -204,6 +206,11 @@ func budgetHolds(resources: mod GpuResources, output: view FrameOutput) ret Bool
   log(
     "90 frames played with a budget of 12 frames: each right, the cache gave frames up and never held more than its budget: {ok}"
   )
+  if not ok {
+    log(
+      "  wrong {wrong}, not cached in time {notCached}, most {pipeline.cache.mostBytes} of {budget} bytes, given up {pipeline.cache.evicted}"
+    )
+  }
   pipeline.close(resources: resources)
   ret ok
 }
