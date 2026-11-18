@@ -6,7 +6,7 @@ pack FfmpegApp {
   description: "The DNxHR test file decoded through packages/ffmpeg and shown on the GPU, by a program that tools/checkFfmpegBundle.sh puts in a macOS app with FFmpeg in its Contents/Frameworks."
   category: "Video"
   rae: {
-    version: "0.4.3"
+    version: "0.4.24"
   }
   dependencies: {
     dep video: {
