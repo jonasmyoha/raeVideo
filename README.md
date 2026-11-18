@@ -10,7 +10,7 @@ The design is [docs/design.md](docs/design.md); what lives here,
 
 ## Packages
 
-- `packages/video` (0.12.1): MP4 and MOV reading (`MediaReader`), decoding
+- `packages/video` (0.13.0): MP4 and MOV reading (`MediaReader`), decoding
   through VideoToolbox on Apple (H.264, HEVC, ProRes: `VideoDecoder`,
   `FrameStream`) or a registered backend, a frame on the GPU as RGBA
   (`YuvPicture`), 10-bit frames as linear light in rgba16float
@@ -20,7 +20,7 @@ The design is [docs/design.md](docs/design.md); what lives here,
   VideoToolbox (`VideoEncoder`: H.264, HEVC, ProRes), AAC through
   AudioToolbox (`AacEncoder`) and MOV / MP4 writing (`MediaWriter`, its boxes from
   Rae's `media/Mp4Writer`), and a simple player on Rae's audio clock
-  (`VideoPlayer`). It depends on Rae's `audio` package 0.22.0.
+  (`VideoPlayer`). It depends on Rae's `audio` package 0.25.0.
 - `packages/ffmpeg` (0.6.1): FFmpeg 9.0.2, built LGPL-only from its pinned
   tarball the first time a program uses the package, loaded at run time, as
   one more decoder of the video package (DNxHD/DNxHR, VP8, VP9, FFV1, ProRes):
