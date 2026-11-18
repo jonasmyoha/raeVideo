@@ -21,7 +21,7 @@ The design is [docs/design.md](docs/design.md); what lives here,
   AudioToolbox (`AacEncoder`) and MOV / MP4 writing (`MediaWriter`, its boxes from
   Rae's `media/Mp4Writer`), and a simple player on Rae's audio clock
   (`VideoPlayer`). It depends on Rae's `audio` package 0.25.0.
-- `packages/ffmpeg` (0.6.1): FFmpeg 9.0.2, built LGPL-only from its pinned
+- `packages/ffmpeg` (0.7.0): FFmpeg 9.0.2, built LGPL-only from its pinned
   tarball the first time a program uses the package, loaded at run time, as
   one more decoder of the video package (DNxHD/DNxHR, VP8, VP9, FFV1, ProRes):
   `addFfmpegBackend(table:)`, and encoder (DNxHR LB and HQ, FFV1; on one thread per core):
@@ -49,14 +49,14 @@ A program takes a package by git at a release tag:
 dep video: {
   git: "https://github.com/jonasmyoha/raeVideo.git"
   subdir: "packages/video"
-  version: "0.7.0"
-  hash: "git-tree:b9478290dd1f6ce129d02a38140b00cb832eda61"
+  version: "0.13.0"
+  hash: "git-tree:00d6cea57d79b5b5d16d34d2e4e5ac99ea458608"
 }
 dep ffmpeg: {
   git: "https://github.com/jonasmyoha/raeVideo.git"
   subdir: "packages/ffmpeg"
-  version: "0.2.0"
-  hash: "git-tree:6e884a024fe0a5de6de8a64ef5dca5694ba8ed42"
+  version: "0.7.0"
+  hash: "git-tree:7666a81a9ab1246ddf10dc01ceb5a5d0bc55cc54"
 }
 ```
 
