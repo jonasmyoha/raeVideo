@@ -5,7 +5,7 @@ pack Ffmpeg {
     version: "0.7.0"
   }
   rae: {
-    version: "0.4.24"
+    version: "0.4.25"
   }
   dependencies: {
     dep video: {

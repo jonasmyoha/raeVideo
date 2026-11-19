@@ -3,7 +3,7 @@ pack App {
   version: 1
   defaultTarget: compiled
   rae: {
-    version: "0.4.24"
+    version: "0.4.25"
   }
   dependencies: {
     dep video: {
@@ -12,8 +12,8 @@ pack App {
     dep audio: {
       git: "https://github.com/jonasmyoha/rae.git"
       subdir: "packages/audio"
-      version: "0.25.0"
-      hash: "git-tree:dd7ed0543fe1db9baa0a5f6648da6b390c570199"
+      version: "0.26.0"
+      hash: "git-tree:26ebee8629362ede626178c5781bf5032abd7426"
     }
   }
   targets: {
