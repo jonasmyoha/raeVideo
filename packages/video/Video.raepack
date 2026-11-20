@@ -5,14 +5,14 @@ pack Video {
     version: "0.14.0"
   }
   rae: {
-    version: "0.4.25"
+    version: "0.4.29"
   }
   dependencies: {
     dep audio: {
       git: "https://github.com/jonasmyoha/rae.git"
       subdir: "packages/audio"
-      version: "0.26.0"
-      hash: "git-tree:26ebee8629362ede626178c5781bf5032abd7426"
+      version: "0.27.0"
+      hash: "git-tree:7210fff8087c7edfa3e0a9fbb3e684a3a4726c76"
     }
   }
   native: {
